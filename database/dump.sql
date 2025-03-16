@@ -18,7 +18,7 @@ CREATE TABLE `config` (
   UNIQUE KEY `ldap_url` (`ldap_url`),
   UNIQUE KEY `base_dn` (`base_dn`),
   UNIQUE KEY `refresh_interval` (`refresh_interval`)
-) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8
+) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8;
 
 CREATE TABLE `img` (
   `id` int(11) NOT NULL AUTO_INCREMENT COMMENT 'primary key',
@@ -28,7 +28,7 @@ CREATE TABLE `img` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `id` (`id`),
   UNIQUE KEY `images` (`images`)
-) ENGINE=InnoDB AUTO_INCREMENT=155 DEFAULT CHARSET=utf8
+) ENGINE=InnoDB AUTO_INCREMENT=155 DEFAULT CHARSET=utf8;
 
 CREATE TABLE `logs` (
   `id` int(11) NOT NULL AUTO_INCREMENT COMMENT 'primary key',
@@ -36,7 +36,7 @@ CREATE TABLE `logs` (
   `updated_time` datetime DEFAULT NULL COMMENT 'updated time',
   `logs` text,
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8
+) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8;
 
 CREATE TABLE `switch` (
   `id` int(11) NOT NULL AUTO_INCREMENT COMMENT 'primary key',
@@ -45,7 +45,7 @@ CREATE TABLE `switch` (
   `switch` varchar(255) DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `switch` (`switch`)
-) ENGINE=InnoDB AUTO_INCREMENT=185 DEFAULT CHARSET=utf8
+) ENGINE=InnoDB AUTO_INCREMENT=185 DEFAULT CHARSET=utf8;
 
 
 CREATE TABLE `users` (
@@ -58,7 +58,7 @@ CREATE TABLE `users` (
   UNIQUE KEY `id` (`id`),
   UNIQUE KEY `username` (`username`),
   UNIQUE KEY `password` (`password`)
-) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8
+) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8;
 
 CREATE TABLE `VMS_UNIQUE` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
@@ -75,4 +75,4 @@ CREATE TABLE `VMS_UNIQUE` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `id` (`id`),
   UNIQUE KEY `VMID` (`VMID`)
-) ENGINE=InnoDB AUTO_INCREMENT=12857 DEFAULT CHARSET=utf8
+) ENGINE=InnoDB AUTO_INCREMENT=12857 DEFAULT CHARSET=utf8;
