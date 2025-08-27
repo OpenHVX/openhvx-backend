@@ -4,7 +4,7 @@
   "description": "Hyper-V Manager through Web dashboard",
   "main": "app.js",
   "dependencies": {
-    "@glokon/guacamole-lite": "^0.9.1",
+    "@glokon/guacamole-lite": "^0.13.1",
     "activedirectory": "^0.7.2",
     "bcrypt": "^5.0.1",
     "body-parser": "^1.19.0",
