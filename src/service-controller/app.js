@@ -8,7 +8,7 @@ const aRoutes = require("./routes/admin.routes");
 const tRoutes = require("./routes/tenant.routes");
 const { startTelemetryConsumers, startResultsToMongo } = require("./services/amqp");
 const Heartbeat = require("./models/Heartbeat");
-const Inventory = require("./models/Inventory");
+
 const Task = require("./models/Task");
 
 
@@ -20,7 +20,7 @@ async function main() {
     await mongoose.connect(MONGO_URL);
     console.log("[controller] Mongo connected");
 
-    await startTelemetryConsumers({ Heartbeat, Inventory });
+    await startTelemetryConsumers({ Heartbeat });
     await startResultsToMongo(Task); // <-- important
 
     const app = express();

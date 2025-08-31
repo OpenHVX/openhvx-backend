@@ -1,6 +1,6 @@
 // controllers/agentController.js
 const Heartbeat = require("../models/Heartbeat");
-const Inventory = require("../models/Inventory");
+const Inventory = require("../models/Inventory.full");
 
 const ONLINE_THRESHOLD_MS = parseInt(process.env.AGENT_ONLINE_THRESHOLD_MS || '90000', 10);
 

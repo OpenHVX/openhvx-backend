@@ -1,6 +1,6 @@
 // controllers/metrics.controller.js
 const Heartbeat = require('../models/Heartbeat');
-const Inventory = require('../models/Inventory');
+const Inventory = require('../models/Inventory.full');
 const Task = require('../models/Task');
 let Tenant; try { Tenant = require('../models/Tenant'); } catch { Tenant = null; }
 const TenantResource = require('../models/TenantResource');

@@ -1,8 +1,9 @@
 
 // services/amqp.js
 const amqplib = require("amqplib");
-const InventoryFull = require("../models/InventoryFull");
-const InventoryLight = require("../models/InventoryLight");
+
+const InvFull = require("../models/Inventory.full");
+const InvLight = require("../models/Inventory.light");
 
 const RMQ_URL = process.env.RMQ_URL || "amqp://guest:guest@localhost:5672/";
 const JOBS_EX = process.env.JOBS_EXCHANGE || "jobs";                 // direct
@@ -10,6 +11,12 @@ const TELE_EX = process.env.TELEMETRY_EXCHANGE || "agent.telemetry"; // topic
 const RES_EX = process.env.RESULTS_EXCHANGE || "results";           // topic
 
 let conn, ch;
+
+function isLight(headers, env) {
+    const mode = headers?.["x-merge-mode"] || env?.mergeMode;
+    const source = headers?.["x-source"] || env?.source;
+    return mode === "patch-nondestructive" || source === "inventory.refresh.light";
+}
 
 async function connect() {
     if (ch) return ch;
@@ -58,7 +65,7 @@ async function publishTask(payload) {
 }
 
 // Télémétrie -> Mongo (sans notion de tenant)
-async function startTelemetryConsumers({ Heartbeat, Inventory }) {
+async function startTelemetryConsumers({ Heartbeat }) {
     const channel = await connect();
 
     await channel.consume(
@@ -88,7 +95,6 @@ async function startTelemetryConsumers({ Heartbeat, Inventory }) {
         },
         { noAck: false }
     );
-
     await channel.consume("agent.inventories", async (msg) => {
         if (!msg) return;
         try {
@@ -105,11 +111,11 @@ async function startTelemetryConsumers({ Heartbeat, Inventory }) {
             };
 
             if (isLight(headers, env)) {
-                await InventoryLight.findOneAndUpdate(
+                await InvLight.findOneAndUpdate(
                     { agentId }, { $set: doc }, { upsert: true }
                 );
             } else {
-                await InventoryFull.findOneAndUpdate(
+                await InvFull.findOneAndUpdate(
                     { agentId }, { $set: doc }, { upsert: true }
                 );
             }

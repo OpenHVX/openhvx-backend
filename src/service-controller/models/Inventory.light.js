@@ -1,7 +1,10 @@
 const mongoose = require("mongoose");
-module.exports = mongoose.model("InventoryLight", new mongoose.Schema({
+
+const InventoryLightSchema = new mongoose.Schema({
     agentId: { type: String, index: true },
     ts: { type: Date, index: true },
     inventory: { type: Object },
     raw: { type: Object },
-}, { minimize: false }));
+}, { minimize: false });
+
+module.exports = mongoose.model("InventoryLight", InventoryLightSchema);
