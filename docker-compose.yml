@@ -1,0 +1,57 @@
+services:
+  mongo:
+    image: mongo:6
+    container_name: mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # UI management
+    environment:
+      RABBITMQ_DEFAULT_USER: ""
+      RABBITMQ_DEFAULT_PASS: ""
+    restart: unless-stopped
+
+  auth:
+    build:
+      context: ./src/service-auth
+      dockerfile: Dockerfile
+    container_name: auth-service
+    env_file: ./.env.auth
+    ports:
+      - "4000:4000"
+    depends_on:
+      - mongo
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: ./src/service-api-gateway
+    container_name: api-gateway
+    env_file: ./.env.gateway
+    ports:
+      - "8080:8080"   # l’app écoute sur 8080
+    depends_on:
+      - auth
+      # - controller   # (décommente quand ton service controller sera ajouté)
+    restart: unless-stopped
+
+  controller:
+    build:
+      context: ./src/service-controller
+    container_name: controller
+    env_file: ./.env.controller
+    depends_on:
+      - mongo
+      - rabbitmq
+    restart: unless-stopped
+
+volumes:
+  mongo_data:

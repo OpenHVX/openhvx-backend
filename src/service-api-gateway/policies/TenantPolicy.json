@@ -1,0 +1,16 @@
+{
+    "mode": "deny",
+    "actions": {
+        "vm.create": [
+            "vhd_path",
+            "vhdPath",
+            "path"
+        ],
+        "vm.clone": {
+            "deny": [
+                "dest.vhd_path",
+                "dest.vhdPath"
+            ]
+        }
+    }
+}

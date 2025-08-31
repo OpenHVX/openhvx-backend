@@ -1,0 +1,414 @@
+openapi: 3.0.3
+info:
+  title: HVWM API Gateway
+  description: >
+    Passerelle HTTP vers les services Controller et Auth.  
+    Toutes les routes **/api/v1/** nécessitent un token **Bearer JWT** (introspection côté gateway).
+  version: 0.1.0
+  contact:
+    name: HVWM OSS
+    url: https://github.com/hvwm
+    email: oss@example.com
+servers:
+  - url: http://localhost:8080
+    description: Local (dev)
+tags:
+  - name: System
+  - name: Agents
+  - name: Tasks
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    AgentStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [online, offline]
+        agentId:
+          type: string
+        tenantId:
+          type: string
+        lastSeen:
+          type: string
+          format: date-time
+        version:
+          type: string
+        capabilities:
+          type: array
+          items: { type: string }
+      required: [status, agentId]
+
+    Inventory:
+      type: object
+      properties:
+        host:
+          type: object
+          properties:
+            hostname: { type: string }
+            os:        { type: string }
+            osVersion: { type: string }
+            memMB:     { type: integer }
+            domain:    { type: string }
+            cpu:
+              type: object
+              properties:
+                name:              { type: string }
+                cores:             { type: integer }
+                logicalProcessors: { type: integer }
+                maxClockMHz:       { type: integer }
+            hypervHost:
+              type: object
+              properties:
+                logicalProcessors:       { type: integer }
+                memoryCapacityMB:        { type: integer }
+                numaSpanningEnabled:     { type: boolean }
+                defaultVmPath:           { type: string }
+                defaultVhdPath:          { type: string }
+                resourceMeteringEnabled: { type: boolean }
+        networks:
+          type: object
+          properties:
+            switches:
+              type: array
+              items:
+                type: object
+                properties:
+                  name: { type: string }
+                  type: { type: string, enum: [External, Internal, Private] }
+                  uplinks:
+                    type: array
+                    items: { type: string }
+            hostAdapters:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:      { type: string }
+                  interface: { type: string }
+                  mac:       { type: string }
+                  status:    { type: string }
+                  linkSpeed: { type: string }
+                  switchName:{ type: string }
+                  ip:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        address:   { type: string }
+                        prefixLen: { type: integer }
+                        family:    { type: string }
+                  dns:
+                    type: array
+                    items: { type: string }
+        storage:
+          type: object
+          properties:
+            disks:
+              type: array
+              items:
+                type: object
+                properties:
+                  number:     { type: integer }
+                  friendly:   { type: string }
+                  sizeMB:     { type: integer }
+                  busType:    { type: string }
+                  isSystem:   { type: boolean }
+                  isBoot:     { type: boolean }
+                  isReadOnly: { type: boolean }
+                  health:     { type: string }
+                  partitionStyle: { type: string }
+            volumes:
+              type: array
+              items:
+                type: object
+                properties:
+                  drive:   { type: string }
+                  label:   { type: string }
+                  fs:      { type: string }
+                  sizeMB:  { type: integer }
+                  freeMB:  { type: integer }
+                  health:  { type: string }
+                  path:    { type: string }
+        vms:
+          type: array
+          items:
+            type: object
+            properties:
+              name:             { type: string }
+              id:               { type: string }
+              state:            { type: string }
+              generation:       { type: integer }
+              uptimeSec:        { type: integer }
+              cpuUsagePct:      { type: integer }
+              memoryAssignedMB: { type: integer }
+              automaticStart:   { type: string }
+              automaticStop:    { type: string }
+              configuration:
+                type: object
+                properties:
+                  memory:
+                    type: object
+                    properties:
+                      dynamicEnabled: { type: boolean }
+                      startupMB:      { type: integer }
+                      minMB:          { type: integer }
+                      maxMB:          { type: integer }
+                  cpu:
+                    type: object
+                    properties:
+                      count:                 { type: integer }
+                      relativeWeight:        { type: integer }
+                      exposeVirtualizationExtensions: { type: boolean }
+                  firmware:
+                    type: object
+                    properties:
+                      secureBootEnabled: { type: boolean }
+                      secureBootTemplate:{ type: string }
+                      bootOrder:
+                        type: array
+                        items: { type: string }
+              networkAdapters:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:       { type: string }
+                    switch:     { type: string }
+                    mac:        { type: string }
+                    dynamicMac: { type: boolean }
+                    isLegacy:   { type: boolean }
+                    vlan:
+                      type: object
+                      properties:
+                        mode:       { type: string }
+                        vlanId:     { type: integer }
+                        nativeVlan: { type: integer }
+                        trunkVlans:
+                          type: array
+                          items: { type: integer }
+                    ips:
+                      type: array
+                      items: { type: string }
+              storage:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    controllerType:   { type: string }
+                    controllerNumber: { type: integer }
+                    controllerSlot:   { type: integer }
+                    path:             { type: string }
+                    vhd:
+                      type: object
+                      properties:
+                        format:     { type: string }
+                        type:       { type: string }
+                        sizeMB:     { type: integer }
+                        fileSizeMB: { type: integer }
+                        parentPath: { type: string }
+        collectedAt:
+          type: string
+          format: date-time
+
+    TaskCreateRequest:
+      type: object
+      required: [agentId, action]
+      properties:
+        agentId:
+          type: string
+          example: HOST-001
+        tenantId:
+          type: string
+          example: TENANT1
+        action:
+          type: string
+          example: vm.power
+        data:
+          type: object
+          example: { "target": "VM1", "state": "on" }
+
+    TaskEnqueueResponse:
+      type: object
+      required: [queued, taskId]
+      properties:
+        queued:
+          type: boolean
+        taskId:
+          type: string
+          example: 6f2b8f1a-8a9e-4b2e-9a8d-1d6b7f3c9a10
+        agentOnline:
+          type: boolean
+        statusUrl:
+          type: string
+          example: /api/v1/tasks/6f2b8f1a-8a9e-4b2e-9a8d-1d6b7f3c9a10
+
+    TaskResource:
+      type: object
+      properties:
+        taskId:       { type: string }
+        tenantId:     { type: string }
+        agentId:      { type: string }
+        action:       { type: string }
+        data:         { type: object }
+        status:       { type: string, enum: [queued, sent, done, error] }
+        correlationId:{ type: string }
+        queuedAt:     { type: string, format: date-time }
+        publishedAt:  { type: string, format: date-time }
+        startedAt:    { type: string, format: date-time }
+        finishedAt:   { type: string, format: date-time }
+        result:       { type: object }
+        error:        { type: string }
+        routingKey:   { type: string }
+
+security:
+  - BearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [System]
+      summary: Healthcheck
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean }, service: { type: string } }
+
+  /api/v1/agents/{agentId}/status:
+    get:
+      tags: [Agents]
+      summary: Statut d’un agent (online/offline)
+      parameters:
+        - in: path
+          name: agentId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Statut
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    $ref: '#/components/schemas/AgentStatus'
+        '404':
+          description: Agent inconnu
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/v1/agents/{agentId}/inventory:
+    get:
+      tags: [Agents]
+      summary: Dernier inventaire connu pour un agent
+      parameters:
+        - in: path
+          name: agentId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Inventaire
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    $ref: '#/components/schemas/Inventory'
+        '404':
+          description: Pas d’inventaire
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/v1/agents/{agentId}/inventory/refresh:
+    post:
+      tags: [Agents]
+      summary: Demande un refresh d’inventaire (enqueue une tâche)
+      parameters:
+        - in: path
+          name: agentId
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tenantId: { type: string }
+                depth:
+                  type: string
+                  enum: [light, normal, deep]
+                  default: normal
+      responses:
+        '202':
+          description: Tâche enqueued
+          content: { application/json: { schema: { $ref: '#/components/schemas/TaskEnqueueResponse' } } }
+        '4XX':
+          description: Erreur de validation
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/v1/tasks:
+    post:
+      tags: [Tasks]
+      summary: Enqueue une tâche vers un agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskCreateRequest' }
+            examples:
+              vmPowerOn:
+                value: { agentId: "HOST-001", tenantId: "TENANT1", action: "vm.power", data: { target: "VM1", state: "on" } }
+      responses:
+        '202':
+          description: Accepté
+          content: { application/json: { schema: { $ref: '#/components/schemas/TaskEnqueueResponse' } } }
+        '404':
+          description: Agent inconnu
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '422':
+          description: Capability manquante
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  /api/v1/tasks/{taskId}:
+    get:
+      tags: [Tasks]
+      summary: Récupère l’état/résultat d’une tâche
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Tâche
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TaskResource' }
+        '404':
+          description: Inconnue
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

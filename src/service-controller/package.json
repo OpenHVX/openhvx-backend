@@ -1,0 +1,21 @@
+{
+    "name": "hvwm-controller",
+    "version": "0.1.0",
+    "private": true,
+    "main": "src/controller/app.js",
+    "scripts": {
+        "start": "node src/controller/app.js",
+        "dev": "nodemon src/controller/app.js"
+    },
+    "dependencies": {
+        "amqplib": "^0.10.3",
+        "cors": "^2.8.5",
+        "dotenv": "^17.2.1",
+        "express": "^4.19.2",
+        "mongoose": "^8.6.0",
+        "morgan": "^1.10.0"
+    },
+    "devDependencies": {
+        "nodemon": "^3.1.0"
+    }
+}
