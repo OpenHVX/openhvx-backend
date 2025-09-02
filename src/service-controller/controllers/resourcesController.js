@@ -1,4 +1,5 @@
 // controllers/resourcesController.js
+// NOTE: Images moved to Image Repository (SMB) -> handled by imagesController (no DB/inventory).
 const TenantResource = require("../models/TenantResource");
 const InventoryFull = require("../models/Inventory.full");
 const InventoryLight = require("../models/Inventory.light");
@@ -30,9 +31,10 @@ function safeArray(v) {
     return Array.isArray(v) ? v : [];
 }
 
-/** Extrait la structure inventaire depuis un doc (full ou light) */
+/** Extrait la branche structure (VMs, networks...) depuis un doc (full ou light) */
 function invRoot(doc) {
-    // schéma attendu: { agentId, inventory: { inventory: {...}, datastores: [...] } }
+    // schéma attendu: { agentId, inventory: { inventory: {...}, datastores: [...], images: [...] } }
+    // Ici on ne lit QUE la structure (vms, networks, etc.)
     return doc?.inventory?.inventory || {};
 }
 
@@ -79,10 +81,9 @@ function mergeVM(vmFull, vmLight) {
 
         outDisk.vhd = {
             ...fullVhd,
-            // format/type restent ceux du full si connus; on peut copier ceux du light si absents
             format: fullVhd.format ?? lightVhd.format ?? null,
             type: fullVhd.type ?? lightVhd.type ?? null,
-            sizeMB: fullVhd.sizeMB ?? null, // ne pas écraser (le full est la source)
+            sizeMB: fullVhd.sizeMB ?? null,
             fileSizeMB: Number.isFinite(newUsed) ? newUsed : fullVhd.fileSizeMB ?? null,
             parentPath: fullVhd.parentPath ?? null,
             blockSize: fullVhd.blockSize ?? null,
@@ -152,6 +153,7 @@ function extractResourcesFromInventoryDoc(invDoc, { kind, agentId }) {
  * GET (tenant)  /api/v1/tenant/resources?kind=vm&agentId=HOST-1
  * GET (admin)   /api/v1/admin/:tenantId/resources?kind=vm&agentId=HOST-1
  * -> renvoie les ressources (agrégées full+light) appartenant au tenant.
+ *    (Images exclues: voir imagesController pour le repository SMB)
  */
 exports.listResources = async (req, res) => {
     try {
@@ -197,6 +199,8 @@ exports.listResources = async (req, res) => {
                 const sw = swList.find((s) => s.name === link.refId);
                 if (sw) resources.push({ ...sw, tenantId, agentId: link.agentId, kind: "switch", refId: link.refId });
             }
+
+            // NOTE: kind "image" n'est plus géré ici.
         }
 
         res.json({ success: true, data: resources });
@@ -264,6 +268,7 @@ exports.unclaimResource = async (req, res) => {
 /**
  * GET (admin/global) /api/v1/admin/resources/unassigned?kind=vm|switch&agentId=HOST-1&limit=100
  * Liste les ressources présentes dans Inventory FULL (structure) mais absentes de TenantResource.
+ * (Images exclues)
  */
 exports.listUnassignedResources = async (req, res) => {
     try {

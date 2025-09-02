@@ -77,8 +77,15 @@ module.exports = ({ CONTROLLER_URL }) => {
     router.post('/tasks', requireTenantInJWT, applyPolicy("TenantPolicy.json"), ensureAnyRole(['tenant-user-rw', 'tenant-admin']), baseProxy);
     router.get('/tasks/:taskId', requireTenantInJWT, ensureAnyRole(['tenant-user-r', 'tenant-user-rw', 'tenant-admin']), baseProxy);
     router.get('/resources', requireTenantInJWT, ensureAnyRole(['tenant-user-r', 'tenant-user-rw', 'tenant-admin']), baseProxy);
+    router.get('/images', requireTenantInJWT, ensureAnyRole(['tenant-user-r', 'tenant-user-rw', 'tenant-admin']), baseProxy);
 
     router.get('/metrics/overview', requireTenantInJWT, ensureAnyRole(['tenant-user-r', 'tenant-user-rw', 'tenant-admin']), baseProxy);
+
+
+    router.get("/images", requireTenantInJWT, ensureAnyRole(['tenant-user-r', 'tenant-user-rw', 'tenant-admin']), baseProxy);
+    router.get("/images/:imageId", requireTenantInJWT, ensureAnyRole(['tenant-user-r', 'tenant-user-rw', 'tenant-admin']), baseProxy);
+    router.get("/images/:imageId/resolve", requireTenantInJWT, ensureAnyRole(['tenant-user-r', 'tenant-user-rw', 'tenant-admin']), baseProxy);
+
 
     // → ajoute ici d’autres endpoints tenant si besoin :
     // router.get('/something', requireTenantInJWT, allowTenantRoles, baseProxy);

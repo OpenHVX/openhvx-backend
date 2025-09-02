@@ -7,6 +7,7 @@ const loadTenant = require('../middlewares/loadTenant');
 const tasks = require("../controllers/tasksController");
 const resources = require("../controllers/resourcesController");
 const metrics = require("../controllers/metricsController");
+const images = require("../controllers/imagesController");
 
 router.use(asTenantMode());            // enforceTenant = true
 router.use(requireTenant(), loadTenant());
@@ -19,5 +20,11 @@ router.get("/resources", resources.listResources);
 
 //Metrics
 router.get("/metrics/overview", metrics.tenantOverview);
+
+
+router.get("/images", images.list);
+router.get("/images/:imageId", images.getOne);
+router.get("/images/:imageId/resolve", images.resolve);
+
 
 module.exports = router;

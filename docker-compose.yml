@@ -12,11 +12,11 @@ services:
     image: rabbitmq:3-management
     container_name: rabbitmq
     ports:
-      - "5672:5672"      # AMQP
-      - "15672:15672"    # UI management
+      - "5672:5672"
+      - "15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: ""
-      RABBITMQ_DEFAULT_PASS: ""
+      RABBITMQ_DEFAULT_USER: "guest"
+      RABBITMQ_DEFAULT_PASS: "guest"
     restart: unless-stopped
 
   auth:
@@ -37,10 +37,9 @@ services:
     container_name: api-gateway
     env_file: ./.env.gateway
     ports:
-      - "8080:8080"   # l’app écoute sur 8080
+      - "8080:8080"
     depends_on:
       - auth
-      # - controller   # (décommente quand ton service controller sera ajouté)
     restart: unless-stopped
 
   controller:
@@ -51,6 +50,8 @@ services:
     depends_on:
       - mongo
       - rabbitmq
+    volumes:
+      - /mnt/openhvx:/share:ro   # <-- partage SMB monté sur l’hôte → visible dans le container
     restart: unless-stopped
 
 volumes:

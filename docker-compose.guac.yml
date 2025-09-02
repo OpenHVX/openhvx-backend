@@ -1,0 +1,34 @@
+# docker-compose.guac.yml
+
+services:
+  guacd:
+    image: guacamole/guacd:1.5.5
+    restart: unless-stopped
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: guacdb
+      POSTGRES_USER: guac
+      POSTGRES_PASSWORD: change_me
+    volumes: [ "guacdb:/var/lib/postgresql/data" ]
+
+  guacamole:
+    image: guacamole/guacamole:1.5.5
+    environment:
+      POSTGRES_HOSTNAME: postgres
+      POSTGRES_DATABASE: guacdb
+      POSTGRES_USER: guac
+      POSTGRES_PASSWORD: change_me
+      GUACD_HOSTNAME: guacd
+    depends_on: [guacd, postgres]
+    ports: ["8080:8080"]  # mets un reverse-proxy HTTPS devant si possible
+
+  initdb:
+    image: guacamole/guacamole:1.5.5
+    depends_on: [postgres]
+    entrypoint: /bin/sh
+    command: -c "cat /opt/guacamole/postgresql/schema/*.sql | psql postgresql://guac:change_me@postgres:5432/guacdb"
+    restart: "no"
+    
+volumes:
+  guacdb: {}

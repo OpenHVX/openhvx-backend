@@ -6,6 +6,7 @@ const agents = require("../controllers/agentsController");
 const resources = require("../controllers/resourcesController");
 const tasks = require("../controllers/tasksController");
 const metrics = require("../controllers/metricsController");
+const images = require("../controllers/imagesController");
 
 router.use(asAdminMode());
 
@@ -45,5 +46,9 @@ router.get('/metrics/datastores', metrics.adminDatastores);
 router.get('/metrics/vms', metrics.adminVMs);
 router.get('/metrics/tenant/overview', metrics.adminTenantOverview);
 
+
+router.get("/images", images.list);
+router.get("/images/:imageId", images.getOne);
+router.get("/images/:imageId/resolve", images.resolve);
 
 module.exports = router;
