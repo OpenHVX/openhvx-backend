@@ -72,8 +72,6 @@ module.exports = ({ CONTROLLER_URL }) => {
     router.get('/tenants/:tenantId/resources', baseProxy);
     router.post('/tenants/:tenantId/resources/claim', baseProxy);
     router.delete('/tenants/:tenantId/resources/:resourceId', baseProxy);
-    router.get('/tenants/:tenantId/images', baseProxy);
-    router.get('/images', baseProxy);
 
     // Ressources non-assignées (global admin)
     router.get('/resources/unassigned', baseProxy);

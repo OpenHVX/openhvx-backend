@@ -4,6 +4,7 @@ const { randomUUID } = require('node:crypto');
 const Task = require('../models/Task');
 const Heartbeat = require('../models/Heartbeat');
 const TenantResource = require('../models/TenantResource');
+const { enrich } = require('../lib/enrich');
 
 function requiredCapability(action) {
     const map = {
@@ -27,10 +28,10 @@ function actionRequiresRefId(action) {
 // Récupère un tenantId en “tout venant” (JWT, champ middleware, body, query)
 function getTenantIdFromReq(req) {
     return (
-        req?.tenant?.tenantId || // injecté par middleware côté tenant
-        req?.tenantId ||         // champ posé par un middleware éventuel
-        req?.body?.tenantId ||   // utile surtout côté admin
-        req?.query?.tenantId ||  // optionnel
+        req?.tenant?.tenantId ||
+        req?.tenantId ||
+        req?.body?.tenantId ||
+        req?.query?.tenantId ||
         null
     );
 }
@@ -60,8 +61,6 @@ exports.enqueueTask = async (req, res) => {
         const agentId = target.agentId;
 
         // --- Tenant effectif ---
-        // Admin : doit fournir tenantId (via body ou middleware) -> sinon 400
-        // Non-admin : tenantId uniquement depuis JWT/middleware (on ignore body)
         const tenantId = admin ? (body.tenantId || getTenantIdFromReq(req)) : getTenantIdFromJWT(req);
         if (!tenantId) {
             return res.status(400).json({ error: admin ? 'tenantId is required for admin operations' : 'Missing tenant context' });
@@ -101,13 +100,35 @@ exports.enqueueTask = async (req, res) => {
         // --- Données envoyées à l’agent ---
         const data = { ...(body.data || {}) };
         if (needsRefId && !data.id && target.refId) data.id = target.refId; // l’agent lit data.id
-        const dataForAgent = { ...data, target }; // garde target pour l’audit
+        let dataForAgent = { ...data, target }; // garde target pour l’audit
 
-        // --- Créer + publier la task (UTILISE la variable tenantId calculée) ---
+        // 🔹 ENRICH GÉNÉRIQUE (AUCUNE logique d’image ici)
+        // On tente toujours 'auto' sur l’action telle quelle.
+        // - Si non supporté → no-op (on garde dataForAgent intact)
+        // - Si erreur réelle → 400
+        const enr = await enrich(action, {
+            operation: 'auto',
+            object: dataForAgent,
+            ctx: { tenantId, agentId },
+        });
+
+        if (enr.ok) {
+            dataForAgent = enr.data;
+        } else {
+            const isUnsupported =
+                enr.error?.startsWith('unsupported action:') ||
+                enr.error?.includes('unsupported operation');
+            if (!isUnsupported) {
+                return res.status(400).json({ error: `enrichment failed: ${enr.error}` });
+            }
+            // sinon no-op
+        }
+
+        // --- Créer + publier la task ---
         const taskId = randomUUID();
         const doc = await Task.create({
             taskId,
-            tenantId,                 // <--- important: plus de recalcul ici
+            tenantId,
             agentId,
             action,
             data: dataForAgent,
@@ -118,7 +139,7 @@ exports.enqueueTask = async (req, res) => {
 
         await publishTask({
             taskId: doc.taskId,
-            tenantId: doc.tenantId,   // transmis à l’agent
+            tenantId: doc.tenantId,
             agentId: doc.agentId,
             action: doc.action,
             data: doc.data,

@@ -95,6 +95,7 @@ async function startTelemetryConsumers({ Heartbeat }) {
         },
         { noAck: false }
     );
+
     await channel.consume("agent.inventories", async (msg) => {
         if (!msg) return;
         try {
@@ -109,7 +110,6 @@ async function startTelemetryConsumers({ Heartbeat }) {
                 inventory: env.inventory, // { inventory:{...}, datastores:[...] }
                 raw: env,
             };
-
             if (isLight(headers, env)) {
                 await InvLight.findOneAndUpdate(
                     { agentId }, { $set: doc }, { upsert: true }
