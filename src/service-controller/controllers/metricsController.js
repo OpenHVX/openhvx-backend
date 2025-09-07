@@ -256,7 +256,7 @@ async function computeTenantOverview(tenantId) {
 
     for (const link of links) {
         const doc = invMap.get(link.agentId);
-        const inv = doc?.inventory?.inventory?.inventory || doc?.inventory || {};
+        const inv = doc?.inventory?.inventory || doc?.inventory || {};
         const vms = inv?.vms || [];
 
         const vm = vms.find(v =>

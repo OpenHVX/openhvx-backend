@@ -1,4 +1,3 @@
-
 // services/amqp.js
 const amqplib = require("amqplib");
 
@@ -145,15 +144,14 @@ async function onTaskSucceededUpsertTenantLink(TaskModel, payload) {
 
 
     if (!t) return; // task inconnue (edge case)
+    console.log(JSON.stringify(t))
+
     const { action, tenantId, agentId } = t;
     if (!tenantId || !agentId) return; // sécurité (la task est notre source de vérité métier)
-
     // VM créées / clonées
     if (action === "vm.create" || action === "vm.clone") {
 
         const vm = payload?.result?.vm;
-
-
         const refId = vm?.guid || vm?.name;
 
         if (!refId) return;
@@ -267,3 +265,5 @@ module.exports = {
     startTelemetryConsumers,
     startResultsToMongo,
 };
+
+
