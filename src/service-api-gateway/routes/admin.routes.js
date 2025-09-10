@@ -1,3 +1,4 @@
+
 // api-gateway/src/routes/admin.routes.js
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const antiSpoof = require('../middlewares/antiSpoof');

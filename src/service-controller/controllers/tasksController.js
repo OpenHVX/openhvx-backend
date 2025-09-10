@@ -13,6 +13,8 @@ function requiredCapability(action) {
         'vm.delete': 'vm.delete',
         'vm.create': 'vm.create',
         'vm.clone': 'vm.clone',
+        'console.serial.open': 'console',
+        'net.tunnel.open': 'console',
         'echo': 'echo',
     };
     if (map[action]) return map[action];
@@ -22,6 +24,9 @@ function requiredCapability(action) {
 }
 
 function actionRequiresRefId(action) {
+    // 🔹 on force le refId pour les actions console/tunnel (scopées VM)
+    if (/^console\.serial\.open$/i.test(action)) return true;
+    if (/^net\.tunnel\.open$/i.test(action)) return true;
     return /^vm\.(delete|power|start|stop|restart|resize|attach|detach|snapshot|revert|rename|clone)$/i.test(action);
 }
 
@@ -102,18 +107,28 @@ exports.enqueueTask = async (req, res) => {
         if (needsRefId && !data.id && target.refId) data.id = target.refId; // l’agent lit data.id
         let dataForAgent = { ...data, target }; // garde target pour l’audit
 
-        // 🔹 ENRICH GÉNÉRIQUE (AUCUNE logique d’image ici)
-        // On tente toujours 'auto' sur l’action telle quelle.
-        // - Si non supporté → no-op (on garde dataForAgent intact)
-        // - Si erreur réelle → 400
+        // 🔹 ENRICH GÉNÉRIQUE
+        // délègue à /lib/enrich (qui appellera services/console pour JWT/URLs)
+        let consoleMeta = null;
         const enr = await enrich(action, {
             operation: 'auto',
             object: dataForAgent,
-            ctx: { tenantId, agentId },
+            // pas de "ctx" verbeux : on passe juste le minimum
+            ctx: {
+                user: req.user || null,
+                refId: target.refId || null,
+                tenantId,
+                agentId,
+            },
         });
 
         if (enr.ok) {
-            dataForAgent = enr.data;
+            dataForAgent = enr.data || dataForAgent;
+            // Ne pas persister ni envoyer _console au broker/agent
+            if (dataForAgent && dataForAgent._console) {
+                consoleMeta = dataForAgent._console;
+                try { delete dataForAgent._console; } catch { }
+            }
         } else {
             const isUnsupported =
                 enr.error?.startsWith('unsupported action:') ||
@@ -149,7 +164,19 @@ exports.enqueueTask = async (req, res) => {
         await Task.updateOne({ taskId }, { $set: { status: 'sent', publishedAt: new Date() } });
 
         const base = admin ? '/api/v1/admin' : '/api/v1/tenant';
-        return res.status(202).json({ queued: true, taskId, agentOnline, statusUrl: `${base}/tasks/${taskId}` });
+        const resp = {
+            queued: true,
+            taskId,
+            agentOnline,
+            statusUrl: `${base}/tasks/${taskId}`
+        };
+
+        // Si enrich a préparé une session console, on la renvoie à l’UI
+        if (consoleMeta) {
+            resp.console = consoleMeta;
+        }
+
+        return res.status(202).json(resp);
     } catch (err) {
         console.error('enqueueTask error:', err);
         return res.status(500).json({ error: 'Failed to publish task' });

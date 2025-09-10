@@ -1,24 +1,21 @@
 // /lib/enrich.js
 const imagesService = require("../services/images");
+const consoleSvc = require("../services/console");
 
 const registry = {
+    // =========================
+    //       VM LIFECYCLE
+    // =========================
     "vm.create": {
-        // AUTO: enchaîne les enrichissements pertinents pour vm.create
         async auto({ object }) {
             let out = { ...object };
-
-            // determineImage seulement si nécessaire
             if (!out.imagePath && out.imageId) {
                 const r = await imagesService.resolvePath(out.imageId);
                 if (!r || !r.path) throw new Error(`imageId not found: ${out.imageId}`);
                 out = { ...out, imagePath: r.path };
             }
-
-            // … d’autres enrichissements vm.create ici si besoin …
-
             return out;
         },
-
         async determineImage({ object }) {
             if (object.imagePath) return { ...object };
             if (!object.imageId) throw new Error("imageId is required for determineImage");
@@ -33,10 +30,70 @@ const registry = {
         async determineImage(args) { return registry["vm.create"].determineImage(args); },
     },
 
-    // actions non gérées: soit tu ajoutes un auto no-op ici,
-    // soit le dispatcher traitera "unsupported" comme no-op côté controller.
     "vm.edit": {
         async auto({ object }) { return { ...object }; },
+    },
+
+    // =========================
+    //   CONSOLE / TUNNELS
+    // =========================
+
+    /**
+     * console.serial.open
+     * - Appelle services/console.planSerialOpen()
+     * - Renvoie les données agent (pour la task) + _console pour l’UI
+     *
+     * Attendu:
+     *  object: { refId?|vmId?, ttlSeconds? }
+     *  ctx:    { tenantId, agentId } (fourni par tasksController)
+     */
+    "console.serial.open": {
+        async auto({ object, ctx }) {
+            const refId =
+                object.refId || object.vmId || ctx?.refId || ctx?.vm?._id;
+            if (!refId) throw new Error("refId/vmId is required");
+
+            const { agentData, ui } = await consoleSvc.planSerialOpen({
+                refId,
+                tenantId: ctx?.tenantId,
+                agentId: ctx?.agentId,
+                // sub optionnel si un jour on passe l'utilisateur dans ctx
+                sub: ctx?.user?.id,
+                ttlSeconds: object.ttlSeconds,
+            });
+
+            // Merge non destructif: on garde le payload d’origine et on ajoute ce qu’il faut pour l’agent
+            return { ...object, ...agentData, _console: ui };
+        },
+    },
+
+    /**
+     * net.tunnel.open
+     * - Tunnel TCP générique (SSH/RDP/VNC…)
+     * object attendu: { target:{ip,port}, mode?, ttlSeconds? }
+     * ctx attendu   : { tenantId, agentId }
+     */
+    "net.tunnel.open": {
+        async auto({ object, ctx }) {
+            const refId =
+                object.refId || object.vmId || ctx?.refId || ctx?.vm?._id;
+            if (!refId) throw new Error("refId/vmId is required");
+            if (!object?.target?.ip || !object?.target?.port) {
+                throw new Error("target.ip and target.port are required");
+            }
+
+            const { agentData, ui } = await consoleSvc.planNetTunnelOpen({
+                refId,
+                tenantId: ctx?.tenantId,
+                agentId: ctx?.agentId,
+                sub: ctx?.user?.id,
+                target: object.target,
+                mode: object.mode,
+                ttlSeconds: object.ttlSeconds,
+            });
+
+            return { ...object, ...agentData, _console: ui };
+        },
     },
 };
 

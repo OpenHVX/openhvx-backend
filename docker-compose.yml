@@ -42,6 +42,15 @@ services:
       - auth
     restart: unless-stopped
 
+  ws-broker:
+    build:
+      context: ./src/service-ws-broker
+    container_name: ws-broker
+    env_file: ./.env.ws
+    ports:
+      - "8081:8081"
+
+    restart: unless-stopped
   controller:
     build:
       context: ./src/service-controller

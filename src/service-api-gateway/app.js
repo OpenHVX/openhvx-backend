@@ -7,11 +7,11 @@ const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
 const rateLimit = require("express-rate-limit");
 const axios = require("axios");
-
+const { mountWsProxy } = require('./ws/ws-proxy');
 const CONTROLLER_URL = process.env.CONTROLLER_URL || "http://controller:3000";
 const AUTH_URL = process.env.AUTH_URL || "http://auth:4000";
 const PORT = process.env.PORT || 8080;
-
+const BROKER_URL = process.env.BROKER_URL || "http://ws-broker:8081";
 
 
 // CORS
@@ -83,6 +83,14 @@ app.use("/api/v1/tenant",
     require("./routes/tenant.routes")({ CONTROLLER_URL })
 );
 
-app.listen(PORT, () => {
+// -------------------------------------------------------------------------------------------------------------
+
+const http = require('http');
+const server = http.createServer(app);
+console.log(CONTROLLER_URL)
+// monte le proxy WS (browser -> controller)
+mountWsProxy(app, server, BROKER_URL);
+
+server.listen(PORT, () => {
     console.log(`[gateway] listening on :${PORT} → controller=${CONTROLLER_URL} auth=${AUTH_URL}`);
 });
