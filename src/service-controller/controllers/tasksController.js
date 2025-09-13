@@ -5,6 +5,7 @@ const Task = require('../models/Task');
 const Heartbeat = require('../models/Heartbeat');
 const TenantResource = require('../models/TenantResource');
 const { enrich } = require('../lib/enrich');
+const { election } = require('../services/election')
 
 function requiredCapability(action) {
     const map = {
@@ -54,8 +55,8 @@ exports.enqueueTask = async (req, res) => {
         if (!action) return res.status(400).json({ error: "Missing 'action' in body" });
 
         const target = (body.target && typeof body.target === 'object') ? body.target : null;
-        if (!target?.kind || !target?.agentId) {
-            return res.status(400).json({ error: 'Missing target.kind / target.agentId' });
+        if (!target?.kind) {
+            return res.status(400).json({ error: 'Missing target.kind' });
         }
 
         const needsRefId = actionRequiresRefId(action);
@@ -63,28 +64,40 @@ exports.enqueueTask = async (req, res) => {
             return res.status(400).json({ error: 'Missing target.refId for this action' });
         }
 
-        const agentId = target.agentId;
-
         // --- Tenant effectif ---
         const tenantId = admin ? (body.tenantId || getTenantIdFromReq(req)) : getTenantIdFromJWT(req);
         if (!tenantId) {
             return res.status(400).json({ error: admin ? 'tenantId is required for admin operations' : 'Missing tenant context' });
         }
 
+        // -------------------------------
+        // Agent Election (vm.create)
+        // -------------------------------
+        if (action === 'vm.create' && !target.agentId) {
+            const freshness = Number(process.env.AGENT_FRESHNESS_SEC || 60);
+            const needCap = requiredCapability(action); // => 'vm.create'
+            // ajoute d'autres caps si tu veux, ex: 'inventory'
+            const agentIdSelected = await election({ freshness, capabilities: [needCap] });
+
+            target.agentId = agentIdSelected;
+
+            body.target = { ...target };
+        }
+
+        const agentId = target?.agentId;
+        if (!agentId) {
+            return res.status(400).json({ error: 'Missing target.agentId (no election performed or selection failed)' });
+        }
+
         // --- Ownership check (désactivé en admin) ---
         if (!admin && needsRefId) {
-            const link = await TenantResource.findOne({
-                tenantId, kind: target.kind, agentId, refId: target.refId,
-            }).lean();
+            const link = await TenantResource.findOne({ tenantId, kind: target.kind, agentId, refId: target.refId }).lean();
             if (!link) {
-                return res.status(403).json({
-                    error: 'Forbidden: resource not owned by this tenant',
-                    details: { tenantId, target }
-                });
+                return res.status(403).json({ error: 'Forbidden: resource not owned by this tenant', details: { tenantId, target } });
             }
         }
 
-        // --- Capabilities agent ---
+        // --- Capabilities agent (assert) ---
         const needCap = requiredCapability(action);
         const hb = await Heartbeat.findOne({ agentId }).lean();
         if (!hb) return res.status(404).json({ error: 'Agent not found (no heartbeat yet)', agentId });
@@ -104,77 +117,45 @@ exports.enqueueTask = async (req, res) => {
 
         // --- Données envoyées à l’agent ---
         const data = { ...(body.data || {}) };
-        if (needsRefId && !data.id && target.refId) data.id = target.refId; // l’agent lit data.id
-        let dataForAgent = { ...data, target }; // garde target pour l’audit
+        if (needsRefId && !data.id && target.refId) data.id = target.refId;
+        let dataForAgent = { ...data, target };
 
         // 🔹 ENRICH GÉNÉRIQUE
-        // délègue à /lib/enrich (qui appellera services/console pour JWT/URLs)
         let consoleMeta = null;
         const enr = await enrich(action, {
             operation: 'auto',
             object: dataForAgent,
-            // pas de "ctx" verbeux : on passe juste le minimum
-            ctx: {
-                user: req.user || null,
-                refId: target.refId || null,
-                tenantId,
-                agentId,
-            },
+            ctx: { user: req.user || null, refId: target.refId || null, tenantId, agentId },
         });
 
         if (enr.ok) {
             dataForAgent = enr.data || dataForAgent;
-            // Ne pas persister ni envoyer _console au broker/agent
             if (dataForAgent && dataForAgent._console) {
                 consoleMeta = dataForAgent._console;
                 try { delete dataForAgent._console; } catch { }
             }
         } else {
-            const isUnsupported =
-                enr.error?.startsWith('unsupported action:') ||
-                enr.error?.includes('unsupported operation');
-            if (!isUnsupported) {
-                return res.status(400).json({ error: `enrichment failed: ${enr.error}` });
-            }
-            // sinon no-op
+            const isUnsupported = enr.error?.startsWith('unsupported action:') || enr.error?.includes('unsupported operation');
+            if (!isUnsupported) return res.status(400).json({ error: `enrichment failed: ${enr.error}` });
         }
 
         // --- Créer + publier la task ---
         const taskId = randomUUID();
         const doc = await Task.create({
-            taskId,
-            tenantId,
-            agentId,
-            action,
-            data: dataForAgent,
-            correlationId: taskId,
-            status: 'queued',
-            queuedAt: new Date(),
+            taskId, tenantId, agentId, action, data: dataForAgent,
+            correlationId: taskId, status: 'queued', queuedAt: new Date(),
         });
 
         await publishTask({
-            taskId: doc.taskId,
-            tenantId: doc.tenantId,
-            agentId: doc.agentId,
-            action: doc.action,
-            data: doc.data,
-            correlationId: doc.correlationId,
+            taskId: doc.taskId, tenantId: doc.tenantId, agentId: doc.agentId,
+            action: doc.action, data: doc.data, correlationId: doc.correlationId,
         });
 
         await Task.updateOne({ taskId }, { $set: { status: 'sent', publishedAt: new Date() } });
 
         const base = admin ? '/api/v1/admin' : '/api/v1/tenant';
-        const resp = {
-            queued: true,
-            taskId,
-            agentOnline,
-            statusUrl: `${base}/tasks/${taskId}`
-        };
-
-        // Si enrich a préparé une session console, on la renvoie à l’UI
-        if (consoleMeta) {
-            resp.console = consoleMeta;
-        }
+        const resp = { queued: true, taskId, agentOnline, statusUrl: `${base}/tasks/${taskId}` };
+        if (consoleMeta) resp.console = consoleMeta;
 
         return res.status(202).json(resp);
     } catch (err) {

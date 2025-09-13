@@ -1,6 +1,8 @@
+
 // /lib/enrich.js
 const imagesService = require("../services/images");
 const consoleSvc = require("../services/console");
+
 
 const registry = {
     // =========================
@@ -25,6 +27,9 @@ const registry = {
         },
     },
 
+
+
+
     "vm.clone": {
         async auto(args) { return registry["vm.create"].auto(args); },
         async determineImage(args) { return registry["vm.create"].determineImage(args); },
@@ -37,16 +42,6 @@ const registry = {
     // =========================
     //   CONSOLE / TUNNELS
     // =========================
-
-    /**
-     * console.serial.open
-     * - Appelle services/console.planSerialOpen()
-     * - Renvoie les données agent (pour la task) + _console pour l’UI
-     *
-     * Attendu:
-     *  object: { refId?|vmId?, ttlSeconds? }
-     *  ctx:    { tenantId, agentId } (fourni par tasksController)
-     */
     "console.serial.open": {
         async auto({ object, ctx }) {
             const refId =
@@ -67,12 +62,7 @@ const registry = {
         },
     },
 
-    /**
-     * net.tunnel.open
-     * - Tunnel TCP générique (SSH/RDP/VNC…)
-     * object attendu: { target:{ip,port}, mode?, ttlSeconds? }
-     * ctx attendu   : { tenantId, agentId }
-     */
+
     "net.tunnel.open": {
         async auto({ object, ctx }) {
             const refId =

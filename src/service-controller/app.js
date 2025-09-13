@@ -11,11 +11,12 @@ const Heartbeat = require("./models/Heartbeat");
 
 const Task = require("./models/Task");
 
+const { election } = require("./services/election");
+
 
 const PORT = process.env.PORT || 3000;
-const MONGO_URL = process.env.MONGO_URL || "mongodb://mongo:27017/hvwm";
+const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/hvwm";
 
-console.log(MONGO_URL)
 async function main() {
     await mongoose.connect(MONGO_URL);
     console.log("[controller] Mongo connected");
@@ -24,6 +25,7 @@ async function main() {
     await startResultsToMongo(Task); // <-- important
 
     const app = express();
+
     app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
     app.use(express.json({ limit: "1mb" }));
     app.use(morgan("dev"));
@@ -32,7 +34,7 @@ async function main() {
     app.use('/api/v1', gRoutes);
     app.use('/api/v1/admin', aRoutes);
     app.use('/api/v1/tenant', tRoutes);
-
+    console.log("Chosen agent:", agentId);
     app.listen(PORT, () => console.log(`[controller] listening on :${PORT}`));
 }
 
