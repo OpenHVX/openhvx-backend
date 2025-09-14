@@ -1,4 +1,3 @@
-
 // /lib/enrich.js
 const imagesService = require("../services/images");
 const consoleSvc = require("../services/console");
@@ -16,6 +15,13 @@ const registry = {
                 if (!r || !r.path) throw new Error(`imageId not found: ${out.imageId}`);
                 out = { ...out, imagePath: r.path };
             }
+
+            out.generation = 2;
+
+            if (!out.switch) {
+                out.switch = "fabric0";
+            }
+
             return out;
         },
         async determineImage({ object }) {

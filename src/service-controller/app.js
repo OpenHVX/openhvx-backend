@@ -11,8 +11,6 @@ const Heartbeat = require("./models/Heartbeat");
 
 const Task = require("./models/Task");
 
-const { election } = require("./services/election");
-
 
 const PORT = process.env.PORT || 3000;
 const MONGO_URL = process.env.MONGO_URL || "mongodb://localhost:27017/hvwm";
@@ -34,7 +32,7 @@ async function main() {
     app.use('/api/v1', gRoutes);
     app.use('/api/v1/admin', aRoutes);
     app.use('/api/v1/tenant', tRoutes);
-    console.log("Chosen agent:", agentId);
+
     app.listen(PORT, () => console.log(`[controller] listening on :${PORT}`));
 }
 

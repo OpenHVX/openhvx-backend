@@ -7,6 +7,9 @@ const TenantResource = require('../models/TenantResource');
 const { enrich } = require('../lib/enrich');
 const { election } = require('../services/election')
 
+
+// ----- Helpers -------
+
 function requiredCapability(action) {
     const map = {
         'inventory.refresh': 'inventory',
@@ -25,13 +28,12 @@ function requiredCapability(action) {
 }
 
 function actionRequiresRefId(action) {
-    // 🔹 on force le refId pour les actions console/tunnel (scopées VM)
     if (/^console\.serial\.open$/i.test(action)) return true;
     if (/^net\.tunnel\.open$/i.test(action)) return true;
     return /^vm\.(delete|power|start|stop|restart|resize|attach|detach|snapshot|revert|rename|clone)$/i.test(action);
 }
 
-// Récupère un tenantId en “tout venant” (JWT, champ middleware, body, query)
+// Get TenantID from multiple source (JWT, middleware, body, query)
 function getTenantIdFromReq(req) {
     return (
         req?.tenant?.tenantId ||
@@ -64,7 +66,7 @@ exports.enqueueTask = async (req, res) => {
             return res.status(400).json({ error: 'Missing target.refId for this action' });
         }
 
-        // --- Tenant effectif ---
+        // --- Tenant ---
         const tenantId = admin ? (body.tenantId || getTenantIdFromReq(req)) : getTenantIdFromJWT(req);
         if (!tenantId) {
             return res.status(400).json({ error: admin ? 'tenantId is required for admin operations' : 'Missing tenant context' });
@@ -76,7 +78,6 @@ exports.enqueueTask = async (req, res) => {
         if (action === 'vm.create' && !target.agentId) {
             const freshness = Number(process.env.AGENT_FRESHNESS_SEC || 60);
             const needCap = requiredCapability(action); // => 'vm.create'
-            // ajoute d'autres caps si tu veux, ex: 'inventory'
             const agentIdSelected = await election({ freshness, capabilities: [needCap] });
 
             target.agentId = agentIdSelected;
@@ -115,12 +116,12 @@ exports.enqueueTask = async (req, res) => {
         const lastSeen = hb.lastSeen ? new Date(hb.lastSeen).getTime() : 0;
         const agentOnline = !!(lastSeen && Date.now() - lastSeen < staleMs);
 
-        // --- Données envoyées à l’agent ---
+        // --- Data sent to agent ---
         const data = { ...(body.data || {}) };
         if (needsRefId && !data.id && target.refId) data.id = target.refId;
         let dataForAgent = { ...data, target };
 
-        // 🔹 ENRICH GÉNÉRIQUE
+        // Enrich
         let consoleMeta = null;
         const enr = await enrich(action, {
             operation: 'auto',
@@ -139,7 +140,8 @@ exports.enqueueTask = async (req, res) => {
             if (!isUnsupported) return res.status(400).json({ error: `enrichment failed: ${enr.error}` });
         }
 
-        // --- Créer + publier la task ---
+        // --- Create the task and publish it ---
+        // Task will be updated based on the result in services/amqp.js
         const taskId = randomUUID();
         const doc = await Task.create({
             taskId, tenantId, agentId, action, data: dataForAgent,

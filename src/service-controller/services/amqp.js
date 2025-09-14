@@ -144,7 +144,6 @@ async function onTaskSucceededUpsertTenantLink(TaskModel, payload) {
 
 
     if (!t) return; // task inconnue (edge case)
-    console.log(JSON.stringify(t))
 
     const { action, tenantId, agentId } = t;
     if (!tenantId || !agentId) return; // sécurité (la task est notre source de vérité métier)
