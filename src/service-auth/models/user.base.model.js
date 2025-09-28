@@ -1,7 +1,8 @@
+// models/user.base.model.js
 const mongoose = require('mongoose');
 
-// models/user.base.js
 const Base = new mongoose.Schema({
+    kind: { type: String, required: true, enum: ['tenant', 'admin'] },
     email: { type: String, required: true, lowercase: true, trim: true, unique: true, index: true },
     username: { type: String, lowercase: true, trim: true, default: null },
     passwordHash: { type: String, required: true, select: false },
@@ -11,17 +12,3 @@ const Base = new mongoose.Schema({
 }, { timestamps: true, discriminatorKey: 'kind' });
 
 module.exports = mongoose.model('User', Base);
-
-// models/user.tenant.js
-const User = require('./user.base');
-const TenantSchema = new mongoose.Schema({
-    tenantId: { type: String, required: true, index: true },
-});
-module.exports = User.discriminator('tenant', TenantSchema);
-
-// models/user.admin.js
-const User = require('./user.base');
-const AdminSchema = new mongoose.Schema({
-    // pas de tenantId ici
-});
-module.exports = User.discriminator('admin', AdminSchema);

@@ -1,27 +1,17 @@
-// auth-service/routes/user.routes.js
-const express = require("express");
-const router = express.Router();
-const ctrl = require("../controllers/user.mongo.controller");
-const authStatic = require("../middlewares/auth.static");
+// routes/auth.routes.js
+const router = require('express').Router();
+const authTenant = require('../controllers/authTenant.controller');
+const authAdmin = require('../controllers/authAdmin.controller');
 
-// Health proxy (optionnel)
-router.get("/", (req, res) => res.json({ ok: true, service: "auth-service" }));
+router.post('/tenant/register', authTenant.register); // si tu l’actives
+router.post('/tenant/login', authTenant.login);
+router.post('/tenant/introspect', authTenant.introspect);
+router.get('/tenant/me', authTenant.me);
+router.get('/tenant/userinfo', authTenant.userinfo);
 
-// Auth
-router.post("/auth/register", authStatic({ env: "AUTH_ADMIN_API_KEY" }), ctrl.register);
-router.post("/auth/login", ctrl.login);
-
-// Introspection (si tu veux la verrouiller : define AUTH_INTROSPECT_API_KEY)
-const maybeProtectIntrospect = process.env.AUTH_INTROSPECT_API_KEY
-    ? authStatic({ env: "AUTH_INTROSPECT_API_KEY" })
-    : (req, res, next) => next();
-
-router.post("/auth/introspect", maybeProtectIntrospect, ctrl.introspect);
-
-// Profile
-router.get("/users/me", ctrl.me);
-
-router.get("/auth/userinfo", ctrl.userinfo);
-
-
+router.post('/admin/login', authAdmin.login);
+router.post('/admin/introspect', authAdmin.introspect);
+router.get('/admin/me', authAdmin.me);
+router.get('/admin/userinfo', authAdmin.userinfo);
+router.post('/admin/register', authAdmin.register);
 module.exports = router;

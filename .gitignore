@@ -4,6 +4,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+#traefik
+traefik/
 
 # Logs
 logs
@@ -57,3 +59,9 @@ docker-compose.override.yml
 .env.*
 !.env.example
 !.env.*.example
+
+#certs
+*.pem
+*.crt
+*.key
+*.pfx

@@ -12,7 +12,7 @@ function mountWsProxy(app, server, brokerUrl) {
         target,
         changeOrigin: true,
         ws: true,
-        logLevel: 'warn',
+        logLevel: 'debug',
         // /api/v1/... (Gateway) -> /v1/... (Controller)
         pathRewrite: { '^/api': '' },
     });

@@ -1,22 +1,64 @@
 services:
+
+  traefik:
+    image: traefik:v3.1
+    user: "0:0"
+    container_name: traefik
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --providers.docker=true
+      - --providers.docker.endpoint=unix:///run/podman/podman.sock
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=internal
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --api.dashboard=false
+      # logs
+      - --log.level=DEBUG
+      - --log.filePath=/var/log/traefik/traefik.log
+      - --accesslog=true
+      - --accesslog.filePath=/var/log/traefik/access.log
+      - --accesslog.bufferingsize=0
+      - --accesslog.fields.defaultmode=keep
+      - --accesslog.fields.headers.defaultmode=keep
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /run/podman/podman.sock:/run/podman/podman.sock:ro,z
+      - ./.traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./.traefik/certs:/etc/traefik/certs:ro
+      - ./.traefik/logs:/var/log/traefik 
+    networks:
+      - public
+      - internal
+    restart: unless-stopped
+    security_opt:
+      - label=disable
+
+
   mongo:
     image: mongo:6
     container_name: mongo
-    ports:
-      - "27017:27017"
     volumes:
       - mongo_data:/data/db
+    networks:
+      - internal
     restart: unless-stopped
 
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq
-    ports:
-      - "5672:5672"
-      - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: "guest"
       RABBITMQ_DEFAULT_PASS: "guest"
+    networks:
+      - internal
+      - public
+    ports:
+      - "5672:5672" 
+      - "15672:15672"
     restart: unless-stopped
 
   auth:
@@ -25,10 +67,10 @@ services:
       dockerfile: Dockerfile
     container_name: auth-service
     env_file: ./.env.auth
-    ports:
-      - "4000:4000"
     depends_on:
       - mongo
+    networks:
+      - internal
     restart: unless-stopped
 
   api-gateway:
@@ -36,21 +78,61 @@ services:
       context: ./src/service-api-gateway
     container_name: api-gateway
     env_file: ./.env.gateway
-    ports:
-      - "8080:8080"
     depends_on:
       - auth
+    networks:
+      - internal
     restart: unless-stopped
+    labels:
+      - traefik.enable=true
+
+      # TENANT
+      - traefik.http.routers.api.rule=Host(`api.openhvx.local`)
+      - traefik.http.routers.api.entrypoints=websecure
+      - traefik.http.routers.api.tls=true
+      - traefik.http.routers.api.middlewares=cors-auth@file,rate-tenant@file,sec-headers@file,compress@file
+      - traefik.http.routers.api.service=tenant-svc
+      - traefik.http.services.tenant-svc.loadbalancer.server.port=8080
+      - traefik.docker.network=internal
+
+      # ADMIN
+      - traefik.http.routers.admin.rule=Host(`admin-api.openhvx.local`)
+      - traefik.http.routers.admin.entrypoints=websecure
+      - traefik.http.routers.admin.tls=true
+      - traefik.http.routers.admin.middlewares=cors-auth@file,rate-admin@file,sec-headers@file,compress@file
+      - traefik.http.routers.admin.service=admin-svc
+      - traefik.http.services.admin-svc.loadbalancer.server.port=8080
+
+      # CONSOLE (Browser)
+      - traefik.http.routers.console.rule=Host(`console.openhvx.local`)
+      - traefik.http.routers.console.entrypoints=websecure
+      - traefik.http.routers.console.tls=true
+      - traefik.http.routers.console.middlewares=sec-headers@file,compress@file
+      - traefik.http.routers.console.service=console-svc
+      - traefik.http.services.console-svc.loadbalancer.server.port=8080
+      - traefik.docker.network=internal
+
 
   ws-broker:
     build:
       context: ./src/service-ws-broker
     container_name: ws-broker
     env_file: ./.env.ws
-    ports:
-      - "8081:8081"
-
+    networks:
+      - internal
     restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=internal
+
+      # AGENTS → ws-broker (direct)
+      - traefik.http.routers.wsb.rule=Host(`ws.openhvx.local`) && PathPrefix(`/ws/`)
+      - traefik.http.routers.wsb.entrypoints=websecure
+      - traefik.http.routers.wsb.tls=true
+      - traefik.http.routers.wsb.middlewares=sec-headers@file,compress@file
+      - traefik.http.routers.wsb.service=wsb-svc
+      - traefik.http.services.wsb-svc.loadbalancer.server.port=8081
+
   controller:
     build:
       context: ./src/service-controller
@@ -60,8 +142,19 @@ services:
       - mongo
       - rabbitmq
     volumes:
-      - /mnt/openhvx:/share:ro   # <-- partage SMB monté sur l’hôte → visible dans le container
+      - /mnt/openhvx:/share:ro
+    networks:
+      - internal
     restart: unless-stopped
 
 volumes:
   mongo_data:
+
+networks:
+  public:
+    driver: bridge
+    name: public
+  internal:
+    driver: bridge
+    internal: true 
+    name: internal

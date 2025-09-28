@@ -1,0 +1,4 @@
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/app.pem
+      keyFile:  /etc/traefik/certs/app-key.pem

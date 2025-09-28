@@ -1,0 +1,71 @@
+# traefik/middlewares.yml
+http:
+  middlewares:
+
+    sec-headers:
+      headers:
+        # HSTS – ok en dev si tu es en full HTTPS; sinon désactive
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+
+        # Anti-MIME sniff
+        contentTypeNosniff: true
+
+        # Referrer Policy
+        referrerPolicy: no-referrer-when-downgrade
+
+        # CSP minimaliste (ajuste si tu sers depuis CDNs, etc.)
+        contentSecurityPolicy: >
+          default-src 'self';
+          script-src 'self';
+          style-src 'self' 'unsafe-inline';
+          img-src 'self' data:;
+          connect-src 'self' https: wss:;
+          frame-ancestors 'self';
+        frameDeny: false
+
+        customResponseHeaders:
+          X-Content-Type-Options: nosniff
+          X-Frame-Options: SAMEORIGIN
+          X-XSS-Protection: "0"
+
+    cors-auth:
+      headers:
+        accessControlAllowCredentials: true
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+        accessControlAllowOriginList:
+          - http://127.0.0.1:5173
+          - http://localhost:5173
+          - https://app.openhvx.local
+          - https://admin.openhvx.local
+        accessControlAllowHeaders:
+          - Authorization
+          - Content-Type
+          - X-Requested-With
+          - X-Api-Key
+          - x-api-key
+          - X-Tenant-Id
+          - X-Request-Id
+        accessControlExposeHeaders:
+          - X-Request-Id
+        accessControlMaxAge: 600
+
+    rate-admin:
+      rateLimit:
+        average: 5
+        burst: 10
+
+    rate-tenant:
+      rateLimit:
+        average: 20
+        burst: 40
+
+    compress:
+      compress: {}
