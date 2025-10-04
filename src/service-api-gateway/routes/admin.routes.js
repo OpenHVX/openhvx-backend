@@ -7,7 +7,7 @@ const resolveTenantFromToken = require('../middlewares/resolveTenantFromToken');
 module.exports = ({ CONTROLLER_URL }) => {
     const router = require('express').Router();
 
-    // --- middlewares locaux ---------------------------------------------------
+    // --- local middlewares  ---------------------------------------------------
     const ensureAnyRole = (allowed) => (req, res, next) => {
         const u = req.user || {};
         const roles = Array.isArray(u.roles) ? u.roles

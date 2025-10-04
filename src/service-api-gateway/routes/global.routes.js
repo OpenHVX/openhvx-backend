@@ -3,8 +3,7 @@ const { createProxyMiddleware } = require("http-proxy-middleware");
 module.exports = ({ CONTROLLER_URL }) => {
     const router = require("express").Router();
 
-    // Toutes les routes de ce router sont montées sous /api/v1 côté Gateway.
-    // Ici, req.url vaut "/agents" → on doit préfixer "/api/v1" pour le controller.
+
     const proxy = createProxyMiddleware({
         target: CONTROLLER_URL,
         changeOrigin: true,

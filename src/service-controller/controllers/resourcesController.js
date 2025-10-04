@@ -65,10 +65,9 @@ const getTs = (doc) => {
 };
 
 /* ==================================================================== */
-/* VM merging (FULL ∪ LIGHT)                                            */
+/* VM merging (FULL & LIGHT)                                            */
 /* ==================================================================== */
 
-/** Champs volatils que l’on surcouche depuis la source la plus fraîche. */
 const VOLATILE_FIELDS = [
     "state",
     "uptimeSec",
@@ -78,13 +77,6 @@ const VOLATILE_FIELDS = [
     "automaticStop",
 ];
 
-/**
- * Fusionne une VM “base” avec une VM “overlay” (volatils + VHD fileSizeMB).
- * - Les champs structurels (ex: stockage) proviennent du base.
- * - On surcouche:
- *    * champs volatils
- *    * vhd.fileSizeMB (max entre base et overlay, pour VHDX dynamiques)
- */
 function mergeVm(baseVm, overlayVm) {
     if (!overlayVm) return { ...baseVm };
 
@@ -95,7 +87,7 @@ function mergeVm(baseVm, overlayVm) {
         if (overlayVm[k] != null) out[k] = overlayVm[k];
     }
 
-    // 2) Disques: conserver structure du base, surcoucher infos connues
+    // 2) Disques
     const baseDisks = arr(baseVm.storage);
     const ovDisks = arr(overlayVm.storage);
     const byPath = mapBy(ovDisks, (d) => normPath(d?.path));

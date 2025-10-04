@@ -302,7 +302,7 @@ async function computeTenantOverview(tenantId) {
 // ---- TENANT: /tenant/metrics/overview -------------------------------------
 exports.tenantOverview = async (req, res) => {
     try {
-        // ⚠️ ne JAMAIS lire tenantId depuis la query ici
+
         const tenantId = req?.tenant?.tenantId || req?.tenantId;
         if (!tenantId) return res.status(400).json({ error: 'Missing tenant context' });
 

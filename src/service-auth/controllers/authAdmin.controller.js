@@ -21,6 +21,7 @@ function timingSafeEq(a, b) {
     const bh = crypto.createHash('sha256').update(B).digest();
     try { return crypto.timingSafeEqual(ah, bh); } catch { return false; }
 }
+
 function assertRegisterAuth(req) {
     if (!REGISTER_ENABLED) return { ok: false, status: 404, error: 'NotFound' };
     if (!REGISTER_API_KEY) return { ok: false, status: 503, error: 'RegisterNotConfigured' };
@@ -28,8 +29,11 @@ function assertRegisterAuth(req) {
     if (!timingSafeEq(provided, REGISTER_API_KEY)) return { ok: false, status: 401, error: 'Unauthorized' };
     return { ok: true };
 }
+
 function norm(s) { return (s ?? '').toString().trim().toLowerCase(); }
+
 function ridOf(req) { return req._rid || crypto.randomUUID(); }
+
 function publicUser(u) {
     return {
         id: String(u._id),
@@ -41,6 +45,7 @@ function publicUser(u) {
         updatedAt: u.updatedAt,
     };
 }
+
 function resolveRegisterMode(req) {
     const m = String(req.query?.mode || '').toLowerCase();
     return ['once', 'reset', 'upsert'].includes(m) ? m : 'once'; // défaut: once

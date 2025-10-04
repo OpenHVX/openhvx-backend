@@ -4,7 +4,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 module.exports = ({ AUTH_URL }) => {
     const router = require('express').Router();
 
-    // --- middlewares locaux ---------------------------------------------------
+    // --- local middlewares  ---------------------------------------------------
     const stripSpoofableHeaders = (_req, _res, next) => {
         delete _req.headers['x-tenant-id'];
         delete _req.headers['x-tenant'];
@@ -27,8 +27,6 @@ module.exports = ({ AUTH_URL }) => {
         }
         next();
     };
-
-    // Proxy factory pour avoir un rewrite spécifique par endpoint
     const mkProxy = (rewritePathFn) =>
         createProxyMiddleware({
             target: AUTH_URL,
@@ -63,7 +61,7 @@ module.exports = ({ AUTH_URL }) => {
             },
         });
 
-    // --- routes explicites (pas de catch-all) ---------------------------------
+    // --- routes ---------------------------------
 
     // POST /auth/login  -> auth-service /auth/login
     // (pas d’Authorization nécessaire ici ; on nettoie juste les headers spoofables)

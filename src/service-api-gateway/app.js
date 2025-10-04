@@ -70,18 +70,13 @@ app.get("/healthz", (_req, res) => res.json({ ok: true, service: "api-gateway" }
 const tenantAuthRoutes = require("./routes/tenant.auth.routes")({ AUTH_URL });
 const adminAuthRoutes = require("./routes/admin.auth.routes")({ AUTH_URL });
 
-// Nouveaux prefixes explicites
 app.use("/api/v1/tenant/auth", tenantAuthRoutes);
 app.use("/api/v1/admin/auth", adminAuthRoutes);
-
-// (Optionnel) Compat temporaire: si tu veux encore accepter /api/auth/* pendant la migration,
-// décommente la ligne ci-dessous et crée un petit routes/compat.auth.routes.js si besoin.
-// app.use("/api/auth", require("./routes/compat.auth.routes")({ AUTH_URL }));
 
 // ============================================================================
 // Protected APIs
 // ============================================================================
-const verifyViaAuth = require("./middlewares/verifyViaAuth")({ AUTH_URL }); // version host-aware
+const verifyViaAuth = require("./middlewares/verifyViaAuth")({ AUTH_URL });
 
 // Global (public) — inchangé
 app.use("/api/v1", require("./routes/global.routes")({ CONTROLLER_URL }));
