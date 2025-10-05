@@ -33,9 +33,6 @@ const registry = {
         },
     },
 
-
-
-
     "vm.clone": {
         async auto(args) { return registry["vm.create"].auto(args); },
         async determineImage(args) { return registry["vm.create"].determineImage(args); },

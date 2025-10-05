@@ -1,17 +1,24 @@
+// controllers/resources.js
+"use strict";
+
 /**
  * Resources Controller
  * --------------------
- * Objectif:
- *  - Exposer les ressources d'un tenant (VMs, switches) à partir de deux inventaires :
- *    * FULL  : riche, périodique (lent)
- *    * LIGHT : léger, post-tâche (rapide)
+ * Purpose:
+ *  - Expose tenant resources (VMs, switches) by combining two inventories:
+ *    * FULL  : rich, periodic (slow)
+ *    * LIGHT : lightweight, posted after an agent task (fast)
  *
- * Principes:
- *  - On NE REJETTE JAMAIS le LIGHT : on construit l'UNION FULL ∪ LIGHT.
- *  - Base d'une VM = entrée FULL si dispo, sinon LIGHT.
- *  - Champs volatils (state/uptime/cpu/ram/autoStart/autoStop + vhd.fileSizeMB) =
- *    source la plus RÉCENTE (FULL vs LIGHT).
- *  - Compat structure: { inventory: { ... } } et { inventory: { inventory: { ... } } }
+ * New, reliable merge rule:
+ *  - FULL is authoritative for existence (a VM must be present in FULL to exist),
+ *  - LIGHT may overlay volatile fields when LIGHT is newer than FULL, 
+ *  - Exception (fast create): if LIGHT is newer than FULL AND the VM key is explicitly
+ *    linked in TenantResource for this agent, we allow it to appear from LIGHT
+ *    until the next FULL arrives.
+ *
+ * Rationale:
+ *  - Prevent “ghost VMs” when deleted on the host (absent in FULL ⇒ not listed),
+ *  - Still show newly created VMs right after a task completes, without waiting for FULL.
  */
 
 const TenantResource = require("../models/TenantResource");
@@ -22,24 +29,24 @@ const InventoryLight = require("../models/Inventory.light");
 /* Utilities                                                            */
 /* ==================================================================== */
 
-/** Récupère le tenantId depuis l’URL, le middleware ou le JWT. */
+/** Get tenantId from URL, middleware, or JWT. */
 const getTenantId = (req) =>
     req.params?.tenantId || req.tenantId || req.user?.tenantId || null;
 
-/** Norme: tableau (sécurise les boucles). */
+/** Normalize to array (safe loop). */
 const arr = (v) => (Array.isArray(v) ? v : []);
 
-/** Normalise un chemin Windows pour comparer insensiblement à la casse et aux / vs \. */
+/** Normalize Windows path for case-insensitive + / vs \ comparison. */
 const normPath = (p) =>
     typeof p === "string" ? p.replace(/\//g, "\\").toLowerCase() : p;
 
-/** Racine d’inventaire (FULL & LIGHT actuels + rétro-compat). */
+/** Root of inventory (support legacy shapes { inventory:{...} } and { inventory:{ inventory:{...} } }). */
 const root = (doc) => doc?.inventory?.inventory || doc?.inventory || {};
 
-/** Clé d’index d’une VM : guid > id > name. */
+/** VM key priority: guid > id > name. */
 const vmKey = (vm) => vm?.guid || vm?.id || vm?.name || null;
 
-/** Fabrique une Map<K,V> depuis une liste en extrayant une clé. */
+/** Build a Map<K,V> from a list by extracting a key. */
 const mapBy = (list, keyFn) => {
     const m = new Map();
     for (const x of arr(list)) {
@@ -49,7 +56,7 @@ const mapBy = (list, keyFn) => {
     return m;
 };
 
-/** Timestamp fiable depuis doc.ts ou inventory.collectedAt (sinon null). */
+/** Reliable timestamp from doc.ts or inventory.collectedAt (else null). */
 const getTs = (doc) => {
     if (!doc) return null;
     if (doc.ts) {
@@ -64,8 +71,14 @@ const getTs = (doc) => {
     return null;
 };
 
+/** All possible identity keys for a VM (stringified). */
+const vmKeysAll = (vm) => [vm?.guid, vm?.id, vm?.name].filter(Boolean).map(String);
+
+/** Lowercase helper. */
+const lcase = (s) => (typeof s === "string" ? s.toLowerCase() : s);
+
 /* ==================================================================== */
-/* VM merging (FULL & LIGHT)                                            */
+/* VM merge (FULL authoritative + LIGHT overlay + fast-create exception)*/
 /* ==================================================================== */
 
 const VOLATILE_FIELDS = [
@@ -77,17 +90,20 @@ const VOLATILE_FIELDS = [
     "automaticStop",
 ];
 
+/**
+ * Overlay "overlayVm" onto "baseVm" for volatile fields and disk vhd.fileSizeMB.
+ */
 function mergeVm(baseVm, overlayVm) {
     if (!overlayVm) return { ...baseVm };
 
     const out = { ...baseVm };
 
-    // 1) Champs volatils
+    // 1) Volatile fields overlay (only if present in overlay)
     for (const k of VOLATILE_FIELDS) {
         if (overlayVm[k] != null) out[k] = overlayVm[k];
     }
 
-    // 2) Disques
+    // 2) Disks - keep best (max) vhd.fileSizeMB seen across sources
     const baseDisks = arr(baseVm.storage);
     const ovDisks = arr(overlayVm.storage);
     const byPath = mapBy(ovDisks, (d) => normPath(d?.path));
@@ -100,8 +116,7 @@ function mergeVm(baseVm, overlayVm) {
         const ov = od?.vhd || {};
 
         const cur = typeof bv.fileSizeMB === "number" ? bv.fileSizeMB : -Infinity;
-        const nxt =
-            typeof ov.fileSizeMB === "number" ? Math.max(cur, ov.fileSizeMB) : cur;
+        const nxt = typeof ov.fileSizeMB === "number" ? Math.max(cur, ov.fileSizeMB) : cur;
 
         return {
             ...bd,
@@ -123,37 +138,76 @@ function mergeVm(baseVm, overlayVm) {
 }
 
 /**
- * Construit, pour un agent, l’UNION des VMs FULL ∪ LIGHT.
- * - Base = FULL si dispo, sinon LIGHT.
- * - Overlay = VM issue de la source la plus fraîche (FULL vs LIGHT), si différente.
+ * Combine VMs for a given agent.
+ *
+ * Rules:
+ *  - If FULL exists:
+ *      • Only VMs present in FULL are returned (existence is FULL-authoritative),
+ *      • LIGHT can overlay volatile fields when LIGHT is newer than FULL,
+ *      • Exception: if LIGHT is newer AND the VM key is explicitly linked for the tenant/agent
+ *        (allowLightOnlyKeys), allow LIGHT-only VMs to appear temporarily (fast create).
+ *  - If no FULL exists at all (agent just started or first sync):
+ *      • Return LIGHT (best effort) — still not a union with stale FULL.
+ *
+ * @param {Object|null} fullDoc
+ * @param {Object|null} lightDoc
+ * @param {Set<string>|null} allowLightOnlyKeys - allowed keys (refId/name) in lowercase
+ * @returns {Array<Object>} merged list of VMs
  */
-function combineAgent(fullDoc, lightDoc) {
+function combineAgent(fullDoc, lightDoc, allowLightOnlyKeys = null) {
     const fullVms = arr(root(fullDoc).vms);
     const lightVms = arr(root(lightDoc).vms);
 
     const tFull = getTs(fullDoc) ?? -Infinity;
     const tLight = getTs(lightDoc) ?? -Infinity;
+    const lightIsNewer = tLight > tFull;
 
-    const byFull = mapBy(fullVms, vmKey);
-    const byLight = mapBy(lightVms, vmKey);
+    // Index LIGHT by all possible keys (guid, id, name)
+    const byLight = new Map();
+    for (const lv of lightVms) {
+        for (const k of vmKeysAll(lv)) {
+            if (!byLight.has(k)) byLight.set(k, lv);
+        }
+    }
 
-    // Union des clés (guid/id/name) connues dans FULL et/ou LIGHT
-    const keys = new Set([...byFull.keys(), ...byLight.keys()]);
+    // No FULL available yet → initial best-effort from LIGHT
+    if (fullVms.length === 0) {
+        return lightVms.map((v) => ({ ...v }));
+    }
 
+    // FULL present → base = FULL; overlay with LIGHT (if newer)
+    const presentKeyLC = new Set();
     const out = [];
-    for (const k of keys) {
-        const vf = byFull.get(k);
-        const vl = byLight.get(k);
 
-        // Base: FULL si dispo, sinon LIGHT
-        const base = vf || vl;
-        if (!base) continue;
+    for (const fv of fullVms) {
+        // Try to find LIGHT counterpart by any identity key
+        let lv = null;
+        for (const k of vmKeysAll(fv)) {
+            if (byLight.has(k)) {
+                lv = byLight.get(k);
+                break;
+            }
+        }
+        const merged = lightIsNewer && lv ? mergeVm(fv, lv) : { ...fv };
+        out.push(merged);
 
-        // Overlay: source la plus fraîche (si elle existe)
-        const overlay =
-            tFull >= tLight ? (tFull === -Infinity ? null : vf) : (tLight === -Infinity ? null : vl);
+        // Track keys we already emitted (lowercase for easier set membership)
+        for (const k of vmKeysAll(fv)) presentKeyLC.add(lcase(k));
+    }
 
-        out.push(mergeVm(base, overlay));
+    // Fast-create exception: allow LIGHT-only VMs if LIGHT is newer AND explicitly linked
+    if (lightIsNewer && allowLightOnlyKeys && allowLightOnlyKeys.size) {
+        for (const lv of lightVms) {
+            const keys = vmKeysAll(lv);
+            const alreadyPresent = keys.some((k) => presentKeyLC.has(lcase(k)));
+            if (alreadyPresent) continue;
+
+            const allowed = keys.some((k) => allowLightOnlyKeys.has(lcase(k)));
+            if (allowed) {
+                out.push({ ...lv });
+                for (const k of keys) presentKeyLC.add(lcase(k));
+            }
+        }
     }
 
     return out;
@@ -163,7 +217,10 @@ function combineAgent(fullDoc, lightDoc) {
 /* Non-VM extraction (switches, etc.)                                   */
 /* ==================================================================== */
 
-/** Extrait (kind=vm|switch) depuis un document d’inventaire. */
+/**
+ * Extract resources (kind = vm|switch) from an inventory doc.
+ * Used by the "unassigned resources" helper endpoint.
+ */
 function pickFromInv(invDoc, { kind, agentId }) {
     const out = [];
     const aId = agentId || invDoc.agentId;
@@ -201,7 +258,7 @@ exports.listResources = async (req, res) => {
         const { kind, agentId, includeOrphans } = req.query;
         const showOrphans = String(includeOrphans).toLowerCase() === "true";
 
-        // 1) Liens (ressources revendiquées par le tenant)
+        // 1) All links (resources claimed by the tenant)
         const q = { tenantId };
         if (kind) q.kind = kind;
         if (agentId) q.agentId = agentId;
@@ -209,27 +266,37 @@ exports.listResources = async (req, res) => {
         const links = await TenantResource.find(q).lean();
         if (!links.length) return res.json({ success: true, data: [] });
 
-        // 2) Inventaires FULL & LIGHT pour tous les agents impliqués
+        // 2) Get FULL & LIGHT for all involved agents
         const agentIds = Array.from(new Set(links.map((l) => l.agentId)));
 
         const [fullDocs, lightDocs] = await Promise.all([
-            InventoryFull.find(
-                { agentId: { $in: agentIds } },
-                { agentId: 1, inventory: 1, ts: 1 }
-            ).lean(),
-            InventoryLight.find(
-                { agentId: { $in: agentIds } },
-                { agentId: 1, inventory: 1, ts: 1 }
-            ).lean(),
+            InventoryFull.find({ agentId: { $in: agentIds } }, { agentId: 1, inventory: 1, ts: 1 }).lean(),
+            InventoryLight.find({ agentId: { $in: agentIds } }, { agentId: 1, inventory: 1, ts: 1 }).lean(),
         ]);
 
         const fullBy = new Map(fullDocs.map((d) => [d.agentId, d]));
         const lightBy = new Map(lightDocs.map((d) => [d.agentId, d]));
 
-        // 3) Pour chaque agent, on prépare un index VM fusionné (FULL ∪ LIGHT)
+        // 3) Per agent, prepare allowed keys for LIGHT-only "fast create" (from links)
+        //    We allow refId and (optionally) name as keys; store them lowercase for quick membership tests.
+        const allowByAgent = new Map();
+        for (const l of links) {
+            if (l.kind !== "vm") continue;
+            const set = allowByAgent.get(l.agentId) || new Set();
+            if (l.refId) set.add(l.refId.toLowerCase());
+            if (l.name) set.add(l.name.toLowerCase());
+            allowByAgent.set(l.agentId, set);
+        }
+
+        // 4) For each agent, build a merged VM index (FULL with LIGHT overlay + exceptions)
         const vmIdxByAgent = new Map();
         for (const aId of agentIds) {
-            const merged = combineAgent(fullBy.get(aId) || null, lightBy.get(aId) || null);
+            const merged = combineAgent(
+                fullBy.get(aId) || null,
+                lightBy.get(aId) || null,
+                allowByAgent.get(aId) || null
+            );
+
             const idx = new Map();
             for (const vm of merged) {
                 for (const k of [vm.guid, vm.id, vm.name].filter(Boolean).map(String)) {
@@ -239,13 +306,13 @@ exports.listResources = async (req, res) => {
             vmIdxByAgent.set(aId, idx);
         }
 
-        // 4) Reconstitue la réponse dans l’ordre des liens
+        // 5) Rebuild response in link order; show orphans only if requested
         const out = [];
         for (const l of links) {
             if (l.kind === "vm") {
                 const idx = vmIdxByAgent.get(l.agentId) || new Map();
 
-                // Recherche par refId, puis fallback par name (case-insensitive)
+                // Try by refId, then fallback by stored name (case-insensitive)
                 let vm = idx.get(String(l.refId));
                 if (!vm && l.name) {
                     vm = idx.get(String(l.name));
@@ -259,6 +326,7 @@ exports.listResources = async (req, res) => {
                         }
                     }
                 }
+                // Final fallback: if refId is "name-like", try matching by VM name case-insensitively
                 if (!vm && /^[a-z0-9._-]+$/i.test(String(l.refId))) {
                     const wanted = String(l.refId).toLowerCase();
                     for (const v of idx.values()) {
@@ -293,7 +361,7 @@ exports.listResources = async (req, res) => {
             }
 
             if (l.kind === "switch") {
-                // Pour les switches, on reste FULL-first (structure généralement plus riche)
+                // For switches we keep FULL-first (structure usually richer)
                 const invFull = root(fullBy.get(l.agentId) || {});
                 const sw = arr(invFull?.networks?.switches).find((s) => s.name === l.refId);
 
@@ -320,7 +388,7 @@ exports.listResources = async (req, res) => {
                 continue;
             }
 
-            // kind "image" géré ailleurs
+            // kind "image" or others handled elsewhere
         }
 
         return res.json({ success: true, data: out });
@@ -391,6 +459,7 @@ exports.unclaimResource = async (req, res) => {
 
 /**
  * GET /api/v1/admin/resources/unassigned?kind=vm|switch&agentId=HOST&limit=100
+ * Helper endpoint: lists resources present in FULL but not claimed in TenantResource.
  */
 exports.listUnassignedResources = async (req, res) => {
     try {
@@ -406,7 +475,7 @@ exports.listUnassignedResources = async (req, res) => {
         for (const d of invs) cand.push(...pickFromInv(d, { kind, agentId: d.agentId }));
         if (cand.length === 0) return res.json({ success: true, data: [] });
 
-        // Dédupliquer & retirer ce qui est déjà assigné
+        // De-duplicate and remove already assigned
         const key = (r) => `${r.kind}|${r.agentId}|${r.refId}`;
         const uniq = Array.from(new Set(cand.map(key)));
 
@@ -419,10 +488,7 @@ exports.listUnassignedResources = async (req, res) => {
                 const [knd, aId, ref] = k.split("|");
                 return { kind: knd, agentId: aId, refId: ref };
             });
-            const assigned = await TenantResource.find(
-                { $or: or },
-                { kind: 1, agentId: 1, refId: 1 }
-            ).lean();
+            const assigned = await TenantResource.find({ $or: or }, { kind: 1, agentId: 1, refId: 1 }).lean();
             for (const a of assigned) assignedSet.add(key(a));
         }
 
