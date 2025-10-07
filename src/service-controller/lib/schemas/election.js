@@ -1,4 +1,3 @@
-
 // lib/schemas/election.js
 const { objectStrict, arrayOf, isString, isInteger, isDate } = require("../validate");
 

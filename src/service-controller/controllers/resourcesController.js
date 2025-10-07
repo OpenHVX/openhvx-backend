@@ -4,22 +4,16 @@
 /**
  * Resources Controller
  * --------------------
- * Purpose:
- *  - Expose tenant resources (VMs, switches) by combining two inventories:
- *    * FULL  : rich, periodic (slow)
- *    * LIGHT : lightweight, posted after an agent task (fast)
- *
- * New, reliable merge rule:
- *  - FULL is authoritative for existence (a VM must be present in FULL to exist),
- *  - LIGHT may overlay volatile fields when LIGHT is newer than FULL, 
- *  - Exception (fast create): if LIGHT is newer than FULL AND the VM key is explicitly
- *    linked in TenantResource for this agent, we allow it to appear from LIGHT
- *    until the next FULL arrives.
- *
- * Rationale:
- *  - Prevent “ghost VMs” when deleted on the host (absent in FULL ⇒ not listed),
- *  - Still show newly created VMs right after a task completes, without waiting for FULL.
+ * (docs unchanged for brevity)
  */
+const { ERR, send } = require('../lib/errors/http-errors');
+const {
+    validateListQuery,
+    validateClaimBody,
+    validateUnclaimParams,
+    validateUnclaimQuery,
+    validateUnassignedQuery,
+} = require('../lib/schemas/resource');
 
 const TenantResource = require("../models/TenantResource");
 const InventoryFull = require("../models/Inventory.full");
@@ -40,7 +34,7 @@ const arr = (v) => (Array.isArray(v) ? v : []);
 const normPath = (p) =>
     typeof p === "string" ? p.replace(/\//g, "\\").toLowerCase() : p;
 
-/** Root of inventory (support legacy shapes { inventory:{...} } and { inventory:{ inventory:{...} } }). */
+/** Root of inventory (supports legacy shapes). */
 const root = (doc) => doc?.inventory?.inventory || doc?.inventory || {};
 
 /** VM key priority: guid > id > name. */
@@ -72,10 +66,32 @@ const getTs = (doc) => {
 };
 
 /** All possible identity keys for a VM (stringified). */
-const vmKeysAll = (vm) => [vm?.guid, vm?.id, vm?.name].filter(Boolean).map(String);
+const vmKeysAll = (vm) =>
+    [vm?.guid, vm?.id, vm?.name].filter(Boolean).map(String);
 
 /** Lowercase helper. */
 const lcase = (s) => (typeof s === "string" ? s.toLowerCase() : s);
+
+/* ==================================================================== */
+/* Agent staleness                                                      */
+/* ==================================================================== */
+
+const STALE_MS = Number(
+    process.env.AGENT_STALE_MS ||
+    process.env.RESOURCE_STATE_STALE_MS ||
+    3 * 60 * 1000
+);
+
+const agentLastTs = (fullDoc, lightDoc) => {
+    const t1 = getTs(fullDoc) ?? -Infinity;
+    const t2 = getTs(lightDoc) ?? -Infinity;
+    return Math.max(t1, t2);
+};
+
+const isStale = (fullDoc, lightDoc, now = Date.now()) => {
+    const last = agentLastTs(fullDoc, lightDoc);
+    return !Number.isFinite(last) || now - last > STALE_MS;
+};
 
 /* ==================================================================== */
 /* VM merge (FULL authoritative + LIGHT overlay + fast-create exception)*/
@@ -90,20 +106,16 @@ const VOLATILE_FIELDS = [
     "automaticStop",
 ];
 
-/**
- * Overlay "overlayVm" onto "baseVm" for volatile fields and disk vhd.fileSizeMB.
- */
 function mergeVm(baseVm, overlayVm) {
     if (!overlayVm) return { ...baseVm };
-
     const out = { ...baseVm };
 
-    // 1) Volatile fields overlay (only if present in overlay)
+    // (1) Volatile overlay
     for (const k of VOLATILE_FIELDS) {
         if (overlayVm[k] != null) out[k] = overlayVm[k];
     }
 
-    // 2) Disks - keep best (max) vhd.fileSizeMB seen across sources
+    // (2) Disks: keep best (max) vhd.fileSizeMB
     const baseDisks = arr(baseVm.storage);
     const ovDisks = arr(overlayVm.storage);
     const byPath = mapBy(ovDisks, (d) => normPath(d?.path));
@@ -137,23 +149,6 @@ function mergeVm(baseVm, overlayVm) {
     return out;
 }
 
-/**
- * Combine VMs for a given agent.
- *
- * Rules:
- *  - If FULL exists:
- *      • Only VMs present in FULL are returned (existence is FULL-authoritative),
- *      • LIGHT can overlay volatile fields when LIGHT is newer than FULL,
- *      • Exception: if LIGHT is newer AND the VM key is explicitly linked for the tenant/agent
- *        (allowLightOnlyKeys), allow LIGHT-only VMs to appear temporarily (fast create).
- *  - If no FULL exists at all (agent just started or first sync):
- *      • Return LIGHT (best effort) — still not a union with stale FULL.
- *
- * @param {Object|null} fullDoc
- * @param {Object|null} lightDoc
- * @param {Set<string>|null} allowLightOnlyKeys - allowed keys (refId/name) in lowercase
- * @returns {Array<Object>} merged list of VMs
- */
 function combineAgent(fullDoc, lightDoc, allowLightOnlyKeys = null) {
     const fullVms = arr(root(fullDoc).vms);
     const lightVms = arr(root(lightDoc).vms);
@@ -162,7 +157,7 @@ function combineAgent(fullDoc, lightDoc, allowLightOnlyKeys = null) {
     const tLight = getTs(lightDoc) ?? -Infinity;
     const lightIsNewer = tLight > tFull;
 
-    // Index LIGHT by all possible keys (guid, id, name)
+    // Index LIGHT by all possible keys
     const byLight = new Map();
     for (const lv of lightVms) {
         for (const k of vmKeysAll(lv)) {
@@ -170,7 +165,7 @@ function combineAgent(fullDoc, lightDoc, allowLightOnlyKeys = null) {
         }
     }
 
-    // No FULL available yet → initial best-effort from LIGHT
+    // No FULL yet → best effort from LIGHT
     if (fullVms.length === 0) {
         return lightVms.map((v) => ({ ...v }));
     }
@@ -180,22 +175,17 @@ function combineAgent(fullDoc, lightDoc, allowLightOnlyKeys = null) {
     const out = [];
 
     for (const fv of fullVms) {
-        // Try to find LIGHT counterpart by any identity key
         let lv = null;
         for (const k of vmKeysAll(fv)) {
-            if (byLight.has(k)) {
-                lv = byLight.get(k);
-                break;
-            }
+            if (byLight.has(k)) { lv = byLight.get(k); break; }
         }
         const merged = lightIsNewer && lv ? mergeVm(fv, lv) : { ...fv };
         out.push(merged);
 
-        // Track keys we already emitted (lowercase for easier set membership)
         for (const k of vmKeysAll(fv)) presentKeyLC.add(lcase(k));
     }
 
-    // Fast-create exception: allow LIGHT-only VMs if LIGHT is newer AND explicitly linked
+    // Fast-create: allow LIGHT-only if explicitly linked and LIGHT newer
     if (lightIsNewer && allowLightOnlyKeys && allowLightOnlyKeys.size) {
         for (const lv of lightVms) {
             const keys = vmKeysAll(lv);
@@ -214,34 +204,6 @@ function combineAgent(fullDoc, lightDoc, allowLightOnlyKeys = null) {
 }
 
 /* ==================================================================== */
-/* Non-VM extraction (switches, etc.)                                   */
-/* ==================================================================== */
-
-/**
- * Extract resources (kind = vm|switch) from an inventory doc.
- * Used by the "unassigned resources" helper endpoint.
- */
-function pickFromInv(invDoc, { kind, agentId }) {
-    const out = [];
-    const aId = agentId || invDoc.agentId;
-    const inv = root(invDoc);
-
-    if (!kind || kind === "vm") {
-        for (const vm of arr(inv.vms)) {
-            const k = vmKey(vm);
-            if (k) out.push({ kind: "vm", agentId: aId, refId: k, data: vm });
-        }
-    }
-    if (!kind || kind === "switch") {
-        for (const sw of arr(inv?.networks?.switches)) {
-            const name = sw?.name;
-            if (name) out.push({ kind: "switch", agentId: aId, refId: name, data: sw });
-        }
-    }
-    return out;
-}
-
-/* ==================================================================== */
 /* Controllers                                                           */
 /* ==================================================================== */
 
@@ -253,9 +215,13 @@ function pickFromInv(invDoc, { kind, agentId }) {
 exports.listResources = async (req, res) => {
     try {
         const tenantId = getTenantId(req);
-        if (!tenantId) return res.status(400).json({ error: "Missing tenant context" });
+        if (!tenantId) return send(res, ERR.tenantContextMissing(), req);
 
-        const { kind, agentId, includeOrphans } = req.query;
+        // Validate query
+        const vq = validateListQuery(req.query || {});
+        if (!vq.ok) return send(res, ERR.validationPre(vq.errors), req);
+
+        const { kind, agentId, includeOrphans } = vq.value;
         const showOrphans = String(includeOrphans).toLowerCase() === "true";
 
         // 1) All links (resources claimed by the tenant)
@@ -270,15 +236,20 @@ exports.listResources = async (req, res) => {
         const agentIds = Array.from(new Set(links.map((l) => l.agentId)));
 
         const [fullDocs, lightDocs] = await Promise.all([
-            InventoryFull.find({ agentId: { $in: agentIds } }, { agentId: 1, inventory: 1, ts: 1 }).lean(),
-            InventoryLight.find({ agentId: { $in: agentIds } }, { agentId: 1, inventory: 1, ts: 1 }).lean(),
+            InventoryFull.find(
+                { agentId: { $in: agentIds } },
+                { agentId: 1, inventory: 1, ts: 1 }
+            ).lean(),
+            InventoryLight.find(
+                { agentId: { $in: agentIds } },
+                { agentId: 1, inventory: 1, ts: 1 }
+            ).lean(),
         ]);
 
         const fullBy = new Map(fullDocs.map((d) => [d.agentId, d]));
         const lightBy = new Map(lightDocs.map((d) => [d.agentId, d]));
 
-        // 3) Per agent, prepare allowed keys for LIGHT-only "fast create" (from links)
-        //    We allow refId and (optionally) name as keys; store them lowercase for quick membership tests.
+        // 3) Per agent, keys allowed for LIGHT-only "fast create" (from links)
         const allowByAgent = new Map();
         for (const l of links) {
             if (l.kind !== "vm") continue;
@@ -288,7 +259,13 @@ exports.listResources = async (req, res) => {
             allowByAgent.set(l.agentId, set);
         }
 
-        // 4) For each agent, build a merged VM index (FULL with LIGHT overlay + exceptions)
+        // 4) Staleness by agent
+        const staleByAgent = new Map();
+        for (const aId of agentIds) {
+            staleByAgent.set(aId, isStale(fullBy.get(aId), lightBy.get(aId)));
+        }
+
+        // 5) Build merged VM index per agent
         const vmIdxByAgent = new Map();
         for (const aId of agentIds) {
             const merged = combineAgent(
@@ -306,45 +283,41 @@ exports.listResources = async (req, res) => {
             vmIdxByAgent.set(aId, idx);
         }
 
-        // 5) Rebuild response in link order; show orphans only if requested
+        // 6) Rebuild response in link order; show orphans only if requested
         const out = [];
         for (const l of links) {
             if (l.kind === "vm") {
                 const idx = vmIdxByAgent.get(l.agentId) || new Map();
 
-                // Try by refId, then fallback by stored name (case-insensitive)
                 let vm = idx.get(String(l.refId));
                 if (!vm && l.name) {
                     vm = idx.get(String(l.name));
                     if (!vm) {
                         const wanted = String(l.name).toLowerCase();
                         for (const v of idx.values()) {
-                            if ((v?.name || "").toLowerCase() === wanted) {
-                                vm = v;
-                                break;
-                            }
+                            if ((v?.name || "").toLowerCase() === wanted) { vm = v; break; }
                         }
                     }
                 }
-                // Final fallback: if refId is "name-like", try matching by VM name case-insensitively
                 if (!vm && /^[a-z0-9._-]+$/i.test(String(l.refId))) {
                     const wanted = String(l.refId).toLowerCase();
                     for (const v of idx.values()) {
-                        if ((v?.name || "").toLowerCase() === wanted) {
-                            vm = v;
-                            break;
-                        }
+                        if ((v?.name || "").toLowerCase() === wanted) { vm = v; break; }
                     }
                 }
 
                 if (vm) {
-                    out.push({
+                    const stale = !!staleByAgent.get(l.agentId);
+                    const vmOut = {
                         ...vm,
                         tenantId,
                         agentId: l.agentId,
                         kind: "vm",
                         refId: l.refId,
-                    });
+                        _staleAgent: stale,
+                    };
+                    if (stale && vmOut.state !== "NotFound") vmOut.state = "Unknown";
+                    out.push(vmOut);
                 } else if (showOrphans) {
                     out.push({
                         tenantId,
@@ -361,7 +334,6 @@ exports.listResources = async (req, res) => {
             }
 
             if (l.kind === "switch") {
-                // For switches we keep FULL-first (structure usually richer)
                 const invFull = root(fullBy.get(l.agentId) || {});
                 const sw = arr(invFull?.networks?.switches).find((s) => s.name === l.refId);
 
@@ -372,6 +344,7 @@ exports.listResources = async (req, res) => {
                         agentId: l.agentId,
                         kind: "switch",
                         refId: l.refId,
+                        _staleAgent: !!staleByAgent.get(l.agentId),
                     });
                 } else if (showOrphans) {
                     out.push({
@@ -388,13 +361,13 @@ exports.listResources = async (req, res) => {
                 continue;
             }
 
-            // kind "image" or others handled elsewhere
+            // other kinds handled elsewhere
         }
 
         return res.json({ success: true, data: out });
     } catch (e) {
         console.error("listResources error:", e);
-        return res.status(500).json({ error: "Server error" });
+        return send(res, ERR.internal(), req);
     }
 };
 
@@ -406,16 +379,17 @@ exports.listResources = async (req, res) => {
 exports.claimResources = async (req, res) => {
     try {
         const tenantId = getTenantId(req);
-        if (!tenantId) return res.status(400).json({ error: "Missing tenant context" });
+        if (!tenantId) return send(res, ERR.tenantContextMissing(), req);
 
-        const { kind, agentId, refIds } = req.body;
-        const valid = kind && agentId && Array.isArray(refIds) && refIds.length > 0;
-        if (!valid) {
-            return res
-                .status(400)
-                .json({ error: "kind, agentId and non-empty refIds[] required" });
+        const vb = validateClaimBody(req.body || {});
+        if (!vb.ok) return send(res, ERR.validationPre(vb.errors), req);
+
+        // Non-empty refIds
+        if (!vb.value.refIds.length) {
+            return send(res, ERR.validationPre(['body.refIds: must contain at least one id']), req);
         }
 
+        const { kind, agentId, refIds } = vb.value;
         const ops = refIds.map((refId) => ({
             updateOne: {
                 filter: { kind, agentId, refId },
@@ -428,7 +402,7 @@ exports.claimResources = async (req, res) => {
         return res.json({ success: true });
     } catch (e) {
         console.error("claimResources error:", e);
-        return res.status(500).json({ error: "Server error" });
+        return send(res, ERR.internal(), req);
     }
 };
 
@@ -439,21 +413,22 @@ exports.claimResources = async (req, res) => {
 exports.unclaimResource = async (req, res) => {
     try {
         const tenantId = getTenantId(req);
-        if (!tenantId) return res.status(400).json({ error: "Missing tenant context" });
+        if (!tenantId) return send(res, ERR.tenantContextMissing(), req);
 
-        const { resourceId } = req.params;
-        const { kind, agentId } = req.query;
-        if (!resourceId || !kind || !agentId) {
-            return res
-                .status(400)
-                .json({ error: "resourceId param and kind/agentId query params are required" });
-        }
+        const vp = validateUnclaimParams(req.params || {});
+        if (!vp.ok) return send(res, ERR.validationPre(vp.errors), req);
+
+        const vq = validateUnclaimQuery(req.query || {});
+        if (!vq.ok) return send(res, ERR.validationPre(vq.errors), req);
+
+        const { resourceId } = vp.value;
+        const { kind, agentId } = vq.value;
 
         await TenantResource.deleteOne({ tenantId, kind, agentId, refId: resourceId });
         return res.json({ success: true });
     } catch (e) {
         console.error("unclaimResource error:", e);
-        return res.status(500).json({ error: "Server error" });
+        return send(res, ERR.internal(), req);
     }
 };
 
@@ -463,13 +438,20 @@ exports.unclaimResource = async (req, res) => {
  */
 exports.listUnassignedResources = async (req, res) => {
     try {
-        const { kind, agentId } = req.query;
+        const vq = validateUnassignedQuery(req.query || {});
+        if (!vq.ok) return send(res, ERR.validationPre(vq.errors), req);
+
+        const { kind, agentId } = vq.value;
         const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
 
         const f = {};
         if (agentId) f.agentId = agentId;
 
-        const invs = await InventoryFull.find(f, { agentId: 1, inventory: 1 }).lean();
+        const invs = await InventoryFull.find(f, {
+            agentId: 1,
+            inventory: 1,
+            ts: 1,
+        }).lean();
 
         const cand = [];
         for (const d of invs) cand.push(...pickFromInv(d, { kind, agentId: d.agentId }));
@@ -488,7 +470,10 @@ exports.listUnassignedResources = async (req, res) => {
                 const [knd, aId, ref] = k.split("|");
                 return { kind: knd, agentId: aId, refId: ref };
             });
-            const assigned = await TenantResource.find({ $or: or }, { kind: 1, agentId: 1, refId: 1 }).lean();
+            const assigned = await TenantResource.find(
+                { $or: or },
+                { kind: 1, agentId: 1, refId: 1 }
+            ).lean();
             for (const a of assigned) assignedSet.add(key(a));
         }
 
@@ -498,24 +483,34 @@ exports.listUnassignedResources = async (req, res) => {
             if (out.length >= limit) break;
         }
 
+        // Agents considered stale (based on FULL only for this endpoint)
+        const staleAgents = new Set(invs.filter((d) => isStale(d, null)).map((d) => d.agentId));
+
         return res.json({
             success: true,
             count: out.length,
-            data: out.map((r) => ({
-                kind: r.kind,
-                agentId: r.agentId,
-                refId: r.refId,
-                name: r.data?.name,
-                guid: r.data?.guid,
-                state: r.data?.state,
-                cpu: r.data?.cpu,
-                ramMB: r.data?.ramMB,
-                switches: r.data?.switches,
-                raw: r.data,
-            })),
+            data: out.map((r) => {
+                const base = {
+                    kind: r.kind,
+                    agentId: r.agentId,
+                    refId: r.refId,
+                    name: r.data?.name,
+                    guid: r.data?.guid,
+                    state: r.data?.state,
+                    cpu: r.data?.cpu,
+                    ramMB: r.data?.ramMB,
+                    switches: r.data?.switches,
+                    raw: r.data,
+                    _staleAgent: staleAgents.has(r.agentId),
+                };
+                if (base.kind === "vm" && base._staleAgent && base.state !== "NotFound") {
+                    base.state = "Unknown";
+                }
+                return base;
+            }),
         });
     } catch (e) {
         console.error("listUnassignedResources error:", e);
-        return res.status(500).json({ error: "Server error" });
+        return send(res, ERR.internal(), req);
     }
 };

@@ -5,8 +5,9 @@ const Task = require('../models/Task');
 const Heartbeat = require('../models/Heartbeat');
 const TenantResource = require('../models/TenantResource');
 const { enrich } = require('../lib/enrich');
-const { election } = require('../services/election')
-
+const { election } = require('../services/election');
+const { isKnownAction, preValidate } = require('../lib/schemas/task');
+const { ERR, send } = require('../lib/errors/http-errors');
 
 // ----- Helpers -------
 
@@ -33,7 +34,7 @@ function actionRequiresRefId(action) {
     return /^vm\.(delete|power|start|stop|restart|resize|attach|detach|snapshot|revert|rename|clone)$/i.test(action);
 }
 
-// Get TenantID from multiple source (JWT, middleware, body, query)
+// Tenant ID can come from several places; for non-admin we only trust JWT/middleware.
 function getTenantIdFromReq(req) {
     return (
         req?.tenant?.tenantId ||
@@ -43,8 +44,6 @@ function getTenantIdFromReq(req) {
         null
     );
 }
-
-// Strict: pour les NON-admins on ne lit QUE le contexte JWT/middleware (jamais le body)
 function getTenantIdFromJWT(req) {
     return req?.tenant?.tenantId || req?.tenantId || null;
 }
@@ -53,75 +52,77 @@ exports.enqueueTask = async (req, res) => {
     try {
         const admin = !!req.isAdmin;
         const body = req.body || {};
+
+        // ---- Envelope checks (action/target) ----
         const action = String(body.action || '').trim();
-        if (!action) return res.status(400).json({ error: "Missing 'action' in body" });
+        if (!action) return send(res, ERR.missingAction(), req);
 
         const target = (body.target && typeof body.target === 'object') ? body.target : null;
-        if (!target?.kind) {
-            return res.status(400).json({ error: 'Missing target.kind' });
-        }
+        if (!target?.kind) return send(res, ERR.missingTargetKind(), req);
+
+        if (!isKnownAction(action)) return send(res, ERR.unknownAction(action), req);
 
         const needsRefId = actionRequiresRefId(action);
         if (needsRefId && !target.refId) {
-            return res.status(400).json({ error: 'Missing target.refId for this action' });
+            return send(res, ERR.missingTargetRefId(action), req);
         }
 
-        // --- Tenant ---
+        // ---- CONTRACT PRE-VALIDATION (user payload) ----
+        const pre = preValidate(action, body.data || {});
+        if (!pre.ok) {
+            return send(res, ERR.validationPre(pre.errors), req);
+        }
+        const userData = pre.value;
+
+        // ---- Tenant context ----
         const tenantId = admin ? (body.tenantId || getTenantIdFromReq(req)) : getTenantIdFromJWT(req);
         if (!tenantId) {
-            return res.status(400).json({ error: admin ? 'tenantId is required for admin operations' : 'Missing tenant context' });
+            return send(res, admin ? ERR.tenantIdRequiredForAdmin() : ERR.tenantContextMissing(), req);
         }
 
-        // -------------------------------
-        // Agent Election (vm.create)
-        // -------------------------------
+        // ---- Agent election (vm.create) ----
         if (action === 'vm.create' && !target.agentId) {
             const freshness = Number(process.env.AGENT_FRESHNESS_SEC || 60);
             const needCap = requiredCapability(action); // => 'vm.create'
             const agentIdSelected = await election({ freshness, capabilities: [needCap] });
-
             target.agentId = agentIdSelected;
-
             body.target = { ...target };
         }
 
         const agentId = target?.agentId;
-        if (!agentId) {
-            return res.status(400).json({ error: 'Missing target.agentId (no election performed or selection failed)' });
-        }
+        if (!agentId) return send(res, ERR.missingAgentId(), req);
 
-        // --- Ownership check (désactivé en admin) ---
+        // ---- Ownership (non-admin) ----
         if (!admin && needsRefId) {
-            const link = await TenantResource.findOne({ tenantId, kind: target.kind, agentId, refId: target.refId }).lean();
+            const link = await TenantResource.findOne({
+                tenantId, kind: target.kind, agentId, refId: target.refId
+            }).lean();
             if (!link) {
-                return res.status(403).json({ error: 'Forbidden: resource not owned by this tenant', details: { tenantId, target } });
+                return send(res, ERR.forbiddenOwnership(tenantId, target), req);
             }
         }
 
-        // --- Capabilities agent (assert) ---
+        // ---- Agent capabilities ----
         const needCap = requiredCapability(action);
         const hb = await Heartbeat.findOne({ agentId }).lean();
-        if (!hb) return res.status(404).json({ error: 'Agent not found (no heartbeat yet)', agentId });
+        if (!hb) return send(res, ERR.agentNotFound(agentId), req);
 
         const caps = Array.isArray(hb.capabilities) ? hb.capabilities : [];
         if (!caps.includes(needCap)) {
-            return res.status(422).json({
-                error: 'Capability not supported by agent',
-                requiredCapability: needCap, agentCapabilities: caps, action, agentId,
-            });
+            return send(res, ERR.capabilityUnsupported(needCap, caps, action, agentId), req);
         }
 
-        // --- Online? ---
+        // ---- Agent online? (FYI flag, not an error) ----
         const staleMs = Number(process.env.AGENT_STALE_MS || 120000);
         const lastSeen = hb.lastSeen ? new Date(hb.lastSeen).getTime() : 0;
         const agentOnline = !!(lastSeen && Date.now() - lastSeen < staleMs);
 
-        // --- Data sent to agent ---
-        const data = { ...(body.data || {}) };
+        // ---- Build data for the agent (start from validated userData) ----
+        const data = { ...userData };
         if (needsRefId && !data.id && target.refId) data.id = target.refId;
         let dataForAgent = { ...data, target };
 
-        // Enrich
+        // ---- Enrich (internal normalization; not re-validated) ----
         let consoleMeta = null;
         const enr = await enrich(action, {
             operation: 'auto',
@@ -137,11 +138,11 @@ exports.enqueueTask = async (req, res) => {
             }
         } else {
             const isUnsupported = enr.error?.startsWith('unsupported action:') || enr.error?.includes('unsupported operation');
-            if (!isUnsupported) return res.status(400).json({ error: `enrichment failed: ${enr.error}` });
+            if (!isUnsupported) return send(res, ERR.enrichFailed(enr.error || 'unknown'), req);
+            // If unsupported enrich op, keep dataForAgent as-is.
         }
 
-        // --- Create the task and publish it ---
-        // Task will be updated based on the result in services/amqp.js
+        // ---- Persist & publish ----
         const taskId = randomUUID();
         const doc = await Task.create({
             taskId, tenantId, agentId, action, data: dataForAgent,
@@ -162,7 +163,7 @@ exports.enqueueTask = async (req, res) => {
         return res.status(202).json(resp);
     } catch (err) {
         console.error('enqueueTask error:', err);
-        return res.status(500).json({ error: 'Failed to publish task' });
+        return send(res, ERR.internal(), req);
     }
 };
 
@@ -173,19 +174,19 @@ exports.getTask = async (req, res) => {
 
         if (admin) {
             const doc = await Task.findOne({ taskId }).lean();
-            if (!doc) return res.status(404).json({ error: 'Task not found' });
+            if (!doc) return send(res, ERR.taskNotFound(), req);
             return res.json({ success: true, data: doc });
         }
 
         const tenantId = getTenantIdFromJWT(req); // non-admin: JWT only
-        if (!tenantId) return res.status(400).json({ error: 'Missing tenant context' });
+        if (!tenantId) return send(res, ERR.tenantContextMissing(), req);
 
         const doc = await Task.findOne({ taskId, tenantId }).lean();
-        if (!doc) return res.status(404).json({ error: 'Task not found' });
+        if (!doc) return send(res, ERR.taskNotFound(), req);
 
         return res.json({ success: true, data: doc });
     } catch (err) {
         console.error('getTask error:', err);
-        return res.status(500).json({ error: 'Server error' });
+        return send(res, ERR.internal(), req);
     }
 };
