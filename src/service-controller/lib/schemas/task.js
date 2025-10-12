@@ -1,5 +1,5 @@
-// lib/schemas/task.js (CommonJS)
-// Validates ONLY user-provided "data" per action, before enrich().
+// lib/schemas/task.js
+"use strict";
 
 const {
     validate,
@@ -8,60 +8,77 @@ const {
     isString,
     isInteger,
     isEnum,
-} = require('../validate');
+} = require("../validate");
 
-// Boolean helper from your primitives (using enum of literals)
 const isBoolean = isEnum([true, false]);
 
-// Per-action PRE payload schemas (user input)
-const PRE = {
-    'vm.create': objectStrict({
-        name: isString,
-        image: isString, // alias or ID; enrich() will resolve
-        cpu: optional(isInteger),
-        ramMB: optional(isInteger),
-        diskGB: optional(isInteger),
-        network: objectStrict({
-            vpcId: isString,
-            subnetId: isString,
-        }),
-        cloudInit: optional(objectStrict({
-            userData: optional(isString),
-        })),
-    }),
+// -------- SCHEMAS --------
 
-    'console.serial.open': objectStrict({
+// CloudInit sous-ensemble (structure libre mais contrôlée)
+const CloudInitSchema = objectStrict({
+    hostname: optional(isString),
+    user: optional(isString),
+    ssh_authorized_keys: optional((v) => Array.isArray(v) && v.every(isString)),
+    packages: optional((v) => Array.isArray(v) && v.every(isString)),
+    runcmd: optional((v) => Array.isArray(v) && v.every(isString)),
+    enableSerial: optional(isBoolean),
+    serialReboot: optional(isBoolean),
+    network: optional(objectStrict({
+        mode: optional(isEnum(["dhcp"])),
+    })),
+});
+
+const VmCreateSchema = objectStrict({
+    name: isString,
+    imageId: optional(isString),
+    cpu: optional(isInteger),
+    generation: optional(isInteger),
+    ram: optional(isString), // e.g. "2GB"
+    dynamic_memory: optional(isBoolean),
+    min_ram: optional(isString),
+    max_ram: optional(isString),
+    network: optional(objectStrict({
+        vpcId: optional(isString),
+        subnetId: optional(isString),
+    })),
+    cloudInit: optional(CloudInitSchema),
+});
+
+// -------- REGISTERED ACTIONS --------
+const PRE = {
+    "vm.create": VmCreateSchema,
+
+    "console.serial.open": objectStrict({
         readOnly: optional(isBoolean),
         timeoutSec: optional(isInteger),
     }),
 
-    'vm.power': objectStrict({
-        op: isEnum(['start', 'stop', 'restart']),
+    "vm.power": objectStrict({
+        op: isEnum(["start", "stop", "restart"]),
     }),
 
-    'vm.delete': objectStrict({}),
+    "vm.delete": objectStrict({}),
 
-    'inventory.refresh': objectStrict({
+    "inventory.refresh": objectStrict({
         full: optional(isBoolean),
     }),
 
-    // Optional placeholders (tune as you formalize these)
-    'vm.clone': objectStrict({
+    "vm.clone": objectStrict({
         newName: optional(isString),
     }),
 
-    'net.tunnel.open': objectStrict({}),
+    "net.tunnel.open": objectStrict({}),
 
-    'echo': objectStrict({
+    "echo": objectStrict({
         message: optional(isString),
     }),
 };
 
+// -------- EXPORTS --------
 function isKnownAction(action) {
     return !!PRE[action];
 }
 
-// Validate the user "data" against PRE schema
 function preValidate(action, data) {
     const schema = PRE[action];
     if (!schema) {

@@ -1,4 +1,6 @@
 // controllers/tasksController.js
+"use strict";
+
 const { publishTask } = require('../services/amqp');
 const { randomUUID } = require('node:crypto');
 const Task = require('../models/Task');
@@ -8,6 +10,7 @@ const { enrich } = require('../lib/enrich');
 const { election } = require('../services/election');
 const { isKnownAction, preValidate } = require('../lib/schemas/task');
 const { ERR, send } = require('../lib/errors/http-errors');
+const quota = require('../services/quota');
 
 // ----- Helpers -------
 
@@ -32,6 +35,16 @@ function actionRequiresRefId(action) {
     if (/^console\.serial\.open$/i.test(action)) return true;
     if (/^net\.tunnel\.open$/i.test(action)) return true;
     return /^vm\.(delete|power|start|stop|restart|resize|attach|detach|snapshot|revert|rename|clone)$/i.test(action);
+}
+
+function ttlForAction(action) {
+    // Ajuste au besoin par type d’action
+    switch (action) {
+        case 'vm.create': return 30 * 60 * 1000; // 30 min
+        case 'vm.edit': return 30 * 60 * 1000; // 30 min
+        case 'vm.clone': return 45 * 60 * 1000; // 45 min
+        default: return quota.DEFAULT_HOLD_TTL_MS; // 15 min par défaut
+    }
 }
 
 // Tenant ID can come from several places; for non-admin we only trust JWT/middleware.
@@ -69,9 +82,7 @@ exports.enqueueTask = async (req, res) => {
 
         // ---- CONTRACT PRE-VALIDATION (user payload) ----
         const pre = preValidate(action, body.data || {});
-        if (!pre.ok) {
-            return send(res, ERR.validationPre(pre.errors), req);
-        }
+        if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
         const userData = pre.value;
 
         // ---- Tenant context ----
@@ -139,14 +150,32 @@ exports.enqueueTask = async (req, res) => {
         } else {
             const isUnsupported = enr.error?.startsWith('unsupported action:') || enr.error?.includes('unsupported operation');
             if (!isUnsupported) return send(res, ERR.enrichFailed(enr.error || 'unknown'), req);
-            // If unsupported enrich op, keep dataForAgent as-is.
         }
 
-        // ---- Persist & publish ----
+        // ---- Persist & publish with HOLD reservation ----
         const taskId = randomUUID();
+        let hasQuotaHold = false;
+
+        // 1) (si l’action consomme des quotas) place un hold (réserve immédiatement)
+        const deltas = quota.computeDeltas(action, dataForAgent);
+        if (deltas) {
+            const tenantObjectId = await quota.getTenantObjectIdOrThrow(tenantId);
+            try {
+                await quota.holdQuota(tenantObjectId, deltas, taskId, { ttlMs: ttlForAction(action) });
+                hasQuotaHold = true;
+            } catch (e) {
+                if (e?.code === 'QUOTA_EXCEEDED' || e?.status === 409) {
+                    return send(res, e, req); // Refus immédiat si pas assez de quota
+                }
+                throw e;
+            }
+        }
+
+        // 2) Crée la tâche et publie au broker
         const doc = await Task.create({
             taskId, tenantId, agentId, action, data: dataForAgent,
             correlationId: taskId, status: 'queued', queuedAt: new Date(),
+            hasQuotaHold,
         });
 
         await publishTask({
@@ -166,6 +195,7 @@ exports.enqueueTask = async (req, res) => {
         return send(res, ERR.internal(), req);
     }
 };
+
 
 exports.getTask = async (req, res) => {
     try {

@@ -1,3 +1,4 @@
+
 // /lib/enrich.js
 const imagesService = require("../services/images");
 const consoleSvc = require("../services/console");
@@ -17,6 +18,7 @@ const registry = {
             }
 
             out.generation = 2;
+            out.storageMB = 10240;
 
             if (!out.switch) {
                 out.switch = "fabric0";

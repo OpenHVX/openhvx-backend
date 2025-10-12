@@ -1,5 +1,11 @@
-// lib/schemas/tenant.js (CommonJS)
-// Contract validation for Tenants, using your lib/validate.js
+// lib/schemas/tenant.js
+"use strict";
+
+/**
+ * Tenant contract validation
+ * - Reuses QuotaLimitsSchema from lib/schemas/quota.js
+ * - Provides normalizeCreate/normalizeUpdate using normalizeQuota
+ */
 
 const {
     validate,
@@ -7,22 +13,18 @@ const {
     optional,
     recordOf,
     isString,
-    isInteger,
     isEnum,
-} = require('../validate');
+} = require("../validate");
 
-// If you don’t have fixed statuses, keep it a string:
-// const isStatus = isString;
-const isStatus = isEnum(['active', 'disabled']); // adjust if needed
+const {
+    QuotaLimitsSchema,
+    normalizeQuota,
+} = require("./quota");
 
-// Basic shape for quotas commonly used in your project
-const QuotasSchema = objectStrict({
-    vcpu: optional(isInteger),
-    ramMB: optional(isInteger),
-    storageGB: optional(isInteger),
-});
+// Status enum
+const isStatus = isEnum(["active", "disabled"]);
 
-// Free-form metadata as a string record (adjust validator if you need numbers/booleans)
+// Free-form metadata
 const MetadataSchema = recordOf(isString);
 
 // Params: /tenants/:tenantId
@@ -34,15 +36,17 @@ const TenantIdParams = objectStrict({
 const TenantCreateBody = objectStrict({
     tenantId: isString,
     name: isString,
-    quotas: optional(QuotasSchema),
+    description: optional(isString),
+    quotas: optional(QuotaLimitsSchema), // flat limits
     metadata: optional(MetadataSchema),
 });
 
 // Body: PATCH /tenants/:tenantId
 const TenantUpdateBody = objectStrict({
     name: optional(isString),
-    status: optional(isStatus),   // or optional(isString)
-    quotas: optional(QuotasSchema),
+    status: optional(isStatus),
+    description: optional(isString),
+    quotas: optional(QuotaLimitsSchema), // flat limits
     metadata: optional(MetadataSchema),
 });
 
@@ -51,8 +55,28 @@ function validateCreate(body) { return validate(TenantCreateBody, body || {}); }
 function validateUpdate(body) { return validate(TenantUpdateBody, body || {}); }
 function validateParams(p) { return validate(TenantIdParams, p || {}); }
 
+/** Normalize flat limits -> model shape */
+function normalizeCreate(value) {
+    const v = { ...value };
+    if (v.quotas) {
+        const q = normalizeQuota(v.quotas);
+        if (q) v.quotas = q; else delete v.quotas;
+    }
+    return v;
+}
+function normalizeUpdate(value) {
+    const v = { ...value };
+    if (v.quotas) {
+        const q = normalizeQuota(v.quotas);
+        if (q) v.quotas = q; else delete v.quotas;
+    }
+    return v;
+}
+
 module.exports = {
     validateCreate,
     validateUpdate,
     validateParams,
+    normalizeCreate,
+    normalizeUpdate,
 };

@@ -1,8 +1,19 @@
 // services/amqp.js
+"use strict";
+
 const amqplib = require("amqplib");
 
 const InvFull = require("../models/Inventory.full");
 const InvLight = require("../models/Inventory.light");
+const TenantResource = require("../models/TenantResource");
+const quota = require("../services/quota"); // consumeHold / releaseHold
+
+const logger = require("../lib/logger");
+const log = logger.child("amqp");
+const logPub = log.child("publish");
+const logTel = log.child("telemetry");
+const logInv = log.child(["telemetry", "inventory"]);
+const logRes = log.child("results");
 
 const RMQ_URL = process.env.RMQ_URL || "amqp://guest:guest@localhost:5672/";
 const JOBS_EX = process.env.JOBS_EXCHANGE || "jobs";                 // direct
@@ -11,6 +22,7 @@ const RES_EX = process.env.RESULTS_EXCHANGE || "results";           // topic
 
 let conn, ch;
 
+// Light vs full inventory
 function isLight(headers, env) {
     const mode = headers?.["x-merge-mode"] || env?.mergeMode;
     const source = headers?.["x-source"] || env?.source;
@@ -19,6 +31,7 @@ function isLight(headers, env) {
 
 async function connect() {
     if (ch) return ch;
+
     conn = await amqplib.connect(RMQ_URL);
     ch = await conn.createChannel();
 
@@ -32,18 +45,18 @@ async function connect() {
     });
     await ch.assertQueue("agent.inventories", { durable: true });
 
-    // heartbeat.<agentId> / inventory.<agentId>
     await ch.bindQueue("agent.heartbeats", TELE_EX, "heartbeat.*");
     await ch.bindQueue("agent.inventories", TELE_EX, "inventory.*");
 
-    ch.on("error", (e) => console.error("[amqp] channel error:", e));
-    conn.on("close", () => console.error("[amqp] connection closed"));
+    ch.on("error", (e) => log.error("channel error", { error: e }));
+    conn.on("close", () => log.error("connection closed"));
 
     await ch.prefetch(50);
+    log.info("connected", { url: RMQ_URL });
     return ch;
 }
 
-// Publier une tâche (asynchrone)
+// Publish a task to the agent queue
 async function publishTask(payload) {
     if (!payload?.agentId || !payload?.action) {
         throw new Error("agentId and action are required");
@@ -61,12 +74,20 @@ async function publishTask(payload) {
     };
 
     channel.publish(JOBS_EX, payload.agentId, Buffer.from(JSON.stringify(payload)), props);
+    logPub.info("task published", {
+        agentId: payload.agentId,
+        action: payload.action,
+        taskId: payload.taskId,
+        correlationId: props.correlationId,
+        queue: qName,
+    });
 }
 
-// Télémétrie -> Mongo (sans notion de tenant)
+// Telemetry consumers (heartbeats + inventories)
 async function startTelemetryConsumers({ Heartbeat }) {
     const channel = await connect();
 
+    // Heartbeats
     await channel.consume(
         "agent.heartbeats",
         async (msg) => {
@@ -85,74 +106,71 @@ async function startTelemetryConsumers({ Heartbeat }) {
                     },
                     { upsert: true, new: true, setDefaultsOnInsert: true }
                 );
-
                 channel.ack(msg);
+                logTel.debug("heartbeat", { agentId: hb.agentId, caps: hb.capabilities || [] });
             } catch (e) {
-                console.error("[amqp] heartbeat error:", e.message);
                 channel.nack(msg, false, false);
+                logTel.error("heartbeat error", { error: e });
             }
         },
         { noAck: false }
     );
 
-    await channel.consume("agent.inventories", async (msg) => {
-        if (!msg) return;
-        try {
-            const headers = msg.properties?.headers || {};
-            const env = JSON.parse(msg.content.toString()); // { agentId, ts, inventory, ... }
-            const agentId = env.agentId;
-            if (!agentId) throw new Error("missing agentId");
+    // Inventories (full or light)
+    await channel.consume(
+        "agent.inventories",
+        async (msg) => {
+            if (!msg) return;
+            try {
+                const headers = msg.properties?.headers || {};
+                const env = JSON.parse(msg.content.toString()); // { agentId, ts, inventory, ... }
+                const agentId = env.agentId;
+                if (!agentId) throw new Error("missing agentId");
 
-            const doc = {
-                agentId,
-                ts: env.ts ? new Date(env.ts) : new Date(),
-                inventory: env.inventory, // { inventory:{...}, datastores:[...] }
-                raw: env,
-            };
-            if (isLight(headers, env)) {
-                await InvLight.findOneAndUpdate(
-                    { agentId }, { $set: doc }, { upsert: true }
-                );
-            } else {
-                await InvFull.findOneAndUpdate(
-                    { agentId }, { $set: doc }, { upsert: true }
-                );
+                const doc = {
+                    agentId,
+                    ts: env.ts ? new Date(env.ts) : new Date(),
+                    inventory: env.inventory,
+                    raw: env,
+                };
+
+                if (isLight(headers, env)) {
+                    await InvLight.findOneAndUpdate({ agentId }, { $set: doc }, { upsert: true });
+                    logInv.debug("inventory(light) stored", { agentId });
+                } else {
+                    await InvFull.findOneAndUpdate({ agentId }, { $set: doc }, { upsert: true });
+                    logInv.debug("inventory(full) stored", { agentId });
+                }
+
+                channel.ack(msg);
+            } catch (e) {
+                channel.nack(msg, false, false);
+                logInv.error("inventory error", { error: e });
             }
+        },
+        { noAck: false }
+    );
 
-            channel.ack(msg);
-        } catch (e) {
-            console.error("[amqp] inventory error:", e.message);
-            channel.nack(msg, false, false);
-        }
-    }, { noAck: false });
-
-
-    console.log("[controller] telemetry consumers started");
+    logTel.info("telemetry consumers started");
 }
+
 /* ------------------------------ Tenant link ------------------------------ */
 
-const TenantResource = require("../models/TenantResource");
-
-// Création automatique du lien Tenant ↔ Ressource quand une task réussit
+// Create/cleanup Tenant ↔ Resource links on successful tasks.
 async function onTaskSucceededUpsertTenantLink(TaskModel, payload) {
-    // Re-lecture de la Task pour obtenir action + tenantId + agentId
-
     const t = await TaskModel.findOne(
         { taskId: payload.taskId },
         { action: 1, tenantId: 1, agentId: 1 }
     ).lean();
-
-
-    if (!t) return; // task inconnue (edge case)
+    if (!t) return;
 
     const { action, tenantId, agentId } = t;
-    if (!tenantId || !agentId) return; // sécurité (la task est notre source de vérité métier)
-    // VM créées / clonées
-    if (action === "vm.create" || action === "vm.clone") {
+    if (!tenantId || !agentId) return;
 
+    // VM create / clone
+    if (action === "vm.create" || action === "vm.clone") {
         const vm = payload?.result?.vm;
         const refId = vm?.guid || vm?.name;
-
         if (!refId) return;
 
         await TenantResource.updateOne(
@@ -163,23 +181,17 @@ async function onTaskSucceededUpsertTenantLink(TaskModel, payload) {
         return;
     }
 
-    // VM Delete 
-
+    // VM delete
     if (action === "vm.delete") {
         const vm = payload?.result?.vm;
         const refId = vm?.guid || vm?.name;
         if (!refId) return;
 
-        await TenantResource.deleteOne({
-            kind: "vm",
-            agentId,
-            refId,
-        });
-
+        await TenantResource.deleteOne({ kind: "vm", agentId, refId });
         return;
     }
 
-    // vSwitch créé (si tu as une action dédiée)
+    // vSwitch create (if exposed)
     if (action === "switch.create") {
         const sw = payload?.result?.switch;
         const refId = sw?.name;
@@ -192,14 +204,11 @@ async function onTaskSucceededUpsertTenantLink(TaskModel, payload) {
         );
         return;
     }
-
-
-    // (Tu pourras ajouter d’autres actions ici: disk.create, nic.add, etc.)
 }
 
 /* ------------------------------------------------------------------------ */
 
-// Results -> Mongo (met à jour la Task) — écoute uniquement task.# (pas de tenant)
+// Results -> Mongo (update Task) — listens on task.# (no tenant key)
 async function startResultsToMongo(TaskModel, { queueName } = {}) {
     const channel = await connect();
     const q = queueName || "results.controller";
@@ -207,7 +216,7 @@ async function startResultsToMongo(TaskModel, { queueName } = {}) {
     await channel.assertQueue(q, { durable: true });
     await channel.bindQueue(q, RES_EX, "task.#");
 
-    console.log(`[controller] results->mongo consuming on queue="${q}"`);
+    logRes.info("results consumer started", { queue: q });
 
     await channel.consume(
         q,
@@ -217,40 +226,67 @@ async function startResultsToMongo(TaskModel, { queueName } = {}) {
                 const payload = JSON.parse(msg.content.toString()); // { taskId, agentId, ok, result, error, finishedAt }
                 const rk = msg.fields.routingKey;
 
-                // 1) Upsert de la Task (statut + résultats)
+                // Read current task state to know if a quota hold exists
+                const existing = await TaskModel.findOne(
+                    { taskId: payload.taskId },
+                    { hasQuotaHold: 1, action: 1, tenantId: 1, agentId: 1 }
+                ).lean();
+
+                // Upsert task status/result
                 const update = {
                     $set: {
                         status: payload.ok ? "done" : "error",
                         finishedAt: payload.finishedAt ? new Date(payload.finishedAt) : new Date(),
                         result: payload.result ?? null,
                         error: payload.error ?? null,
-                        agentId: payload.agentId || undefined,
+                        agentId: payload.agentId || existing?.agentId || undefined,
                         routingKey: rk,
                     },
                     $setOnInsert: {
                         taskId: payload.taskId,
                         queuedAt: new Date(),
-                        action: "unknown",
+                        action: existing?.action || "unknown",
                         data: {},
+                        hasQuotaHold: existing?.hasQuotaHold || false,
                     },
                 };
 
                 await TaskModel.updateOne({ taskId: payload.taskId }, update, { upsert: true });
+                logRes.debug("task result stored", {
+                    taskId: payload.taskId,
+                    ok: !!payload.ok,
+                    rk,
+                    hadHold: !!existing?.hasQuotaHold,
+                });
 
-                // 2) Si succès → créer le lien Tenant ↔ Ressource (idempotent)
+                // On success, link tenant ↔ resource (idempotent)
                 if (payload.ok) {
                     try {
                         await onTaskSucceededUpsertTenantLink(TaskModel, payload);
                     } catch (e) {
-                        console.error("[results] tenant link error:", e.message);
-                        // on log seulement; on n'empêche pas l'ACK du résultat
+                        logRes.warn("tenant link upsert failed", { taskId: payload.taskId, error: e });
                     }
                 }
 
-                // 3) ACK
+                // Resolve quota hold only if the task had one
+                if (existing?.hasQuotaHold) {
+                    try {
+                        if (payload.ok) {
+                            await quota.consumeHold(payload.taskId);
+                            logRes.info("quota hold consumed", { taskId: payload.taskId });
+                        } else {
+                            await quota.releaseHold(payload.taskId);
+                            logRes.info("quota hold released", { taskId: payload.taskId });
+                        }
+                    } catch (e) {
+                        // Don’t block the ACK; reaper/inventory recalc will self-heal if needed
+                        logRes.error("quota hold resolution error", { taskId: payload.taskId, error: e });
+                    }
+                }
+
                 channel.ack(msg);
             } catch (e) {
-                console.error("[amqp] results->mongo error:", e.message);
+                logRes.error("results->mongo error", { error: e });
                 channel.nack(msg, false, false);
             }
         },
@@ -264,5 +300,3 @@ module.exports = {
     startTelemetryConsumers,
     startResultsToMongo,
 };
-
-

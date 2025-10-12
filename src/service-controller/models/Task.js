@@ -19,7 +19,7 @@ const taskSchema = new mongoose.Schema(
 
         result: { type: Object },   // payload result de l’agent
         error: { type: String },   // message d’erreur éventuel
-
+        hasQuotaHold: { type: Boolean, default: false, index: true },
         routingKey: { type: String },   // rk utilisée côté results (utile debug)
     },
     { timestamps: true }

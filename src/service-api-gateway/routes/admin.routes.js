@@ -1,106 +1,130 @@
 // api-gateway/src/routes/admin.routes.js
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const antiSpoof = require('../middlewares/antiSpoof');
-const resolveTenantFromToken = require('../middlewares/resolveTenantFromToken');
+"use strict";
 
+const { createProxyMiddleware } = require("http-proxy-middleware");
+const antiSpoof = require("../middlewares/antiSpoof");
+const resolveTenantFromToken = require("../middlewares/resolveTenantFromToken");
 
 module.exports = ({ CONTROLLER_URL }) => {
-    const router = require('express').Router();
+    const router = require("express").Router();
 
-    // --- local middlewares  ---------------------------------------------------
+    // --- Local middlewares -----------------------------------------------------
     const ensureAnyRole = (allowed) => (req, res, next) => {
         const u = req.user || {};
-        const roles = Array.isArray(u.roles) ? u.roles
-            : Array.isArray(u.scope) ? u.scope
-                : typeof u.role === 'string' ? [u.role]
+        const roles = Array.isArray(u.roles)
+            ? u.roles
+            : Array.isArray(u.scope)
+                ? u.scope
+                : typeof u.role === "string"
+                    ? [u.role]
                     : [];
-        if (roles.some(r => allowed.includes(r))) return next();
-        return res.status(403).json({ error: 'Forbidden: role not allowed' });
+        if (roles.some((r) => allowed.includes(r))) return next();
+        return res.status(403).json({ error: "Forbidden: role not allowed" });
     };
 
-    // --- proxy commun (vers le controller) -----------------------------------
+    // --- Shared proxy (to controller service) ----------------------------------
     const baseProxy = createProxyMiddleware({
         target: CONTROLLER_URL,
         changeOrigin: true,
         proxyTimeout: 60000,
         timeout: 61000,
-        // Le controller admin attend /api/v1/admin/*
+        // The controller expects paths prefixed with /api/v1/admin/*
         pathRewrite: (path) => `/api/v1/admin${path}`,
         on: {
             proxyReq: (proxyReq, req) => {
                 const u = req.user || {};
-                // si la route a :tenantId, on le passe en header (optionnel, le controller n'en dépend pas)
-                const tid = req.params?.tenantId || '';
+                const tid = req.params?.tenantId || "";
 
-                proxyReq.setHeader('x-request-id', req.id || '');
-                proxyReq.setHeader('x-user-id', u.sub || '');
-                proxyReq.setHeader('x-roles', (u.roles || []).join(','));
-                if (tid) proxyReq.setHeader('x-tenant-id', tid);
-                proxyReq.setHeader('accept', 'application/json');
+                proxyReq.setHeader("x-request-id", req.id || "");
+                proxyReq.setHeader("x-user-id", u.sub || "");
+                proxyReq.setHeader("x-roles", (u.roles || []).join(","));
+                if (tid) proxyReq.setHeader("x-tenant-id", tid);
+                proxyReq.setHeader("accept", "application/json");
 
-                // Re-stream du body si déjà parsé côté gateway
+                // Re-stream parsed body from gateway to controller
                 if (
-                    req.method !== 'GET' &&
-                    req.method !== 'HEAD' &&
+                    req.method !== "GET" &&
+                    req.method !== "HEAD" &&
                     req.body &&
                     Object.keys(req.body).length
                 ) {
                     const bodyData = JSON.stringify(req.body);
-                    proxyReq.setHeader('content-type', 'application/json');
-                    proxyReq.setHeader('content-length', Buffer.byteLength(bodyData));
+                    proxyReq.setHeader("content-type", "application/json");
+                    proxyReq.setHeader("content-length", Buffer.byteLength(bodyData));
                     proxyReq.write(bodyData);
                 }
             },
             error: (_err, _req, res) => {
-                res.writeHead(502, { 'content-type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Upstream controller unavailable' }));
+                res.writeHead(502, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: "Upstream controller unavailable" }));
             },
         },
     });
 
-    // --- routes explicites (pas de catch-all) ---------------------------------
-
+    // --- Explicit routes only (no catch-all) -----------------------------------
     router.use(antiSpoof());
     router.use(resolveTenantFromToken({ required: false }));
-    // Toutes ces routes sont protégées par global-admin au niveau gateway
-    router.use(ensureAnyRole(['global-admin']));
+    // All these routes require the global-admin role
+    router.use(ensureAnyRole(["global-admin"]));
 
-    // Tasks (admin: pas de scoping tenant)
-    router.post('/tasks', baseProxy);
-    router.get('/tasks/:taskId', baseProxy);
-    // Ressources (attachées à un tenant donné via path param)
-    router.get('/tenants/:tenantId/resources', baseProxy);
-    router.post('/tenants/:tenantId/resources/claim', baseProxy);
-    router.delete('/tenants/:tenantId/resources/:resourceId', baseProxy);
+    // ---------------------------------------------------------------------------
+    // Tasks (admin scope, no tenant restriction)
+    // ---------------------------------------------------------------------------
+    router.post("/tasks", baseProxy);
+    router.get("/tasks/:taskId", baseProxy);
 
-    // Ressources non-assignées (global admin)
-    router.get('/resources/unassigned', baseProxy);
+    // ---------------------------------------------------------------------------
+    // Tenant resources (scoped by tenantId in path)
+    // ---------------------------------------------------------------------------
+    router.get("/tenants/:tenantId/resources", baseProxy);
+    router.post("/tenants/:tenantId/resources/claim", baseProxy);
+    router.delete("/tenants/:tenantId/resources/:resourceId", baseProxy);
 
-    // Agents (globaux)
-    router.get('/agents', baseProxy);
-    router.get('/agents/:agentId/status', baseProxy);
-    router.get('/agents/:agentId/inventory', baseProxy);
+    // ---------------------------------------------------------------------------
+    // Unassigned resources (global admin only)
+    // ---------------------------------------------------------------------------
+    router.get("/resources/unassigned", baseProxy);
 
-    // (optionnel) CRUD Tenants si ton controller les expose
-    router.post('/tenants', baseProxy);
-    router.get('/tenants', baseProxy);
-    router.get('/tenants/:tenantId', baseProxy);
-    router.patch('/tenants/:tenantId', baseProxy);
-    router.delete('/tenants/:tenantId', baseProxy);
+    // ---------------------------------------------------------------------------
+    // Agents (global)
+    // ---------------------------------------------------------------------------
+    router.get("/agents", baseProxy);
+    router.get("/agents/:agentId/status", baseProxy);
+    router.get("/agents/:agentId/inventory", baseProxy);
 
-    //Metrics
-    router.get('/metrics/overview', baseProxy);
-    router.get('/metrics/compute', baseProxy);
-    router.get('/metrics/datastores', baseProxy);
-    router.get('/metrics/vms', baseProxy);
-    router.get('/metrics/tenant/overview', baseProxy);
+    // ---------------------------------------------------------------------------
+    // Tenants (CRUD)
+    // ---------------------------------------------------------------------------
+    router.post("/tenants", baseProxy);
+    router.get("/tenants", baseProxy);
+    router.get("/tenants/:tenantId", baseProxy);
+    router.patch("/tenants/:tenantId", baseProxy);
+    router.delete("/tenants/:tenantId", baseProxy);
 
+    // ---------------------------------------------------------------------------
+    // Tenants > Quotas (nested)
+    // ---------------------------------------------------------------------------
+    router.get("/tenants/:tenantId/quotas", baseProxy);
+    router.patch("/tenants/:tenantId/quotas", baseProxy);
+    router.post("/tenants/:tenantId/quotas/reserve", baseProxy);
+    router.post("/tenants/:tenantId/quotas/release", baseProxy);
+    router.post("/tenants/:tenantId/quotas/recalculate", baseProxy);
 
+    // ---------------------------------------------------------------------------
+    // Metrics
+    // ---------------------------------------------------------------------------
+    router.get("/metrics/overview", baseProxy);
+    router.get("/metrics/compute", baseProxy);
+    router.get("/metrics/datastores", baseProxy);
+    router.get("/metrics/vms", baseProxy);
+    router.get("/metrics/tenant/overview", baseProxy);
+
+    // ---------------------------------------------------------------------------
+    // Images
+    // ---------------------------------------------------------------------------
     router.get("/images", baseProxy);
     router.get("/images/:imageId", baseProxy);
     router.get("/images/:imageId/resolve", baseProxy);
 
-
     return router;
-
 };
