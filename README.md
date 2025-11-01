@@ -1,4 +1,4 @@
-# OpenHVX Backend (Still in dev progress)
+# OpenHVX Backend
 
 OpenHVX is an open-source IaaS platform for **Hyper-V**, built around an API-first architecture, lightweight services, and full multi-tenant isolation.
 
