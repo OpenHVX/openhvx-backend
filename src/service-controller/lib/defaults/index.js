@@ -1,1 +1,0 @@
-module.exports = { quota: require('./quota') };
