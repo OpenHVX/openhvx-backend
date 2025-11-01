@@ -12,7 +12,7 @@ const {
 
 // GET /.../resources (query)
 const ListResourcesQuery = objectStrict({
-    kind: optional(isEnum(['vm', 'switch'])),
+    kind: optional(isEnum(['vm', 'switch', 'disk'])),
     agentId: optional(isString),
     includeOrphans: optional(isString), // 'true' | 'false' (parsed later)
 });
@@ -35,7 +35,7 @@ const UnclaimQuery = objectStrict({
 
 // GET /admin/resources/unassigned (query)
 const UnassignedQuery = objectStrict({
-    kind: optional(isEnum(['vm', 'switch'])),
+    kind: optional(isEnum(['vm', 'switch', 'disk'])),
     agentId: optional(isString),
     limit: optional(isString), // parsed to int later
 });

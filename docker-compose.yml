@@ -87,7 +87,7 @@ services:
       - traefik.enable=true
 
       # TENANT
-      - traefik.http.routers.api.rule=Host(`api.openhvx.local`)
+      - traefik.http.routers.api.rule=Host(`api.openhvx.local`) && PathPrefix(`/api/v1/tenant`)
       - traefik.http.routers.api.entrypoints=websecure
       - traefik.http.routers.api.tls=true
       - traefik.http.routers.api.middlewares=cors-auth@file,rate-tenant@file,sec-headers@file,compress@file
@@ -96,7 +96,7 @@ services:
       - traefik.docker.network=internal
 
       # ADMIN
-      - traefik.http.routers.admin.rule=Host(`admin-api.openhvx.local`)
+      - traefik.http.routers.admin.rule=Host(`admin-api.openhvx.local`) && PathPrefix(`/api/v1/admin`)
       - traefik.http.routers.admin.entrypoints=websecure
       - traefik.http.routers.admin.tls=true
       - traefik.http.routers.admin.middlewares=cors-auth@file,rate-admin@file,sec-headers@file,compress@file
@@ -104,7 +104,7 @@ services:
       - traefik.http.services.admin-svc.loadbalancer.server.port=8080
 
       # CONSOLE (Browser)
-      - traefik.http.routers.console.rule=Host(`console.openhvx.local`)
+      - traefik.http.routers.console.rule=Host(`console.openhvx.local`) && PathPrefix(`/api/v1/console`)
       - traefik.http.routers.console.entrypoints=websecure
       - traefik.http.routers.console.tls=true
       - traefik.http.routers.console.middlewares=sec-headers@file,compress@file

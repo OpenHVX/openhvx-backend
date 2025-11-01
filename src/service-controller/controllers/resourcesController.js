@@ -203,6 +203,87 @@ function combineAgent(fullDoc, lightDoc, allowLightOnlyKeys = null) {
     return out;
 }
 
+function pickFromInv(doc, { kind, agentId } = {}) {
+    if (!doc) return [];
+    const out = [];
+    const aId = agentId || doc.agentId || null;
+    if (!aId) return out;
+
+    const inv = root(doc) || {};
+    const includeVm = !kind || kind === "vm";
+    const includeSwitch = !kind || kind === "switch";
+    const includeDisk = !kind || kind === "disk";
+
+    if (includeVm) {
+        for (const vm of arr(inv.vms)) {
+            const refId = vmKey(vm);
+            if (!refId) continue;
+
+            out.push({
+                kind: "vm",
+                agentId: aId,
+                refId: String(refId),
+                data: {
+                    name: vm?.name ?? null,
+                    guid: vm?.guid ?? null,
+                    state: vm?.state ?? null,
+                    cpu: vm?.configuration?.processors?.count ?? vm?.cpu ?? null,
+                    ramMB:
+                        vm?.memoryAssignedMB ??
+                        vm?.configuration?.memory?.startupMB ??
+                        null,
+                    switches: arr(vm?.networkAdapters)
+                        .map((n) => n?.switch)
+                        .filter(Boolean),
+                    raw: vm,
+                },
+            });
+        }
+    }
+
+    if (includeSwitch) {
+        const switches = arr(inv?.networks?.switches);
+        for (const sw of switches) {
+            if (!sw?.name) continue;
+            out.push({
+                kind: "switch",
+                agentId: aId,
+                refId: String(sw.name),
+                data: {
+                    name: sw.name ?? null,
+                    type: sw.type ?? sw.switchType ?? null,
+                    isExternal: sw.isExternal ?? null,
+                    raw: sw,
+                },
+            });
+        }
+    }
+
+    if (includeDisk) {
+        for (const vm of arr(inv.vms)) {
+            for (const disk of arr(vm?.storage)) {
+                const vhdPath = disk?.vhd?.path || disk?.path;
+                if (!vhdPath) continue;
+                out.push({
+                    kind: "disk",
+                    agentId: aId,
+                    refId: String(vhdPath),
+                    data: {
+                        name: vm?.name ?? null,
+                        vmGuid: vm?.guid ?? null,
+                        path: vhdPath,
+                        sizeMB: disk?.vhd?.sizeMB ?? null,
+                        fileSizeMB: disk?.vhd?.fileSizeMB ?? null,
+                        raw: disk,
+                    },
+                });
+            }
+        }
+    }
+
+    return out;
+}
+
 /* ==================================================================== */
 /* Controllers                                                           */
 /* ==================================================================== */

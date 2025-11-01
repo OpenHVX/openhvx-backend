@@ -6,11 +6,15 @@
             "vhdPath",
             "path"
         ],
-        "vm.clone": {
-            "deny": [
-                "dest.vhd_path",
-                "dest.vhdPath"
-            ]
-        }
+        "vm.clone": [
+            "vhd_path",
+            "vhdPath",
+            "path"
+        ],
+        "vm.edit": [
+            "vhd_path",
+            "vhdPath",
+            "path"
+        ]
     }
 }

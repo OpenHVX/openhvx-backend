@@ -2,10 +2,12 @@
     "name": "openhvx-service-api-gateway",
     "version": "0.1.0",
     "private": true,
-    "main": "src/controller/app.js",
+    "main": "dist/app.js",
     "scripts": {
-        "start": "node src/controller/app.js",
-        "dev": "nodemon src/controller/app.js"
+        "start": "node dist/app.js",
+        "dev": "ts-node-dev --respawn --transpile-only src/app.ts",
+        "build": "tsc",
+        "lint": "tsc --noEmit"
     },
     "dependencies": {
         "axios": "^1.12.0",
@@ -22,6 +24,16 @@
         "yaml": "^2.8.1"
     },
     "devDependencies": {
-        "nodemon": "^3.1.0"
+        "@types/cors": "^2.8.19",
+        "@types/express": "^5.0.5",
+        "@types/helmet": "^0.0.48",
+        "@types/http-proxy-middleware": "^0.19.3",
+        "@types/morgan": "^1.9.10",
+        "@types/node": "^24.9.2",
+        "@types/uuid": "^10.0.0",
+        "nodemon": "^3.1.0",
+        "ts-node": "^10.9.2",
+        "ts-node-dev": "^2.0.0",
+        "typescript": "^5.9.3"
     }
 }
