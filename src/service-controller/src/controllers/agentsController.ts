@@ -71,7 +71,6 @@ exports.getAgents = async (req, res) => {
             };
         });
 
-        // ⚠️ return an array directly to match the existing UI expectations
         res.json(data);
     } catch (e) {
         console.error('getAgents error:', e);

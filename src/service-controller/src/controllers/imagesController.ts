@@ -30,8 +30,7 @@ exports.getOne = async (req, res) => {
     }
 };
 
-// GET /api/v1/tenant/images/:imageId/resolve
-// -> renvoie juste { id, path } pour la task agent (vm.create)
+// /api/v1/tenant/images/:imageId/resolve
 exports.resolve = async (req, res) => {
     try {
         const r = await imagesService.resolvePath(req.params.imageId);
@@ -43,7 +42,7 @@ exports.resolve = async (req, res) => {
     }
 };
 
-// (Optionnel) GET /api/v1/admin/images/reload
+// GET /api/v1/admin/images/reload
 exports.reload = async (_req, res) => {
     try {
         const imgs = await imagesService._reloadNow();
@@ -54,7 +53,7 @@ exports.reload = async (_req, res) => {
     }
 };
 
-// (Optionnel) GET /api/v1/admin/images/diag
+// GET /api/v1/admin/images/diag
 exports.diag = async (_req, res) => {
     try {
         res.json({ success: true, data: imagesService._cacheInfo() });

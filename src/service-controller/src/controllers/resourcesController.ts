@@ -5,7 +5,6 @@
 /**
  * Resources Controller
  * --------------------
- * (docs unchanged for brevity)
  */
 const { ERR, send } = require('../lib/errors/http-errors');
 const {
@@ -443,7 +442,7 @@ exports.listResources = async (req, res) => {
                 continue;
             }
 
-            // other kinds handled elsewhere
+           
         }
 
         return res.json({ success: true, data: out });
