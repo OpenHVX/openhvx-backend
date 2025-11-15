@@ -205,7 +205,6 @@ exports.userinfo = async (req, res) => {
         return res.status(500).json({ error: e.message });
     }
 };
-
 /**
  * POST /auth/admin/register?mode=once|reset|upsert
  * headers: x-api-key: <REGISTER_API_KEY>

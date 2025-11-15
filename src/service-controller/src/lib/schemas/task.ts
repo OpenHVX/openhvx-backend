@@ -55,7 +55,8 @@ const PRE = {
     }),
 
     "vm.power": objectStrict({
-        op: isEnum(["start", "stop", "restart"]),
+        guid: optional(isString),
+        state: isEnum(["start", "stop", "restart"])
     }),
 
     "vm.delete": objectStrict({
