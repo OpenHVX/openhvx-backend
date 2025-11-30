@@ -1,18 +1,20 @@
-// @ts-nocheck
-// middlewares/requireTenant.js
-module.exports = function requireTenant() {
-    return (req, res, next) => {
-        // Trust the gateway for the authoritative tenant ID
+import type { NextFunction, Response } from "express";
+import type { ControllerRequest } from "../types/express";
+
+export default function requireTenant() {
+    return (req: ControllerRequest, res: Response, next: NextFunction) => {
         const tenantId =
             req.tenantId ||
-            req.headers['x-tenant-id'] ||        // header injected by the gateway
-            req.user?.tenantId || req.auth?.tenantId || // fallback when decoding locally
-            req.tenant?.tenantId || null;
+            req.headers["x-tenant-id"] ||
+            req.user?.tenantId ||
+            req.auth?.tenantId ||
+            req.tenant?.tenantId ||
+            null;
 
         if (!tenantId) {
-            return res.status(400).json({ error: 'Missing tenant context' });
+            return res.status(400).json({ error: "Missing tenant context" });
         }
         req.tenantId = String(tenantId);
         next();
     };
-};
+}

@@ -1,8 +1,7 @@
-// @ts-nocheck
-const express = require("express");
-const router = express.Router();
+import { Router } from "express";
 
-// Health
+const router = Router();
+
 router.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-module.exports = router;
+export default router;

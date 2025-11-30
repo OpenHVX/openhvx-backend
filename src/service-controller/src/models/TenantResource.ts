@@ -1,20 +1,35 @@
-// @ts-nocheck
-// models/TenantResource.js
-const mongoose = require("mongoose");
+import { Schema, model, type HydratedDocument, type Model } from "mongoose";
+import type { ResourceKind } from "../types/domain";
 
-// compact key = (kind, agentId, refId) to avoid string concatenation
-const schema = new mongoose.Schema(
+export interface TenantResourceLink {
+    tenantId: string;
+    kind: ResourceKind;
+    agentId: string;
+    refId: string;
+    assignedAt: Date;
+    name?: string;
+    guid?: string;
+}
+
+export type TenantResourceDocument = HydratedDocument<TenantResourceLink>;
+
+export type TenantResourceModel = Model<TenantResourceLink>;
+
+const schema = new Schema<TenantResourceLink>(
     {
         tenantId: { type: String, required: true, index: true },
         kind: { type: String, required: true, enum: ["vm", "switch", "disk", "nic", "other"] },
         agentId: { type: String, required: true, index: true },
-        refId: { type: String, required: true, index: true }, // ex: VM GUID, switch name, etc.
+        refId: { type: String, required: true, index: true },
         assignedAt: { type: Date, default: () => new Date() },
+        name: { type: String },
+        guid: { type: String },
     },
     { timestamps: true }
 );
 
-// A resource may belong to a single tenant only:
 schema.index({ kind: 1, agentId: 1, refId: 1 }, { unique: true });
 
-module.exports = mongoose.model("TenantResource", schema);
+const TenantResource = model<TenantResourceLink>("TenantResource", schema);
+
+export default TenantResource;

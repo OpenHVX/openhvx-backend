@@ -1,63 +1,63 @@
-// @ts-nocheck
-// controllers/imagesController.js
-const imagesService = require("../services/images");
+import type { Response } from "express";
+import { cacheInfo, getById, list, resolvePath, reloadNow } from "../services/images";
+import type { ControllerRequest } from "../types/express";
+import logger from "../lib/logger";
 
-// GET /api/v1/tenant/images?q=&gen=&os=&arch=
-exports.list = async (req, res) => {
+const log = logger.child(["controller", "images"]);
+type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
+
+export const listImages: Handler = async (req, res) => {
     try {
-        const data = await imagesService.list({
-            q: req.query.q,
-            gen: req.query.gen,
-            os: req.query.os,
-            arch: req.query.arch,
+        const data = await list({
+            q: req.query.q as string | undefined,
+            gen: req.query.gen as string | undefined,
+            os: req.query.os as string | undefined,
+            arch: req.query.arch as string | undefined,
         });
-        res.json({ success: true, count: data.length, data });
-    } catch (e) {
-        console.error("images.list error:", e);
-        res.status(500).json({ error: "Server error" });
+        return res.json({ success: true, count: data.length, data });
+    } catch (error) {
+        log.error("images.list error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };
 
-// GET /api/v1/tenant/images/:imageId
-exports.getOne = async (req, res) => {
+export const getImage: Handler = async (req, res) => {
     try {
-        const img = await imagesService.getById(req.params.imageId);
+        const img = await getById(req.params.imageId);
         if (!img) return res.status(404).json({ error: "Not found" });
-        res.json({ success: true, data: img });
-    } catch (e) {
-        console.error("images.getOne error:", e);
-        res.status(500).json({ error: "Server error" });
+        return res.json({ success: true, data: img });
+    } catch (error) {
+        log.error("images.getOne error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };
 
-// /api/v1/tenant/images/:imageId/resolve
-exports.resolve = async (req, res) => {
+export const resolveImage: Handler = async (req, res) => {
     try {
-        const r = await imagesService.resolvePath(req.params.imageId);
-        if (!r) return res.status(404).json({ error: "Unknown imageId" });
-        res.json({ success: true, data: r });
-    } catch (e) {
-        console.error("images.resolve error:", e);
-        res.status(500).json({ error: "Server error" });
+        const result = await resolvePath(req.params.imageId);
+        if (!result) return res.status(404).json({ error: "Unknown imageId" });
+        return res.json({ success: true, data: result });
+    } catch (error) {
+        log.error("images.resolve error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };
 
-// GET /api/v1/admin/images/reload
-exports.reload = async (_req, res) => {
+export const reloadImages: Handler = async (_req, res) => {
     try {
-        const imgs = await imagesService._reloadNow();
-        res.json({ success: true, reloaded: imgs.length });
-    } catch (e) {
-        console.error("images.reload error:", e);
-        res.status(500).json({ error: "Server error" });
+        const imgs = await reloadNow();
+        return res.json({ success: true, reloaded: imgs.length });
+    } catch (error) {
+        log.error("images.reload error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };
 
-// GET /api/v1/admin/images/diag
-exports.diag = async (_req, res) => {
+export const diag: Handler = async (_req, res) => {
     try {
-        res.json({ success: true, data: imagesService._cacheInfo() });
-    } catch (e) {
-        res.status(500).json({ error: "Server error" });
+        return res.json({ success: true, data: cacheInfo() });
+    } catch (error) {
+        log.error("images.diag error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };

@@ -1,51 +1,80 @@
-// @ts-nocheck
-// lib/schemas/task.js
-"use strict";
-
-const {
-    validate,
+import {
+    arrayOf,
+    isEnum,
+    isInteger,
+    isString,
     objectStrict,
     optional,
-    isString,
-    isInteger,
-    isEnum,
-} = require("../validate");
+    validate,
+} from "../validate";
+import type { ValidationResult, Validator } from "../validate";
 
-const isBoolean = isEnum([true, false]);
+const isBoolean = isEnum([true, false] as const);
 
-// -------- SCHEMAS --------
+export interface CloudInitNetwork {
+    mode?: "dhcp";
+}
 
-// CloudInit subset (loose structure but still constrained)
-const CloudInitSchema = objectStrict({
+export interface CloudInitConfig extends Record<string, unknown> {
+    hostname?: string;
+    user?: string;
+    ssh_authorized_keys?: string[];
+    packages?: string[];
+    runcmd?: string[];
+    enableSerial?: boolean;
+    serialReboot?: boolean;
+    network?: CloudInitNetwork;
+}
+
+export interface VmCreatePayload extends Record<string, unknown> {
+    name: string;
+    imageId?: string;
+    cpu?: number;
+    generation?: number;
+    ram?: string;
+    dynamic_memory?: boolean;
+    min_ram?: string;
+    max_ram?: string;
+    network?: {
+        vpcId?: string;
+        subnetId?: string;
+    };
+    cloudInit?: CloudInitConfig;
+}
+
+const CloudInitSchema = objectStrict<CloudInitConfig>({
     hostname: optional(isString),
     user: optional(isString),
-    ssh_authorized_keys: optional((v) => Array.isArray(v) && v.every(isString)),
-    packages: optional((v) => Array.isArray(v) && v.every(isString)),
-    runcmd: optional((v) => Array.isArray(v) && v.every(isString)),
+    ssh_authorized_keys: optional(arrayOf(isString)),
+    packages: optional(arrayOf(isString)),
+    runcmd: optional(arrayOf(isString)),
     enableSerial: optional(isBoolean),
     serialReboot: optional(isBoolean),
-    network: optional(objectStrict({
-        mode: optional(isEnum(["dhcp"])),
-    })),
+    network: optional(
+        objectStrict({
+            mode: optional(isEnum(["dhcp"] as const)),
+        })
+    ),
 });
 
-const VmCreateSchema = objectStrict({
+const VmCreateSchema = objectStrict<VmCreatePayload>({
     name: isString,
     imageId: optional(isString),
     cpu: optional(isInteger),
     generation: optional(isInteger),
-    ram: optional(isString), // e.g. "2GB"
+    ram: optional(isString),
     dynamic_memory: optional(isBoolean),
     min_ram: optional(isString),
     max_ram: optional(isString),
-    network: optional(objectStrict({
-        vpcId: optional(isString),
-        subnetId: optional(isString),
-    })),
+    network: optional(
+        objectStrict({
+            vpcId: optional(isString),
+            subnetId: optional(isString),
+        })
+    ),
     cloudInit: optional(CloudInitSchema),
 });
 
-// -------- REGISTERED ACTIONS --------
 const PRE = {
     "vm.create": VmCreateSchema,
 
@@ -56,7 +85,7 @@ const PRE = {
 
     "vm.power": objectStrict({
         guid: optional(isString),
-        state: isEnum(["start", "stop", "restart"])
+        state: isEnum(["start", "stop", "restart"] as const),
     }),
 
     "vm.delete": objectStrict({
@@ -74,22 +103,21 @@ const PRE = {
 
     "net.tunnel.open": objectStrict({}),
 
-    "echo": objectStrict({
+    echo: objectStrict({
         message: optional(isString),
     }),
-};
+} as const satisfies Record<string, Validator<unknown>>;
 
-// -------- EXPORTS --------
-function isKnownAction(action) {
-    return !!PRE[action];
+export type TaskAction = keyof typeof PRE;
+
+export function isKnownAction(action: string): action is TaskAction {
+    return Object.prototype.hasOwnProperty.call(PRE, action);
 }
 
-function preValidate(action, data) {
-    const schema = PRE[action];
+export function preValidate(action: string, data: unknown): ValidationResult<unknown> {
+    const schema = (PRE as Record<string, Validator<unknown>>)[action];
     if (!schema) {
         return { ok: false, value: undefined, errors: [`action: UNKNOWN_ACTION (${action})`] };
     }
     return validate(schema, data);
 }
-
-module.exports = { isKnownAction, preValidate };

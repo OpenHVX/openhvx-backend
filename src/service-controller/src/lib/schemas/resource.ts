@@ -1,57 +1,88 @@
-// @ts-nocheck
-// lib/schemas/resource.js (CommonJS)
-// Contracts for resources endpoints, using lib/validate.js
-
-const {
-    validate,
+import {
+    arrayOf,
+    isEnum,
+    isString,
     objectStrict,
     optional,
-    arrayOf,
-    isString,
-    isEnum,
-} = require('../validate');
+    validate,
+} from "../validate";
+import type { ValidationResult } from "../validate";
+import type { ResourceKind } from "../../types/domain";
 
-// GET /.../resources (query)
-const ListResourcesQuery = objectStrict({
-    kind: optional(isEnum(['vm', 'switch', 'disk'])),
+type ClaimKind = Extract<ResourceKind, "vm" | "switch" | "disk">;
+
+export interface ListResourcesQueryShape extends Record<string, unknown> {
+    kind?: ClaimKind;
+    agentId?: string;
+    includeOrphans?: string;
+}
+
+export interface ClaimResourceBody extends Record<string, unknown> {
+    kind: ClaimKind;
+    agentId: string;
+    refIds: string[];
+}
+
+export interface UnclaimParamsShape extends Record<string, unknown> {
+    resourceId: string;
+}
+
+export interface UnclaimQueryShape extends Record<string, unknown> {
+    kind: ClaimKind;
+    agentId: string;
+}
+
+export interface UnassignedQueryShape extends Record<string, unknown> {
+    kind?: ClaimKind;
+    agentId?: string;
+    limit?: string;
+}
+
+const RESOURCE_KIND_VALUES = ["vm", "switch", "disk"] as const;
+
+const ListResourcesQuery = objectStrict<ListResourcesQueryShape>({
+    kind: optional(isEnum(RESOURCE_KIND_VALUES)),
     agentId: optional(isString),
-    includeOrphans: optional(isString), // 'true' | 'false' (parsed later)
+    includeOrphans: optional(isString),
 });
 
-// POST /.../resources/claim (body)
-const ClaimBody = objectStrict({
-    kind: isString,
+const ClaimBody = objectStrict<ClaimResourceBody>({
+    kind: isEnum(RESOURCE_KIND_VALUES),
     agentId: isString,
-    refIds: arrayOf(isString), // non-empty check is done in controller (see note)
+    refIds: arrayOf(isString),
 });
 
-// DELETE /.../resources/:resourceId (params + query)
-const UnclaimParams = objectStrict({
+const UnclaimParams = objectStrict<UnclaimParamsShape>({
     resourceId: isString,
 });
-const UnclaimQuery = objectStrict({
-    kind: isString,
+
+const UnclaimQuery = objectStrict<UnclaimQueryShape>({
+    kind: isEnum(RESOURCE_KIND_VALUES),
     agentId: isString,
 });
 
-// GET /admin/resources/unassigned (query)
-const UnassignedQuery = objectStrict({
-    kind: optional(isEnum(['vm', 'switch', 'disk'])),
+const UnassignedQuery = objectStrict<UnassignedQueryShape>({
+    kind: optional(isEnum(RESOURCE_KIND_VALUES)),
     agentId: optional(isString),
-    limit: optional(isString), // parsed to int later
+    limit: optional(isString),
 });
 
-// Thin wrappers returning { ok, value, errors }
-function validateListQuery(q) { return validate(ListResourcesQuery, q || {}); }
-function validateClaimBody(b) { return validate(ClaimBody, b || {}); }
-function validateUnclaimParams(p) { return validate(UnclaimParams, p || {}); }
-function validateUnclaimQuery(q) { return validate(UnclaimQuery, q || {}); }
-function validateUnassignedQuery(q) { return validate(UnassignedQuery, q || {}); }
+export function validateListQuery(q: unknown): ValidationResult<ListResourcesQueryShape> {
+    return validate(ListResourcesQuery, q || {});
+}
 
-module.exports = {
-    validateListQuery,
-    validateClaimBody,
-    validateUnclaimParams,
-    validateUnclaimQuery,
-    validateUnassignedQuery,
-};
+export function validateClaimBody(b: unknown): ValidationResult<ClaimResourceBody> {
+    return validate(ClaimBody, b || {});
+}
+
+export function validateUnclaimParams(p: unknown): ValidationResult<UnclaimParamsShape> {
+    return validate(UnclaimParams, p || {});
+}
+
+export function validateUnclaimQuery(q: unknown): ValidationResult<UnclaimQueryShape> {
+    return validate(UnclaimQuery, q || {});
+}
+
+export function validateUnassignedQuery(q: unknown): ValidationResult<UnassignedQueryShape> {
+    return validate(UnassignedQuery, q || {});
+}

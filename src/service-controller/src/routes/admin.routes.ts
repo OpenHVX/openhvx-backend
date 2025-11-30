@@ -1,79 +1,71 @@
-// @ts-nocheck
-// routes/admin.js (legacy reference)
-"use strict";
+import { Router } from "express";
+import { asAdminMode } from "../middlewares/accessMode";
+import {
+    createTenant,
+    listTenants,
+    getTenant,
+    updateTenant,
+    removeTenant,
+    getQuotas,
+    patchQuotaLimits,
+    reserveQuotas,
+    releaseQuotas,
+    recalculateQuotas,
+} from "../controllers/tenantsController";
+import { getAgents, getStatus, getInventory } from "../controllers/agentsController";
+import {
+    listResources,
+    claimResources,
+    unclaimResource,
+    listUnassignedResources,
+} from "../controllers/resourcesController";
+import { enqueueTask, getTask } from "../controllers/tasksController";
+import {
+    adminOverview,
+    adminCompute,
+    adminDatastores,
+    adminVMs,
+    adminTenantOverview,
+} from "../controllers/metricsController";
+import { listImages, getImage, resolveImage } from "../controllers/imagesController";
 
-const express = require("express");
-const router = express.Router();
+const router = Router();
 
-const { asAdminMode } = require("../middlewares/accessMode");
-
-const tenants = require("../controllers/tenantsController");
-const agents = require("../controllers/agentsController");
-const resources = require("../controllers/resourcesController");
-const tasks = require("../controllers/tasksController");
-const metrics = require("../controllers/metricsController");
-const images = require("../controllers/imagesController");
-
-// Everything below runs in admin mode
 router.use(asAdminMode());
 
-// -----------------------------------------------------------------------------
-// Global (unassigned)
-// -----------------------------------------------------------------------------
-router.get("/resources/unassigned", resources.listUnassignedResources);
+router.get("/resources/unassigned", listUnassignedResources);
 
-// -----------------------------------------------------------------------------
-// Tenants (CRUD)
-// -----------------------------------------------------------------------------
-router.post("/tenants", tenants.create);
-router.get("/tenants", tenants.list);
-router.get("/tenants/:tenantId", tenants.get);
-router.patch("/tenants/:tenantId", tenants.update);
-router.delete("/tenants/:tenantId", tenants.remove);
+router.post("/tenants", createTenant);
+router.get("/tenants", listTenants);
+router.get("/tenants/:tenantId", getTenant);
+router.patch("/tenants/:tenantId", updateTenant);
+router.delete("/tenants/:tenantId", removeTenant);
 
-// -----------------------------------------------------------------------------
-// Tenants > Quotas
-// -----------------------------------------------------------------------------
-router.get("/tenants/:tenantId/quotas", tenants.getQuotas);
-router.patch("/tenants/:tenantId/quotas", tenants.patchQuotaLimits);
-router.post("/tenants/:tenantId/quotas/reserve", tenants.reserveQuotas);
-router.post("/tenants/:tenantId/quotas/release", tenants.releaseQuotas);
-router.post("/tenants/:tenantId/quotas/recalculate", tenants.recalculateQuotas);
+router.get("/tenants/:tenantId/quotas", getQuotas);
+router.patch("/tenants/:tenantId/quotas", patchQuotaLimits);
+router.post("/tenants/:tenantId/quotas/reserve", reserveQuotas);
+router.post("/tenants/:tenantId/quotas/release", releaseQuotas);
+router.post("/tenants/:tenantId/quotas/recalculate", recalculateQuotas);
 
-// -----------------------------------------------------------------------------
-// Tasks (scoped by tenantId via body/JWT)
-// -----------------------------------------------------------------------------
-router.post("/tasks", tasks.enqueueTask);
-router.get("/tasks/:taskId", tasks.getTask);
+router.post("/tasks", enqueueTask);
+router.get("/tasks/:taskId", getTask);
 
-// -----------------------------------------------------------------------------
-// Tenant-owned resources
-// -----------------------------------------------------------------------------
-router.get("/tenants/:tenantId/resources", resources.listResources);
-router.post("/tenants/:tenantId/resources", resources.claimResources);        // claim on behalf of the tenant
-router.delete("/tenants/:tenantId/resources/:resourceId", resources.unclaimResource);      // unclaim on behalf of the tenant
+router.get("/tenants/:tenantId/resources", listResources);
+router.post("/tenants/:tenantId/resources", claimResources);
+router.delete("/tenants/:tenantId/resources/:resourceId", unclaimResource);
 
-// -----------------------------------------------------------------------------
-// Agents (global)
-// -----------------------------------------------------------------------------
-router.get("/agents", agents.getAgents);
-router.get("/agents/:agentId/status", agents.getStatus);
-router.get("/agents/:agentId/inventory", agents.getInventory);
+router.get("/agents", getAgents);
+router.get("/agents/:agentId/status", getStatus);
+router.get("/agents/:agentId/inventory", getInventory);
 
-// -----------------------------------------------------------------------------
-// Metrics
-// -----------------------------------------------------------------------------
-router.get("/metrics/overview", metrics.adminOverview);
-router.get("/metrics/compute", metrics.adminCompute);
-router.get("/metrics/datastores", metrics.adminDatastores);
-router.get("/metrics/vms", metrics.adminVMs);
-router.get("/metrics/tenant/overview", metrics.adminTenantOverview);
+router.get("/metrics/overview", adminOverview);
+router.get("/metrics/compute", adminCompute);
+router.get("/metrics/datastores", adminDatastores);
+router.get("/metrics/vms", adminVMs);
+router.get("/metrics/tenant/overview", adminTenantOverview);
 
-// -----------------------------------------------------------------------------
-// Images
-// -----------------------------------------------------------------------------
-router.get("/images", images.list);
-router.get("/images/:imageId", images.getOne);
-router.get("/images/:imageId/resolve", images.resolve);
+router.get("/images", listImages);
+router.get("/images/:imageId", getImage);
+router.get("/images/:imageId/resolve", resolveImage);
 
-module.exports = router;
+export default router;

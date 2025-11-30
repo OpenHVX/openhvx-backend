@@ -1,2 +1,3 @@
-// @ts-nocheck
-module.exports = { quota: require('./quota') };
+import quota from "./quota";
+
+export { quota };

@@ -1,15 +1,22 @@
-// @ts-nocheck
-// middlewares/ensureAdmin.js
-module.exports = function ensureAdmin(req, res, next) {
+import type { NextFunction, Response } from "express";
+import type { ControllerRequest } from "../types/express";
+
+const forbidden = (res: Response) => res.status(403).json({ error: "Forbidden: admin only" });
+
+export default function ensureAdmin(req: ControllerRequest, res: Response, next: NextFunction) {
     try {
-        const u = req.user || req.auth || {};
-        const roles = Array.isArray(u.roles) ? u.roles
-            : Array.isArray(u.scope) ? u.scope
-                : typeof u.role === 'string' ? [u.role]
-                    : [];
-        if (roles.includes('global-admin')) return next();
-        return res.status(403).json({ error: 'Forbidden: admin only' });
+        const payload = (req.user || req.auth || {}) as Record<string, unknown>;
+        const roles = Array.isArray(payload.roles)
+            ? payload.roles
+            : Array.isArray(payload.scope)
+            ? payload.scope
+            : typeof payload.role === "string"
+            ? [payload.role]
+            : [];
+        const normalized = roles.map((r) => (typeof r === "string" ? r : String(r ?? ""))).map((r) => r.toLowerCase());
+        if (normalized.includes("global-admin")) return next();
+        return forbidden(res);
     } catch {
-        return res.status(403).json({ error: 'Forbidden: admin only' });
+        return forbidden(res);
     }
-};
+}

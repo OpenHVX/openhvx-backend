@@ -1,101 +1,88 @@
-// @ts-nocheck
-// controllers/resources.js
-"use strict";
-
-/**
- * Resources Controller
- * --------------------
- */
-const { ERR, send } = require('../lib/errors/http-errors');
-const {
-    validateListQuery,
+import type { Response } from "express";
+import { ERR, send } from "../lib/errors/http-errors";
+import {
     validateClaimBody,
+    validateListQuery,
+    validateUnassignedQuery,
     validateUnclaimParams,
     validateUnclaimQuery,
-    validateUnassignedQuery,
-} = require('../lib/schemas/resource');
+} from "../lib/schemas/resource";
+import TenantResource, { type TenantResourceLink } from "../models/TenantResource";
+import InventoryFull from "../models/Inventory.full";
+import InventoryLight from "../models/Inventory.light";
+import type { ControllerRequest } from "../types/express";
+import {
+    type InventoryDatastore,
+    type InventoryDoc,
+    type InventoryNetworkAdapter,
+    type InventoryRoot,
+    type InventorySwitch,
+    type InventoryVm,
+    type PickedResource,
+    type ResourceData,
+    type VmStorage,
+} from "../types/resources";
+import logger from "../lib/logger";
 
-const TenantResource = require("../models/TenantResource");
-const InventoryFull = require("../models/Inventory.full");
-const InventoryLight = require("../models/Inventory.light");
+const log = logger.child(["controller", "resources"]);
+type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
 
-/* ==================================================================== */
-/* Utilities                                                            */
-/* ==================================================================== */
-
-/** Get tenantId from URL, middleware, or JWT. */
-const getTenantId = (req) =>
+const getTenantId = (req: ControllerRequest) =>
     req.params?.tenantId || req.tenantId || req.user?.tenantId || null;
 
-/** Normalize to array (safe loop). */
-const arr = (v) => (Array.isArray(v) ? v : []);
+const arr = <T = unknown>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
+const normPath = (input?: string | null) =>
+    typeof input === "string" ? input.replace(/\//g, "\\").toLowerCase() : input ?? undefined;
 
-/** Normalize Windows path for case-insensitive + / vs \ comparison. */
-const normPath = (p) =>
-    typeof p === "string" ? p.replace(/\//g, "\\").toLowerCase() : p;
+const root = (doc?: InventoryDoc | null): InventoryRoot =>
+    (doc?.inventory?.inventory || doc?.inventory || {}) as InventoryRoot;
 
-/** Root of inventory (supports legacy shapes). */
-const root = (doc) => doc?.inventory?.inventory || doc?.inventory || {};
+const vmKey = (vm: InventoryVm) => vm.guid || vm.id || vm.name || null;
 
-/** VM key priority: guid > id > name. */
-const vmKey = (vm) => vm?.guid || vm?.id || vm?.name || null;
-
-/** Build a Map<K,V> from a list by extracting a key. */
-const mapBy = (list, keyFn) => {
-    const m = new Map();
-    for (const x of arr(list)) {
-        const k = keyFn(x);
-        if (k) m.set(String(k), x);
+const mapBy = <T>(list: T[], keyFn: (item: T) => string | null | undefined) => {
+    const map = new Map<string, T>();
+    for (const item of list) {
+        const key = keyFn(item);
+        if (key) map.set(String(key), item);
     }
-    return m;
+    return map;
 };
 
-/** Reliable timestamp from doc.ts or inventory.collectedAt (else null). */
-const getTs = (doc) => {
+const getTs = (doc?: InventoryDoc | null) => {
     if (!doc) return null;
     if (doc.ts) {
         const t = new Date(doc.ts).getTime();
         if (Number.isFinite(t)) return t;
     }
-    const col = root(doc)?.collectedAt;
-    if (col) {
-        const t = new Date(col).getTime();
+    const collected = root(doc)?.collectedAt as string | Date | undefined;
+    if (collected) {
+        const t = new Date(collected).getTime();
         if (Number.isFinite(t)) return t;
     }
     return null;
 };
 
-/** All possible identity keys for a VM (stringified). */
-const vmKeysAll = (vm) =>
-    [vm?.guid, vm?.id, vm?.name].filter(Boolean).map(String);
+const vmKeysAll = (vm: InventoryVm) =>
+    [vm.guid, vm.id, vm.name].filter(Boolean).map((key) => String(key));
 
-/** Lowercase helper. */
-const lcase = (s) => (typeof s === "string" ? s.toLowerCase() : s);
-
-/* ==================================================================== */
-/* Agent staleness                                                      */
-/* ==================================================================== */
+const lcase = (value?: string | null) => (typeof value === "string" ? value.toLowerCase() : value);
 
 const STALE_MS = Number(
     process.env.AGENT_STALE_MS ||
-    process.env.RESOURCE_STATE_STALE_MS ||
-    3 * 60 * 1000
+        process.env.RESOURCE_STATE_STALE_MS ||
+        3 * 60 * 1000
 );
 
-const agentLastTs = (fullDoc, lightDoc) => {
+const agentLastTs = (fullDoc?: InventoryDoc | null, lightDoc?: InventoryDoc | null) => {
     const t1 = getTs(fullDoc) ?? -Infinity;
     const t2 = getTs(lightDoc) ?? -Infinity;
     return Math.max(t1, t2);
 };
 
-const isStale = (fullDoc, lightDoc, now = Date.now()) => {
+const isStale = (fullDoc?: InventoryDoc | null, lightDoc?: InventoryDoc | null, now = Date.now()) => {
     const last = agentLastTs(fullDoc, lightDoc);
     return !Number.isFinite(last) || now - last > STALE_MS;
 };
-
-/* ==================================================================== */
-/* VM merge (FULL authoritative + LIGHT overlay + fast-create exception)*/
-/* ==================================================================== */
 
 const VOLATILE_FIELDS = [
     "state",
@@ -106,122 +93,132 @@ const VOLATILE_FIELDS = [
     "automaticStop",
 ];
 
-function mergeVm(baseVm, overlayVm) {
+const mergeVm = (baseVm: InventoryVm, overlayVm?: InventoryVm) => {
     if (!overlayVm) return { ...baseVm };
-    const out = { ...baseVm };
+    const out: InventoryVm = { ...baseVm };
 
-    // (1) Volatile overlay
-    for (const k of VOLATILE_FIELDS) {
-        if (overlayVm[k] != null) out[k] = overlayVm[k];
+    for (const key of VOLATILE_FIELDS) {
+        if ((overlayVm as Record<string, unknown>)[key] != null) {
+            (out as Record<string, unknown>)[key] = (overlayVm as Record<string, unknown>)[key];
+        }
     }
 
-    // (2) Disks: keep best (max) vhd.fileSizeMB
-    const baseDisks = arr(baseVm.storage);
-    const ovDisks = arr(overlayVm.storage);
-    const byPath = mapBy(ovDisks, (d) => normPath(d?.path));
+    const baseDisks = arr<VmStorage>(baseVm.storage);
+    const ovDisks = arr<VmStorage>(overlayVm.storage);
+    const byPath = mapBy(ovDisks, (disk) => normPath(disk?.path || disk?.vhd?.path));
 
     out.storage = baseDisks.map((bd) => {
-        const od = byPath.get(normPath(bd?.path));
+        const od = byPath.get(normPath(bd?.path || bd?.vhd?.path) || "");
         if (!od) return bd;
 
-        const bv = bd?.vhd || {};
+        const baseVhd = bd?.vhd || {};
         const ov = od?.vhd || {};
 
-        const cur = typeof bv.fileSizeMB === "number" ? bv.fileSizeMB : -Infinity;
-        const nxt = typeof ov.fileSizeMB === "number" ? Math.max(cur, ov.fileSizeMB) : cur;
+        const current = typeof baseVhd.fileSizeMB === "number" ? baseVhd.fileSizeMB : -Infinity;
+        const next =
+            typeof ov.fileSizeMB === "number" ? Math.max(current, ov.fileSizeMB) : current;
 
         return {
             ...bd,
             vhd: {
-                ...bv,
-                format: bv.format ?? ov.format ?? null,
-                type: bv.type ?? ov.type ?? null,
-                sizeMB: bv.sizeMB ?? null,
-                fileSizeMB: Number.isFinite(nxt) ? nxt : bv.fileSizeMB ?? null,
-                parentPath: bv.parentPath ?? null,
-                blockSize: bv.blockSize ?? null,
-                logicalSectorSize: bv.logicalSectorSize ?? null,
-                physicalSectorSize: bv.physicalSectorSize ?? null,
+                ...baseVhd,
+                format: baseVhd.format ?? ov.format ?? null,
+                type: baseVhd.type ?? ov.type ?? null,
+                sizeMB: baseVhd.sizeMB ?? null,
+                fileSizeMB: Number.isFinite(next) ? next : baseVhd.fileSizeMB ?? null,
+                parentPath: baseVhd.parentPath ?? null,
+                blockSize: baseVhd.blockSize ?? null,
+                logicalSectorSize: baseVhd.logicalSectorSize ?? null,
+                physicalSectorSize: baseVhd.physicalSectorSize ?? null,
             },
         };
     });
 
     return out;
-}
+};
 
-function combineAgent(fullDoc, lightDoc, allowLightOnlyKeys = null) {
-    const fullVms = arr(root(fullDoc).vms);
-    const lightVms = arr(root(lightDoc).vms);
+const combineAgent = (
+    fullDoc?: InventoryDoc | null,
+    lightDoc?: InventoryDoc | null,
+    allowLightOnlyKeys: Set<string> | null = null
+) => {
+    const fullVms = arr<InventoryVm>(root(fullDoc).vms);
+    const lightVms = arr<InventoryVm>(root(lightDoc).vms);
 
     const tFull = getTs(fullDoc) ?? -Infinity;
     const tLight = getTs(lightDoc) ?? -Infinity;
     const lightIsNewer = tLight > tFull;
 
-    // Index LIGHT by all possible keys
-    const byLight = new Map();
-    for (const lv of lightVms) {
-        for (const k of vmKeysAll(lv)) {
-            if (!byLight.has(k)) byLight.set(k, lv);
+    const byLight = new Map<string, InventoryVm>();
+    for (const vm of lightVms) {
+        for (const key of vmKeysAll(vm)) {
+            if (!byLight.has(key)) byLight.set(key, vm);
         }
     }
 
-    // No FULL yet → best effort from LIGHT
     if (fullVms.length === 0) {
-        return lightVms.map((v) => ({ ...v }));
+        return lightVms.map((vm) => ({ ...vm }));
     }
 
-    // FULL present → base = FULL; overlay with LIGHT (if newer)
-    const presentKeyLC = new Set();
-    const out = [];
+    const presentKeyLC = new Set<string>();
+    const out: InventoryVm[] = [];
 
-    for (const fv of fullVms) {
-        let lv = null;
-        for (const k of vmKeysAll(fv)) {
-            if (byLight.has(k)) { lv = byLight.get(k); break; }
+    for (const fullVm of fullVms) {
+        let lv: InventoryVm | null = null;
+        for (const key of vmKeysAll(fullVm)) {
+            if (byLight.has(key)) {
+                lv = byLight.get(key) || null;
+                break;
+            }
         }
-        const merged = lightIsNewer && lv ? mergeVm(fv, lv) : { ...fv };
+        const merged = lightIsNewer && lv ? mergeVm(fullVm, lv) : { ...fullVm };
         out.push(merged);
-
-        for (const k of vmKeysAll(fv)) presentKeyLC.add(lcase(k));
+        vmKeysAll(fullVm).forEach((key) => presentKeyLC.add(lcase(key) || ""));
     }
 
-    // Fast-create: allow LIGHT-only if explicitly linked and LIGHT newer
     if (lightIsNewer && allowLightOnlyKeys && allowLightOnlyKeys.size) {
         for (const lv of lightVms) {
             const keys = vmKeysAll(lv);
-            const alreadyPresent = keys.some((k) => presentKeyLC.has(lcase(k)));
+            const alreadyPresent = keys.some((key) => presentKeyLC.has(lcase(key) || ""));
             if (alreadyPresent) continue;
 
-            const allowed = keys.some((k) => allowLightOnlyKeys.has(lcase(k)));
+            const allowed = keys.some((key) => allowLightOnlyKeys.has(lcase(key) || ""));
             if (allowed) {
                 out.push({ ...lv });
-                for (const k of keys) presentKeyLC.add(lcase(k));
+                keys.forEach((key) => presentKeyLC.add(lcase(key) || ""));
             }
         }
     }
 
     return out;
-}
+};
 
-function pickFromInv(doc, { kind, agentId } = {}) {
+const pickFromInv = (
+    doc?: InventoryDoc | null,
+    filter: { kind?: string; agentId?: string } = {}
+): PickedResource[] => {
     if (!doc) return [];
-    const out = [];
-    const aId = agentId || doc.agentId || null;
-    if (!aId) return out;
+    const out: Array<{
+        kind: string;
+        agentId: string;
+        refId: string;
+        data: ResourceData;
+    }> = [];
+    const agentId = filter.agentId || doc.agentId;
+    if (!agentId) return out;
 
-    const inv = root(doc) || {};
-    const includeVm = !kind || kind === "vm";
-    const includeSwitch = !kind || kind === "switch";
-    const includeDisk = !kind || kind === "disk";
+    const inv = root(doc) as { vms?: InventoryVm[]; networks?: { switches?: InventorySwitch[] } };
+    const includeVm = !filter.kind || filter.kind === "vm";
+    const includeSwitch = !filter.kind || filter.kind === "switch";
+    const includeDisk = !filter.kind || filter.kind === "disk";
 
     if (includeVm) {
-        for (const vm of arr(inv.vms)) {
+        for (const vm of arr<InventoryVm>(inv.vms)) {
             const refId = vmKey(vm);
             if (!refId) continue;
-
             out.push({
                 kind: "vm",
-                agentId: aId,
+                agentId,
                 refId: String(refId),
                 data: {
                     name: vm?.name ?? null,
@@ -232,7 +229,7 @@ function pickFromInv(doc, { kind, agentId } = {}) {
                         vm?.memoryAssignedMB ??
                         vm?.configuration?.memory?.startupMB ??
                         null,
-                    switches: arr(vm?.networkAdapters)
+                    switches: arr<InventoryNetworkAdapter>(vm?.networkAdapters)
                         .map((n) => n?.switch)
                         .filter(Boolean),
                     raw: vm,
@@ -242,12 +239,12 @@ function pickFromInv(doc, { kind, agentId } = {}) {
     }
 
     if (includeSwitch) {
-        const switches = arr(inv?.networks?.switches);
+        const switches = arr<InventorySwitch>(inv?.networks?.switches);
         for (const sw of switches) {
             if (!sw?.name) continue;
             out.push({
                 kind: "switch",
-                agentId: aId,
+                agentId,
                 refId: String(sw.name),
                 data: {
                     name: sw.name ?? null,
@@ -260,13 +257,13 @@ function pickFromInv(doc, { kind, agentId } = {}) {
     }
 
     if (includeDisk) {
-        for (const vm of arr(inv.vms)) {
-            for (const disk of arr(vm?.storage)) {
+        for (const vm of arr<InventoryVm>(inv.vms)) {
+            for (const disk of arr<VmStorage>(vm?.storage)) {
                 const vhdPath = disk?.vhd?.path || disk?.path;
                 if (!vhdPath) continue;
                 out.push({
                     kind: "disk",
-                    agentId: aId,
+                    agentId,
                     refId: String(vhdPath),
                     data: {
                         name: vm?.name ?? null,
@@ -282,182 +279,163 @@ function pickFromInv(doc, { kind, agentId } = {}) {
     }
 
     return out;
-}
+};
 
-/* ==================================================================== */
-/* Controllers                                                           */
-/* ==================================================================== */
-
-/**
- * GET /api/v1/tenant/resources
- * GET /api/v1/admin/:tenantId/resources
- * Query: kind, agentId, includeOrphans
- */
-exports.listResources = async (req, res) => {
+export const listResources: Handler = async (req, res) => {
     try {
         const tenantId = getTenantId(req);
         if (!tenantId) return send(res, ERR.tenantContextMissing(), req);
+        const ensuredTenantId = tenantId as string;
 
-        // Validate query
         const vq = validateListQuery(req.query || {});
         if (!vq.ok) return send(res, ERR.validationPre(vq.errors), req);
 
-        const { kind, agentId, includeOrphans } = vq.value;
+        const { kind, agentId, includeOrphans } = vq.value!;
         const showOrphans = String(includeOrphans).toLowerCase() === "true";
 
-        // 1) All links (resources claimed by the tenant)
-        const q = { tenantId };
-        if (kind) q.kind = kind;
-        if (agentId) q.agentId = agentId;
+        const query: Record<string, string> = { tenantId: ensuredTenantId };
+        if (kind) query.kind = kind;
+        if (agentId) query.agentId = agentId;
 
-        const links = await TenantResource.find(q).lean();
+        const links = await TenantResource.find(query).lean<TenantResourceLink[]>();
         if (!links.length) return res.json({ success: true, data: [] });
 
-        // 2) Get FULL & LIGHT for all involved agents
-        const agentIds = Array.from(new Set(links.map((l) => l.agentId)));
-
+        const agentIds = Array.from(new Set(links.map((link) => String(link.agentId))));
         const [fullDocs, lightDocs] = await Promise.all([
             InventoryFull.find(
                 { agentId: { $in: agentIds } },
                 { agentId: 1, inventory: 1, ts: 1 }
-            ).lean(),
+            ).lean<InventoryDoc[]>(),
             InventoryLight.find(
                 { agentId: { $in: agentIds } },
                 { agentId: 1, inventory: 1, ts: 1 }
-            ).lean(),
+            ).lean<InventoryDoc[]>(),
         ]);
 
-        const fullBy = new Map(fullDocs.map((d) => [d.agentId, d]));
-        const lightBy = new Map(lightDocs.map((d) => [d.agentId, d]));
+        const fullBy = new Map(fullDocs.map((doc) => [doc.agentId, doc]));
+        const lightBy = new Map(lightDocs.map((doc) => [doc.agentId, doc]));
 
-        // 3) Per agent, keys allowed for LIGHT-only "fast create" (from links)
-        const allowByAgent = new Map();
-        for (const l of links) {
-            if (l.kind !== "vm") continue;
-            const set = allowByAgent.get(l.agentId) || new Set();
-            if (l.refId) set.add(l.refId.toLowerCase());
-            if (l.name) set.add(l.name.toLowerCase());
-            allowByAgent.set(l.agentId, set);
+        const allowByAgent = new Map<string, Set<string>>();
+        for (const link of links) {
+            if (link.kind !== "vm") continue;
+            const set = allowByAgent.get(link.agentId) || new Set<string>();
+            if (link.refId) set.add(link.refId.toLowerCase());
+            if (link.name) set.add(link.name.toLowerCase());
+            allowByAgent.set(link.agentId, set);
         }
 
-        // 4) Staleness by agent
-        const staleByAgent = new Map();
-        for (const aId of agentIds) {
-            staleByAgent.set(aId, isStale(fullBy.get(aId), lightBy.get(aId)));
+        const staleByAgent = new Map<string, boolean>();
+        for (const id of agentIds) {
+            staleByAgent.set(id, isStale(fullBy.get(id), lightBy.get(id)));
         }
 
-        // 5) Build merged VM index per agent
-        const vmIdxByAgent = new Map();
-        for (const aId of agentIds) {
+        const vmIdxByAgent = new Map<string, Map<string, InventoryVm>>();
+        for (const id of agentIds) {
             const merged = combineAgent(
-                fullBy.get(aId) || null,
-                lightBy.get(aId) || null,
-                allowByAgent.get(aId) || null
+                fullBy.get(id) || null,
+                lightBy.get(id) || null,
+                allowByAgent.get(id) || null
             );
-
-            const idx = new Map();
+            const idx = new Map<string, InventoryVm>();
             for (const vm of merged) {
-                for (const k of [vm.guid, vm.id, vm.name].filter(Boolean).map(String)) {
-                    idx.set(k, vm);
+                for (const key of [vm.guid, vm.id, vm.name].filter(Boolean).map(String)) {
+                    idx.set(key, vm);
                 }
             }
-            vmIdxByAgent.set(aId, idx);
+            vmIdxByAgent.set(id, idx);
         }
 
-        // 6) Rebuild response in link order; show orphans only if requested
-        const out = [];
-        for (const l of links) {
-            if (l.kind === "vm") {
-                const idx = vmIdxByAgent.get(l.agentId) || new Map();
-
-                let vm = idx.get(String(l.refId));
-                if (!vm && l.name) {
-                    vm = idx.get(String(l.name));
+        const out: Array<Record<string, unknown>> = [];
+        for (const link of links) {
+            if (link.kind === "vm") {
+                const idx = vmIdxByAgent.get(link.agentId) || new Map<string, InventoryVm>();
+                let vm = idx.get(String(link.refId));
+                if (!vm && link.name) {
+                    vm = idx.get(String(link.name));
                     if (!vm) {
-                        const wanted = String(l.name).toLowerCase();
-                        for (const v of idx.values()) {
-                            if ((v?.name || "").toLowerCase() === wanted) { vm = v; break; }
+                        const wanted = link.name.toLowerCase();
+                        for (const candidate of idx.values()) {
+                            if ((candidate?.name || "").toLowerCase() === wanted) {
+                                vm = candidate;
+                                break;
+                            }
                         }
                     }
                 }
-                if (!vm && /^[a-z0-9._-]+$/i.test(String(l.refId))) {
-                    const wanted = String(l.refId).toLowerCase();
-                    for (const v of idx.values()) {
-                        if ((v?.name || "").toLowerCase() === wanted) { vm = v; break; }
+                if (!vm && /^[a-z0-9._-]+$/i.test(String(link.refId))) {
+                    const wanted = String(link.refId).toLowerCase();
+                    for (const candidate of idx.values()) {
+                        if ((candidate?.name || "").toLowerCase() === wanted) {
+                            vm = candidate;
+                            break;
+                        }
                     }
                 }
 
                 if (vm) {
-                    const stale = !!staleByAgent.get(l.agentId);
+                    const stale = !!staleByAgent.get(link.agentId);
                     const vmOut = {
                         ...vm,
-                        tenantId,
-                        agentId: l.agentId,
+                        tenantId: ensuredTenantId,
+                        agentId: link.agentId,
                         kind: "vm",
-                        refId: l.refId,
+                        refId: link.refId,
                         _staleAgent: stale,
                     };
                     if (stale && vmOut.state !== "NotFound") vmOut.state = "Unknown";
                     out.push(vmOut);
                 } else if (showOrphans) {
                     out.push({
-                        tenantId,
-                        agentId: l.agentId,
+                        tenantId: ensuredTenantId,
+                        agentId: link.agentId,
                         kind: "vm",
-                        refId: l.refId,
-                        name: l.name || "(unknown)",
+                        refId: link.refId,
+                        name: link.name || "(unknown)",
                         state: "NotFound",
                         orphaned: true,
-                        assignedAt: l.assignedAt,
+                        assignedAt: link.assignedAt,
                     });
                 }
                 continue;
             }
 
-            if (l.kind === "switch") {
-                const invFull = root(fullBy.get(l.agentId) || {});
-                const sw = arr(invFull?.networks?.switches).find((s) => s.name === l.refId);
+            if (link.kind === "switch") {
+                const invFull = root(fullBy.get(link.agentId));
+                const sw = arr<InventorySwitch>(invFull?.networks?.switches).find((s) => s.name === link.refId);
 
                 if (sw) {
                     out.push({
                         ...sw,
-                        tenantId,
-                        agentId: l.agentId,
+                        tenantId: ensuredTenantId,
+                        agentId: link.agentId,
                         kind: "switch",
-                        refId: l.refId,
-                        _staleAgent: !!staleByAgent.get(l.agentId),
+                        refId: link.refId,
+                        _staleAgent: !!staleByAgent.get(link.agentId),
                     });
                 } else if (showOrphans) {
                     out.push({
-                        tenantId,
-                        agentId: l.agentId,
+                        tenantId: ensuredTenantId,
+                        agentId: link.agentId,
                         kind: "switch",
-                        refId: l.refId,
-                        name: l.refId,
+                        refId: link.refId,
+                        name: link.refId,
                         state: "NotFound",
                         orphaned: true,
-                        assignedAt: l.assignedAt,
+                        assignedAt: link.assignedAt,
                     });
                 }
                 continue;
             }
-
-           
         }
 
         return res.json({ success: true, data: out });
-    } catch (e) {
-        console.error("listResources error:", e);
+    } catch (error) {
+        log.error("listResources error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-/**
- * POST /api/v1/tenant/resources/claim
- * POST /api/v1/admin/:tenantId/resources/claim
- * body: { kind, agentId, refIds: [...] }
- */
-exports.claimResources = async (req, res) => {
+export const claimResources: Handler = async (req, res) => {
     try {
         const tenantId = getTenantId(req);
         if (!tenantId) return send(res, ERR.tenantContextMissing(), req);
@@ -465,9 +443,8 @@ exports.claimResources = async (req, res) => {
         const vb = validateClaimBody(req.body || {});
         if (!vb.ok) return send(res, ERR.validationPre(vb.errors), req);
 
-        // Non-empty refIds
-        if (!vb.value.refIds.length) {
-            return send(res, ERR.validationPre(['body.refIds: must contain at least one id']), req);
+        if (!vb.value?.refIds?.length) {
+            return send(res, ERR.validationPre([{ path: "body.refIds", message: "must contain at least one id" }]), req);
         }
 
         const { kind, agentId, refIds } = vb.value;
@@ -481,17 +458,13 @@ exports.claimResources = async (req, res) => {
 
         await TenantResource.bulkWrite(ops);
         return res.json({ success: true });
-    } catch (e) {
-        console.error("claimResources error:", e);
+    } catch (error) {
+        log.error("claimResources error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-/**
- * DELETE /api/v1/tenant/resources/:resourceId?kind=vm&agentId=HOST
- * DELETE /api/v1/admin/:tenantId/resources/:resourceId?kind=vm&agentId=HOST
- */
-exports.unclaimResource = async (req, res) => {
+export const unclaimResource: Handler = async (req, res) => {
     try {
         const tenantId = getTenantId(req);
         if (!tenantId) return send(res, ERR.tenantContextMissing(), req);
@@ -502,47 +475,43 @@ exports.unclaimResource = async (req, res) => {
         const vq = validateUnclaimQuery(req.query || {});
         if (!vq.ok) return send(res, ERR.validationPre(vq.errors), req);
 
-        const { resourceId } = vp.value;
-        const { kind, agentId } = vq.value;
+        const { resourceId } = vp.value!;
+        const { kind, agentId } = vq.value!;
 
         await TenantResource.deleteOne({ tenantId, kind, agentId, refId: resourceId });
         return res.json({ success: true });
-    } catch (e) {
-        console.error("unclaimResource error:", e);
+    } catch (error) {
+        log.error("unclaimResource error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-/**
- * GET /api/v1/admin/resources/unassigned?kind=vm|switch&agentId=HOST&limit=100
- * Helper endpoint: lists resources present in FULL but not claimed in TenantResource.
- */
-exports.listUnassignedResources = async (req, res) => {
+export const listUnassignedResources: Handler = async (req, res) => {
     try {
         const vq = validateUnassignedQuery(req.query || {});
         if (!vq.ok) return send(res, ERR.validationPre(vq.errors), req);
 
-        const { kind, agentId } = vq.value;
-        const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
+        const { kind, agentId } = vq.value!;
+        const limit = Math.min(parseInt((req.query.limit as string) || "100", 10), 500);
 
-        const f = {};
-        if (agentId) f.agentId = agentId;
+        const filter: Record<string, unknown> = {};
+        if (agentId) filter.agentId = agentId;
 
-        const invs = await InventoryFull.find(f, {
+        const invs = await InventoryFull.find(filter, {
             agentId: 1,
             inventory: 1,
             ts: 1,
-        }).lean();
+        }).lean<InventoryDoc[]>();
 
-        const cand = [];
-        for (const d of invs) cand.push(...pickFromInv(d, { kind, agentId: d.agentId }));
+        const cand: ReturnType<typeof pickFromInv> = [];
+        for (const doc of invs) cand.push(...pickFromInv(doc, { kind, agentId: doc.agentId }));
         if (cand.length === 0) return res.json({ success: true, data: [] });
 
-        // De-duplicate and remove already assigned
-        const key = (r) => `${r.kind}|${r.agentId}|${r.refId}`;
+        const key = (r: { kind: string; agentId: string; refId: string }) =>
+            `${r.kind}|${r.agentId}|${r.refId}`;
         const uniq = Array.from(new Set(cand.map(key)));
 
-        const assignedSet = new Set();
+        const assignedSet = new Set<string>();
         const BATCH = 500;
 
         for (let i = 0; i < uniq.length; i += BATCH) {
@@ -554,44 +523,47 @@ exports.listUnassignedResources = async (req, res) => {
             const assigned = await TenantResource.find(
                 { $or: or },
                 { kind: 1, agentId: 1, refId: 1 }
-            ).lean();
-            for (const a of assigned) assignedSet.add(key(a));
+            ).lean<TenantResourceLink[]>();
+            for (const item of assigned) assignedSet.add(key(item));
         }
 
-        const out = [];
-        for (const c of cand) {
-            if (!assignedSet.has(key(c))) out.push(c);
+        const out: PickedResource[] = [];
+        for (const candidate of cand) {
+            if (!assignedSet.has(key(candidate))) out.push(candidate);
             if (out.length >= limit) break;
         }
 
-        // Agents considered stale (based on FULL only for this endpoint)
-        const staleAgents = new Set(invs.filter((d) => isStale(d, null)).map((d) => d.agentId));
+        const staleAgents = new Set(
+            invs.filter((doc) => isStale(doc, undefined)).map((doc) => doc.agentId)
+        );
 
         return res.json({
             success: true,
             count: out.length,
             data: out.map((r) => {
-                const base = {
+                const data: ResourceData = r.data || {};
+                const staleAgent = staleAgents.has(r.agentId);
+                const base: Record<string, unknown> = {
                     kind: r.kind,
                     agentId: r.agentId,
                     refId: r.refId,
-                    name: r.data?.name,
-                    guid: r.data?.guid,
-                    state: r.data?.state,
-                    cpu: r.data?.cpu,
-                    ramMB: r.data?.ramMB,
-                    switches: r.data?.switches,
-                    raw: r.data,
-                    _staleAgent: staleAgents.has(r.agentId),
+                    name: data.name,
+                    guid: data.guid,
+                    state: data.state,
+                    cpu: data.cpu,
+                    ramMB: data.ramMB,
+                    switches: data.switches,
+                    raw: data,
+                    _staleAgent: staleAgent,
                 };
-                if (base.kind === "vm" && base._staleAgent && base.state !== "NotFound") {
+                if (base.kind === "vm" && staleAgent && base.state !== "NotFound") {
                     base.state = "Unknown";
                 }
                 return base;
             }),
         });
-    } catch (e) {
-        console.error("listUnassignedResources error:", e);
+    } catch (error) {
+        log.error("listUnassignedResources error", { error });
         return send(res, ERR.internal(), req);
     }
 };

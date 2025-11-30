@@ -1,67 +1,69 @@
-// @ts-nocheck
-// /services/election.js
-const Inventory = require("../models/Inventory.full");
-const Heartbeat = require("../models/Heartbeat");
-const { validate } = require("../lib/validate");
-const { AgentsSchema } = require("../lib/schemas/election");
-const { cpuScore, memScore, storageScore, Score } = require("../lib/score");
+import Inventory from "../models/Inventory.full";
+import Heartbeat from "../models/Heartbeat";
+import type { Heartbeat as HeartbeatDoc } from "../models/Heartbeat";
+import { validateElectionPayload } from "../lib/schemas/election";
+import type { ElectionRequirements } from "../types/domain";
+import { cpuScore, memScore, storageScore, Score } from "../lib/score";
 
-async function listAgents() {
-    const docs = await Heartbeat.find({}, 'agentId version lastSeen host capabilities raw').lean();
+interface AgentScore {
+    mem: Awaited<ReturnType<typeof memScore>>;
+    cpu: Awaited<ReturnType<typeof cpuScore>>;
+    storage: Awaited<ReturnType<typeof storageScore>>;
+}
 
+interface ScoredAgent extends HeartbeatDoc {
+    scores: AgentScore;
+    globalScore: number;
+}
+
+export async function listAgents(): Promise<HeartbeatDoc[]> {
+    const docs = await Heartbeat.find({}, "agentId version lastSeen host capabilities raw").lean<HeartbeatDoc[]>();
     if (!Array.isArray(docs) || docs.length === 0) {
         throw new Error("No agent exists yet in database");
     }
     return docs;
 }
 
-
-async function election(requirements) {
-    // 1) Validation
-    const res = validate(AgentsSchema, { requirements });
-    if (!res.ok) {
-        throw new Error("Invalid requirements payload: " + res.errors.join(", "));
+export async function election(requirements: ElectionRequirements): Promise<string | null> {
+    const validation = validateElectionPayload({ requirements });
+    if (!validation.ok || !validation.value) {
+        const errors = validation.errors.join(", ");
+        throw new Error(`Invalid requirements payload: ${errors}`);
     }
 
-    const { requirements: r } = res.value;
-    const list = await listAgents()
-    const cutoff = Date.now() - r.freshness * 1000;
-    const eligible = list.filter(a => new Date(a.lastSeen).getTime() >= cutoff);
+    const { freshness } = validation.value.requirements;
+    const agents = await listAgents();
+    const cutoff = Date.now() - freshness * 1000;
+    const eligible = agents.filter((agent) => {
+        const ts = agent.lastSeen ? new Date(agent.lastSeen).getTime() : 0;
+        return ts >= cutoff;
+    });
 
-    const agents = await Promise.all(
-        eligible.map(async a => {
-            const inv = await Inventory.findOne({ agentId: a.agentId }).lean();
-            // Get MEM score
-            const mem = await memScore(inv);
-            // Get CPU Score
-            const cpu = await cpuScore(inv);
-            // Get Storage score
-            const storage = await storageScore(inv);
+    if (!eligible.length) return null;
 
+    const scoredAgents: ScoredAgent[] = await Promise.all(
+        eligible.map(async (agent) => {
+            const inv = await Inventory.findOne({ agentId: agent.agentId }).lean();
+            const scores = {
+                mem: await memScore(inv),
+                cpu: await cpuScore(inv),
+                storage: await storageScore(inv),
+            };
             return {
-                ...a,
-                scores: {
-                    mem,
-                    cpu,
-                    storage
-                },
+                ...agent,
+                scores,
+                globalScore: Score({ scores }, { cpu: 0.5, mem: 0.3, storage: 0.2 }),
             };
         })
     );
 
-    agents.forEach(a => {
-        a.globalScore = Score(a, { cpu: 0.5, mem: 0.3, storage: 0.2 })
-    })
+    scoredAgents.sort((a, b) => {
+        const diff = b.globalScore - a.globalScore;
+        if (diff !== 0) return diff;
+        const tsA = a.lastSeen ? new Date(a.lastSeen).getTime() : 0;
+        const tsB = b.lastSeen ? new Date(b.lastSeen).getTime() : 0;
+        return tsB - tsA;
+    });
 
-    agents.sort((x, y) => {
-        (x.globalScore - y.globalScore) || (new Date(y.lastSeen) - new Date(x.lastSeen))
-    })
-
-    const agentId = agents[0]?.agentId;
-
-    return agentId;
+    return scoredAgents[0]?.agentId ?? null;
 }
-
-
-
-module.exports = { election };

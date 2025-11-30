@@ -1,18 +1,18 @@
-// @ts-nocheck
-// middlewares/loadTenant.js
-const Tenant = require("../models/Tenant");
+import type { NextFunction, Response } from "express";
+import Tenant from "../models/Tenant";
+import type { ControllerRequest } from "../types/express";
 
-module.exports = function loadTenant() {
-    return async (req, res, next) => {
-        const tenantId = req.tenantId || req.headers['x-tenant-id'];
-        if (!tenantId) return res.status(400).json({ error: "Missing tenant context" });
+export default function loadTenant() {
+    return async (req: ControllerRequest, res: Response, next: NextFunction) => {
+        const tenantIdHeader = req.tenantId || req.headers["x-tenant-id"];
+        if (!tenantIdHeader) return res.status(400).json({ error: "Missing tenant context" });
 
-        const t = await Tenant.findOne({ tenantId: String(tenantId) }).lean();
-        if (!t) return res.status(404).json({ error: "Unknown tenant", tenantId });
-        if (t.status === "disabled") return res.status(403).json({ error: "Tenant disabled", tenantId });
+        const tenant = await Tenant.findOne({ tenantId: String(tenantIdHeader) }).lean();
+        if (!tenant) return res.status(404).json({ error: "Unknown tenant", tenantId: tenantIdHeader });
+        if (tenant.status === "disabled") return res.status(403).json({ error: "Tenant disabled", tenantId: tenantIdHeader });
 
-        req.tenant = t;
-        req.tenantId = String(t.tenantId);
+        req.tenant = tenant;
+        req.tenantId = String(tenant.tenantId);
         next();
     };
-};
+}

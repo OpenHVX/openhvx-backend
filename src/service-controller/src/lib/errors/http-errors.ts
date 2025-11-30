@@ -1,15 +1,25 @@
-// @ts-nocheck
-// lib/http-errors.js (CommonJS)
-// One shape for all errors: { ok:false, code, message, details?, traceId? }
+import type { Response } from "express";
+import type { ControllerRequest } from "../../types/express";
 
-function make(status, code, message, details) {
+export interface HttpErrorPayload {
+    status: number;
+    code: string;
+    message: string;
+    details?: unknown;
+}
+
+export type HttpErrorFactory<T extends unknown[] = []> = (...args: T) => HttpErrorPayload;
+
+export function make(status: number, code: string, message: string, details?: unknown): HttpErrorPayload {
     return { status, code, message, details };
 }
 
-function send(res, err, req) {
+export function send(res: Response, err: HttpErrorPayload, req?: ControllerRequest) {
     const traceId =
-        (req && (req.id || req.requestId)) ||
-        (req && req.headers && (req.headers["x-request-id"] || req.headers["x-correlation-id"])) ||
+        req?.id ||
+        (req?.headers &&
+            (req.headers["x-request-id"] ||
+                req.headers["x-correlation-id"])) ||
         undefined;
 
     const status = err.status || 500;
@@ -22,46 +32,36 @@ function send(res, err, req) {
     });
 }
 
-// Convenience factories
-const ERR = {
-    // generic makers
-    notFound: (message = "Not found", details) =>
-        make(404, "NOT_FOUND", message, details),
+export const ERR = {
+    notFound: (message = "Not found", details?: unknown) => make(404, "NOT_FOUND", message, details),
 
-    quotaExceeded: (message = "Quota exceeded", details) =>
+    quotaExceeded: (message = "Quota exceeded", details?: unknown) =>
         make(409, "QUOTA_EXCEEDED", message, details),
 
-    validationPre: (details) =>
+    validationPre: (details: unknown) =>
         make(422, "VALIDATION_ERROR", "Invalid request payload", { where: "pre", errors: details }),
 
     internal: () => make(500, "INTERNAL_ERROR", "Internal server error"),
 
-    // tasks/controller specifics
-    missingAction: () =>
-        make(400, "MISSING_ACTION", "Missing 'action' in body"),
+    missingAction: () => make(400, "MISSING_ACTION", "Missing 'action' in body"),
 
-    missingTargetKind: () =>
-        make(400, "MISSING_TARGET_KIND", "Missing target.kind"),
+    missingTargetKind: () => make(400, "MISSING_TARGET_KIND", "Missing target.kind"),
 
-    unknownAction: (action) =>
-        make(400, "UNKNOWN_ACTION", `Unknown action '${action}'`, { action }),
+    unknownAction: (action: string) => make(400, "UNKNOWN_ACTION", `Unknown action '${action}'`, { action }),
 
-    missingTargetRefId: (action) =>
+    missingTargetRefId: (action: string) =>
         make(400, "MISSING_TARGET_REFID", "Missing target.refId for this action", { action }),
 
-    tenantIdRequiredForAdmin: () =>
-        make(400, "TENANT_ID_REQUIRED", "tenantId is required for admin operations"),
+    tenantIdRequiredForAdmin: () => make(400, "TENANT_ID_REQUIRED", "tenantId is required for admin operations"),
 
-    tenantContextMissing: () =>
-        make(400, "TENANT_CONTEXT_MISSING", "Missing tenant context"),
+    tenantContextMissing: () => make(400, "TENANT_CONTEXT_MISSING", "Missing tenant context"),
 
-    missingAgentId: () =>
-        make(400, "MISSING_AGENT_ID", "Missing target.agentId (no election performed or selection failed)"),
+    missingAgentId: () => make(400, "MISSING_AGENT_ID", "Missing target.agentId (no election performed or selection failed)"),
 
-    agentNotFound: (agentId) =>
+    agentNotFound: (agentId: string) =>
         make(404, "AGENT_NOT_FOUND", "Agent not found (no heartbeat yet)", { agentId }),
 
-    capabilityUnsupported: (needCap, caps, action, agentId) =>
+    capabilityUnsupported: (needCap: string, caps: string[], action: string, agentId: string) =>
         make(422, "AGENT_CAPABILITY_UNSUPPORTED", "Capability not supported by agent", {
             requiredCapability: needCap,
             agentCapabilities: caps,
@@ -69,14 +69,10 @@ const ERR = {
             agentId,
         }),
 
-    forbiddenOwnership: (tenantId, target) =>
+    forbiddenOwnership: (tenantId: string, target: unknown) =>
         make(403, "FORBIDDEN_OWNERSHIP", "Resource not owned by this tenant", { tenantId, target }),
 
-    enrichFailed: (msg) =>
-        make(400, "ENRICH_FAILED", `enrichment failed: ${msg}`),
+    enrichFailed: (msg: string) => make(400, "ENRICH_FAILED", `enrichment failed: ${msg}`),
 
-    taskNotFound: () =>
-        make(404, "TASK_NOT_FOUND", "Task not found"),
-};
-
-module.exports = { make, send, ERR };
+    taskNotFound: () => make(404, "TASK_NOT_FOUND", "Task not found"),
+} as const;

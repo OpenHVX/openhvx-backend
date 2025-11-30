@@ -1,35 +1,35 @@
-// @ts-nocheck
-// lib/schemas/quota.js
-"use strict";
-
-/**
- * Quota validation schemas
- * ------------------------
- * Central place for all quota-related shapes:
- *  - limits schema (flat limits)  -> reused by tenant create/update
- *  - reserve body (deltas)
- *  - recalc body (full inventory)
- *  - vm spec (for delta previews)
- */
-
-const {
-    validate,
+import {
+    arrayOf,
+    isInteger,
+    isString,
     objectStrict,
     optional,
-    recordOf,
-    isString,
-    isInteger,
-    isEnum,
-} = require("../validate");
+    validate,
+} from "../validate";
+import type { ValidationResult } from "../validate";
+import type { QuotaDeltas, QuotaItem, QuotaKey, QuotaLimits } from "../../types/domain";
 
-// ---- primitives -------------------------------------------------------------
+type FlatQuota = Partial<Record<QuotaKey, number>>;
 
-const intGE0 = (v) => isInteger(v) && v >= 0;
-const limitInt = (v) => isInteger(v) && (v === -1 || v >= 0);
-const idStr = (v) => isString(v) && v.length > 0;
+const intGE0 = (value: unknown, path = "") => {
+    const n = isInteger(value, path);
+    if (n < 0) throw new Error(`${path || "value"}: must be >= 0`);
+    return n;
+};
 
-// ---- Public: flat limits schema (to reuse in tenant.js) --------------------
-const QuotaLimitsSchema = objectStrict({
+const limitInt = (value: unknown, path = "") => {
+    const n = isInteger(value, path);
+    if (n < -1) throw new Error(`${path || "value"}: must be -1 or >= 0`);
+    return n;
+};
+
+const idStr = (value: unknown, path = "") => {
+    const s = isString(value, path);
+    if (!s.length) throw new Error(`${path || "value"}: must not be empty`);
+    return s;
+};
+
+export const QuotaLimitsSchema = objectStrict<QuotaLimits>({
     cpu: optional(limitInt),
     memoryMB: optional(limitInt),
     storageMB: optional(limitInt),
@@ -37,9 +37,7 @@ const QuotaLimitsSchema = objectStrict({
     networkCount: optional(limitInt),
 });
 
-// ---- Reserve (deltas) ------------------------------------------------------
-
-const QuotaDeltasSchema = objectStrict({
+const QuotaDeltasSchema = objectStrict<QuotaDeltas>({
     cpu: optional(intGE0),
     memoryMB: optional(intGE0),
     storageMB: optional(intGE0),
@@ -47,79 +45,145 @@ const QuotaDeltasSchema = objectStrict({
     networkCount: optional(intGE0),
 });
 
-const reserveBody = objectStrict({
+export interface ReserveBody extends Record<string, unknown> {
+    deltas: QuotaDeltas;
+}
+
+const reserveBody = objectStrict<ReserveBody>({
     deltas: QuotaDeltasSchema,
 });
 
-// ---- Recalculate (inventory) -----------------------------------------------
+interface DiskItem extends Record<string, unknown> {
+    sizeMB?: number;
+    sizeMiB?: number;
+    sizeGB?: number;
+}
 
-const diskItem = objectStrict({
+const diskItem = objectStrict<DiskItem>({
     sizeMB: optional(intGE0),
     sizeMiB: optional(intGE0),
     sizeGB: optional(intGE0),
 });
 
-const vmSpec = objectStrict({
+export interface VmSpec extends Record<string, unknown> {
+    cpu?: number;
+    vCPU?: number;
+    memoryMB?: number;
+    memoryMiB?: number;
+    disks?: DiskItem[];
+}
+
+const vmSpec = objectStrict<VmSpec>({
     cpu: optional(intGE0),
     vCPU: optional(intGE0),
     memoryMB: optional(intGE0),
     memoryMiB: optional(intGE0),
-    disks: optional((v) => Array.isArray(v) && v.every((d) => validate(diskItem, d).ok)),
+    disks: optional(arrayOf(diskItem)),
 });
 
-const vmItemLoose = (v) => {
-    if (typeof v !== "object" || v == null) return false;
-    const idish = ["id", "uuid", "_id", "name"].some((k) => v[k] == null || typeof v[k] === "string");
-    const cpuOk = (v.cpu == null || intGE0(v.cpu)) && (v.vCPU == null || intGE0(v.vCPU));
-    const memOk = (v.memoryMB == null || intGE0(v.memoryMB)) && (v.memoryMiB == null || intGE0(v.memoryMiB));
-    const disksOk = v.disks == null || (Array.isArray(v.disks) && v.disks.every((d) => validate(diskItem, d).ok));
-    return idish && cpuOk && memOk && disksOk;
+type VmItemLoose = Record<string, unknown> & {
+    id?: string;
+    uuid?: string;
+    _id?: string;
+    name?: string;
+    cpu?: number;
+    vCPU?: number;
+    memoryMB?: number;
+    memoryMiB?: number;
+    disks?: DiskItem[];
 };
 
-const netItemLoose = (v) => {
-    if (typeof v !== "object" || v == null) return false;
-    const tIdOk = v.tenantId == null || idStr(v.tenantId);
-    const tsOk = v.tenants == null || (Array.isArray(v.tenants) && v.tenants.every(idStr));
-    return tIdOk && tsOk;
+const vmItemLoose = (value: unknown): value is VmItemLoose => {
+    if (typeof value !== "object" || value == null) return false;
+    const v = value as VmItemLoose;
+    const hasId = ["id", "uuid", "_id", "name"].some((k) => v[k as keyof VmItemLoose] == null || typeof v[k as keyof VmItemLoose] === "string");
+    const cpuOk = (v.cpu == null || (typeof v.cpu === "number" && v.cpu >= 0)) &&
+        (v.vCPU == null || (typeof v.vCPU === "number" && v.vCPU >= 0));
+    const memOk = (v.memoryMB == null || (typeof v.memoryMB === "number" && v.memoryMB >= 0)) &&
+        (v.memoryMiB == null || (typeof v.memoryMiB === "number" && v.memoryMiB >= 0));
+    const disksOk =
+        v.disks == null ||
+        (Array.isArray(v.disks) && v.disks.every((d) => validate(diskItem, d).ok));
+    return hasId && cpuOk && memOk && disksOk;
 };
 
-const recalcBody = objectStrict({
+type NetworkItemLoose = Record<string, unknown> & {
+    tenantId?: string;
+    tenants?: string[];
+};
+
+const netItemLoose = (value: unknown): value is NetworkItemLoose => {
+    if (typeof value !== "object" || value == null) return false;
+    const v = value as NetworkItemLoose;
+    const tenantOk = v.tenantId == null || typeof v.tenantId === "string";
+    const tenantsOk =
+        v.tenants == null ||
+        (Array.isArray(v.tenants) && v.tenants.every((t) => typeof t === "string"));
+    return tenantOk && tenantsOk;
+};
+
+export interface RecalcBody extends Record<string, unknown> {
+    tenantId: string;
+    fullInventory: {
+        vms?: VmItemLoose[];
+        networks?: NetworkItemLoose[];
+    };
+    tenantResourceLinks?: Record<string, unknown>;
+}
+
+const recalcBody = objectStrict<RecalcBody>({
     tenantId: idStr,
     fullInventory: objectStrict({
-        vms: optional((v) => Array.isArray(v) && v.every(vmItemLoose)),
-        networks: optional((v) => Array.isArray(v) && v.every(netItemLoose)),
+        vms: optional((value) => {
+            if (!Array.isArray(value) || !value.every(vmItemLoose)) {
+                throw new Error("fullInventory.vms: invalid payload");
+            }
+            return value;
+        }),
+        networks: optional((value) => {
+            if (!Array.isArray(value) || !value.every(netItemLoose)) {
+                throw new Error("fullInventory.networks: invalid payload");
+            }
+            return value;
+        }),
     }),
-    tenantResourceLinks: optional((v) => typeof v === "object"),
+    tenantResourceLinks: optional((value) => {
+        if (typeof value !== "object" || value == null) throw new Error("tenantResourceLinks: must be object");
+        return value as Record<string, unknown>;
+    }),
 });
 
-// ---- API -------------------------------------------------------------------
-
-function validatePatchLimits(body) { // expects { limits: QuotaLimitsSchema }
-    return validate(objectStrict({ limits: QuotaLimitsSchema }), body);
+export function validatePatchLimits(body: unknown): ValidationResult<{ limits: QuotaLimits }> {
+    return validate(
+        objectStrict({
+            limits: QuotaLimitsSchema,
+        }),
+        body
+    );
 }
-function validateReserveBody(body) { return validate(reserveBody, body); }
-function validateRecalcBody(body) { return validate(recalcBody, body); }
-function validateVmSpec(spec) { return validate(vmSpec, spec); }
 
-/** Helper: normalize flat limits -> model shape { key: { limit, used: 0 } } */
-function normalizeQuota(quotas) {
+export function validateReserveBody(body: unknown): ValidationResult<ReserveBody> {
+    return validate(reserveBody, body);
+}
+
+export function validateRecalcBody(body: unknown): ValidationResult<RecalcBody> {
+    return validate(recalcBody, body);
+}
+
+export function validateVmSpec(body: unknown): ValidationResult<VmSpec> {
+    return validate(vmSpec, body);
+}
+
+export function normalizeQuota(
+    quotas: FlatQuota | undefined | null
+): Partial<Record<QuotaKey, QuotaItem>> | undefined {
     if (!quotas || typeof quotas !== "object") return undefined;
-    const out = {};
-    const keys = ["cpu", "memoryMB", "storageMB", "vmCount", "networkCount"];
-    for (const k of keys) {
-        if (quotas[k] == null) continue;
-        const limit = quotas[k] | 0;
-        out[k] = { limit, used: 0 };
-    }
-    return Object.keys(out).length ? out : undefined;
+    const out: Record<string, QuotaItem> = {};
+    (Object.keys(quotas) as QuotaKey[]).forEach((key) => {
+        const value = quotas[key];
+        if (value == null) return;
+        const limit = Number(value) | 0;
+        out[key] = { limit, used: 0 };
+    });
+    return Object.keys(out).length ? (out as Partial<Record<QuotaKey, QuotaItem>>) : undefined;
 }
-
-module.exports = {
-    // Schemas / validators
-    QuotaLimitsSchema,
-    validatePatchLimits,
-    validateReserveBody,
-    validateRecalcBody,
-    validateVmSpec,
-    normalizeQuota,
-};

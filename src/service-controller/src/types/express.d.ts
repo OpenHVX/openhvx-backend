@@ -1,4 +1,5 @@
 import type { Request } from "express";
+import type { TenantRecord } from "../models/Tenant";
 
 declare module "express-serve-static-core" {
     interface Request {
@@ -8,6 +9,7 @@ declare module "express-serve-static-core" {
         auth?: Record<string, unknown>;
         enforceTenant?: boolean;
         isAdmin?: boolean;
+        tenant?: TenantRecord;
     }
 }
 
