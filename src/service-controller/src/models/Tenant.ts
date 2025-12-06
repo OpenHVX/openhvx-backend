@@ -1,24 +1,35 @@
-// @ts-nocheck
-// models/Tenant.js
-"use strict";
+import { Schema, model, type HydratedDocument, type Model, type Document } from "mongoose";
+import { quota } from "../lib/defaults";
+import type { QuotaItem, QuotaKey } from "../types/domain";
 
-const mongoose = require("mongoose");
-const { quota } = require("../lib/defaults");
+export type TenantStatus = "active" | "disabled";
 
-/**
- * Subschema for each quota item.
- */
+export interface TenantQuota extends QuotaItem {}
 
-const QuotaItemSchema = new mongoose.Schema(
+export type TenantQuotas = Partial<Record<QuotaKey, TenantQuota>>;
+
+export interface TenantRecord {
+    tenantId: string;
+    name: string;
+    status: TenantStatus;
+    quotas: TenantQuotas;
+    metadata?: Record<string, unknown>;
+    description?: string;
+}
+
+export type TenantDocument = HydratedDocument<TenantRecord>;
+
+export type TenantModel = Model<TenantRecord>;
+
+const QuotaItemSchema = new Schema<TenantQuota>(
     {
-        // -1 means unlimited, otherwise enforce non-negative integers
         limit: {
             type: Number,
             default: 0,
             validate: {
-                validator: (v) => Number.isInteger(v) && (v === -1 || v >= 0),
-                message: 'limit must be integer and either -1 or >= 0',
-            }
+                validator: (value: number) => Number.isInteger(value) && (value === -1 || value >= 0),
+                message: "limit must be integer and either -1 or >= 0",
+            },
         },
         used: {
             type: Number,
@@ -26,54 +37,58 @@ const QuotaItemSchema = new mongoose.Schema(
             min: 0,
             validate: {
                 validator: Number.isInteger,
-                message: 'used must be integer',
-            }
+                message: "used must be integer",
+            },
         },
     },
     { _id: false }
 );
 
-// Optional: normalize incoming strings to integers (guards against "1.2", etc.)
-QuotaItemSchema.pre('validate', function () {
-    if (typeof this.limit === 'string' && /^-?\d+$/.test(this.limit)) {
+QuotaItemSchema.pre("validate", function (this: TenantQuota & Document) {
+    if (typeof this.limit === "string" && /^-?\d+$/.test(this.limit)) {
         this.limit = parseInt(this.limit, 10);
     }
-    if (typeof this.used === 'string' && /^-?\d+$/.test(this.used)) {
+    if (typeof this.used === "string" && /^-?\d+$/.test(this.used)) {
         this.used = parseInt(this.used, 10);
     }
 });
 
+const defaultQuota = (key: QuotaKey): TenantQuota => ({
+    limit: quota[key],
+    used: 0,
+});
 
-/**
- * Quotas schema (grouped by resource type)
- */
-const QuotasSchema = new mongoose.Schema(
+const QuotasSchema = new Schema<TenantQuotas>(
     {
-        cpu: { type: QuotaItemSchema, default: () => ({ limit: quota.cpu, used: 0 }) },
-        memoryMB: { type: QuotaItemSchema, default: () => ({ limit: quota.memoryMB, used: 0 }) },
-        storageMB: { type: QuotaItemSchema, default: () => ({ limit: quota.storageMB, used: 0 }) },
-        vmCount: { type: QuotaItemSchema, default: () => ({ limit: quota.vmCount, used: 0 }) },
-        networkCount: { type: QuotaItemSchema, default: () => ({ limit: quota.networkCount, used: 0 }) },
+        cpu: { type: QuotaItemSchema, default: () => defaultQuota("cpu") },
+        memoryMB: { type: QuotaItemSchema, default: () => defaultQuota("memoryMB") },
+        storageMB: { type: QuotaItemSchema, default: () => defaultQuota("storageMB") },
+        vmCount: { type: QuotaItemSchema, default: () => defaultQuota("vmCount") },
+        networkCount: { type: QuotaItemSchema, default: () => defaultQuota("networkCount") },
     },
     { _id: false }
 );
 
-const tenantSchema = new mongoose.Schema(
+const tenantSchema = new Schema<TenantRecord>(
     {
         tenantId: { type: String, required: true, unique: true, index: true },
         name: { type: String, required: true },
         status: { type: String, enum: ["active", "disabled"], default: "active", index: true },
         quotas: { type: QuotasSchema, default: () => ({}) },
         metadata: { type: Object },
+        description: { type: String },
     },
     { timestamps: true }
 );
 
-tenantSchema.pre("save", function () {
+tenantSchema.pre("save", function (this: TenantDocument) {
     const q = this.quotas || {};
-    for (const k of Object.keys(q)) {
-        if (q[k] && q[k].used < 0) q[k].used = 0;
-    }
+    (Object.keys(q) as QuotaKey[]).forEach((key) => {
+        const entry = q[key];
+        if (entry && entry.used < 0) entry.used = 0;
+    });
 });
 
-module.exports = mongoose.model("Tenant", tenantSchema);
+const Tenant = model<TenantRecord>("Tenant", tenantSchema);
+
+export default Tenant;

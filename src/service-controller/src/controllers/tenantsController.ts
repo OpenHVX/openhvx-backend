@@ -1,107 +1,96 @@
-// @ts-nocheck
-// controllers/tenantsController.js
-"use strict";
-
-const { ERR, send } = require("../lib/errors/http-errors");
-const Tenant = require("../models/Tenant");
-const {
+import type { Response } from "express";
+import { ERR, send } from "../lib/errors/http-errors";
+import Tenant from "../models/Tenant";
+import {
     validateCreate,
-    validateUpdate,
     validateParams,
+    validateUpdate,
     normalizeCreate,
     normalizeUpdate,
-} = require("../lib/schemas/tenant");
-
-// Quota service + validators
-const quota = require("../services/quota");
-const {
+} from "../lib/schemas/tenant";
+import {
     validatePatchLimits,
-    validateReserveBody,
     validateRecalcBody,
-} = require("../lib/schemas/quota");
+    validateReserveBody,
+} from "../lib/schemas/quota";
+import {
+    getTenantQuotas,
+    setTenantQuotaLimits,
+    holdQuota,
+    releaseHold,
+    recalcUsedFromInventory,
+} from "../services/quota";
+import TenantResource from "../models/TenantResource";
+import type { ControllerRequest } from "../types/express";
+import logger from "../lib/logger";
 
-/**
- * Helper: resolve string tenantId -> Mongo _id
- * Returns _id or sends 404 and returns null.
- */
-async function getTenantObjectIdOr404(tenantId, req, res) {
-    const t = await Tenant.findOne({ tenantId }, { _id: 1 }).lean();
-    if (!t) {
+const log = logger.child(["controller", "tenants"]);
+type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
+
+const getTenantObjectIdOr404 = async (tenantId: string, req: ControllerRequest, res: Response) => {
+    const tenant = await Tenant.findOne({ tenantId }, { _id: 1 }).lean();
+    if (!tenant) {
         send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
         return null;
     }
-    return t._id;
-}
+    return tenant._id;
+};
 
-// -----------------------------------------------------------------------------
-// CRUD tenants
-// -----------------------------------------------------------------------------
-
-// POST /tenants
-exports.create = async (req, res) => {
+export const createTenant: Handler = async (req, res) => {
     try {
         const pre = validateCreate(req.body);
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
-
-        // Normalize flat quotas -> { key: {limit, used} } and drop junk values (e.g., booleans)
-        const norm = normalizeCreate(pre.value);
-        const { tenantId, name, quotas, metadata, description, status } = norm;
-
-        const doc = await Tenant.create({ tenantId, name, quotas, metadata, description, status });
+        const norm = normalizeCreate(pre.value!);
+        const doc = await Tenant.create(norm);
         return res.status(201).json({ success: true, data: doc });
-    } catch (e) {
-        if (e && e.code === 11000) {
+    } catch (error: unknown) {
+        if ((error as { code?: number })?.code === 11000) {
             return send(res, { status: 409, code: "TENANT_CONFLICT", message: "tenantId already exists" }, req);
         }
-        console.error("tenant.create error:", e);
+        log.error("tenant.create error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-// GET /tenants
-exports.list = async (_req, res) => {
+export const listTenants: Handler = async (_req, res) => {
     try {
         const rows = await Tenant.find({}, { _id: 0, tenantId: 1, name: 1, status: 1 })
             .sort({ tenantId: 1 })
             .lean();
-
         return res.json({ success: true, data: rows });
-    } catch (e) {
-        console.error("tenant.list error:", e);
-        return send(res, ERR.internal(), _req);
+    } catch (error) {
+        log.error("tenant.list error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };
 
-// GET /tenants/:tenantId
-exports.get = async (req, res) => {
+export const getTenant: Handler = async (req, res) => {
     try {
         const pre = validateParams(req.params);
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
 
-        const { tenantId } = pre.value;
-        const t = await Tenant.findOne({ tenantId }).lean();
-        if (!t) {
+        const { tenantId } = pre.value!;
+        const tenant = await Tenant.findOne({ tenantId }).lean();
+        if (!tenant) {
             return send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
         }
-        return res.json({ success: true, data: t });
-    } catch (e) {
-        console.error("tenant.get error:", e);
+        return res.json({ success: true, data: tenant });
+    } catch (error) {
+        log.error("tenant.get error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-// PATCH /tenants/:tenantId  (enable/disable/rename/quotas passthrough if needed)
-exports.update = async (req, res) => {
+export const updateTenant: Handler = async (req, res) => {
     try {
-        const preParams = validateParams(req.params);
-        if (!preParams.ok) return send(res, ERR.validationPre(preParams.errors), req);
-        const { tenantId } = preParams.value;
+        const params = validateParams(req.params);
+        if (!params.ok) return send(res, ERR.validationPre(params.errors), req);
+        const { tenantId } = params.value!;
 
         const preBody = validateUpdate(req.body);
         if (!preBody.ok) return send(res, ERR.validationPre(preBody.errors), req);
 
-        // Normalize before applying: converts flat quotas into model shape; removes invalid shapes
-        const updateFields = normalizeUpdate(preBody.value) || {};
+        const updateFields = normalizeUpdate(preBody.value!) || {};
         if (Object.keys(updateFields).length === 0) {
             return send(
                 res,
@@ -110,176 +99,140 @@ exports.update = async (req, res) => {
             );
         }
 
-        const t = await Tenant.findOneAndUpdate({ tenantId }, { $set: updateFields }, { new: true }).lean();
+        const tenant = await Tenant.findOneAndUpdate(
+            { tenantId },
+            { $set: updateFields },
+            { new: true }
+        ).lean();
 
-        if (!t) {
+        if (!tenant) {
             return send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
         }
-        return res.json({ success: true, data: t });
-    } catch (e) {
-        console.error("tenant.update error:", e);
+        return res.json({ success: true, data: tenant });
+    } catch (error) {
+        log.error("tenant.update error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-// DELETE /tenants/:tenantId
-exports.remove = async (req, res) => {
+export const removeTenant: Handler = async (req, res) => {
     try {
         const pre = validateParams(req.params);
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
 
-        const { tenantId } = pre.value;
-        const TenantResource = require("../models/TenantResource");
-
+        const { tenantId } = pre.value!;
         const count = await TenantResource.countDocuments({ tenantId });
         if (count > 0) {
             return send(
                 res,
-                { status: 409, code: "TENANT_HAS_RESOURCES", message: "Tenant has resources; unassign first", details: { count } },
+                {
+                    status: 409,
+                    code: "TENANT_HAS_RESOURCES",
+                    message: "Tenant has resources; unassign first",
+                    details: { count },
+                },
                 req
             );
         }
 
-        const r = await Tenant.deleteOne({ tenantId });
-        if (r.deletedCount === 0) {
+        const result = await Tenant.deleteOne({ tenantId });
+        if (result.deletedCount === 0) {
             return send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
         }
 
         return res.json({ success: true });
-    } catch (e) {
-        console.error("tenant.remove error:", e);
+    } catch (error) {
+        log.error("tenant.remove error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-// -----------------------------------------------------------------------------
-// Quotas (nested under tenant)
-// -----------------------------------------------------------------------------
-
-/**
- * GET /tenants/:tenantId/quotas
- * Returns hydrated limits + used
- */
-exports.getQuotas = async (req, res) => {
+export const getQuotas: Handler = async (req, res) => {
     try {
         const pre = validateParams(req.params);
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
 
-        const _id = await getTenantObjectIdOr404(pre.value.tenantId, req, res);
+        const _id = await getTenantObjectIdOr404(pre.value!.tenantId, req, res);
         if (!_id) return;
 
-        const data = await quota.getTenantQuotas(_id);
+        const data = await getTenantQuotas(_id);
         return res.json({ success: true, data });
-    } catch (e) {
-        console.error("tenant.getQuotas error:", e);
+    } catch (error) {
+        log.error("tenant.getQuotas error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-/**
- * PATCH /tenants/:tenantId/quotas
- * Body: { limits: { cpu?, memoryMB?, storageMB?, vmCount?, networkCount? } }
- */
-exports.patchQuotaLimits = async (req, res) => {
+export const patchQuotaLimits: Handler = async (req, res) => {
     try {
-        const p1 = validateParams(req.params);
-        if (!p1.ok) return send(res, ERR.validationPre(p1.errors), req);
+        const params = validateParams(req.params);
+        if (!params.ok) return send(res, ERR.validationPre(params.errors), req);
 
-        const p2 = validatePatchLimits(req.body);
-        if (!p2.ok) return send(res, ERR.validationPre(p2.errors), req);
+        const body = validatePatchLimits(req.body);
+        if (!body.ok) return send(res, ERR.validationPre(body.errors), req);
 
-        const tId = p1.value.tenantId;
+        const tId = params.value!.tenantId;
         const _id = await getTenantObjectIdOr404(tId, req, res);
         if (!_id) return;
 
-        const ok = Object.values(p2.value?.limits || {}).every(v => v === true);
-        if (!ok)
-            return send(res, ERR.validationPre([{ path: "limits", message: "Invalid fields" }]), req);
-
-        const data = await quota.setTenantQuotaLimits(_id, req.body.limits);
-        res.json({ success: true, data });
-    } catch (e) {
-        console.error("tenant.patchQuotaLimits error:", e);
-        send(res, e?.status || e?.code ? e : ERR.internal(), req);
-    }
-};
-
-/**
- * POST /tenants/:tenantId/quotas/reserve
- * Body: { deltas: { cpu?, memoryMB?, storageMB?, vmCount?, networkCount? } }
- */
-exports.reserveQuotas = async (req, res) => {
-    try {
-        const preParams = validateParams(req.params);
-        if (!preParams.ok) return send(res, ERR.validationPre(preParams.errors), req);
-
-        const preBody = validateReserveBody(req.body);
-        if (!preBody.ok) return send(res, ERR.validationPre(preBody.errors), req);
-
-        const _id = await getTenantObjectIdOr404(preParams.value.tenantId, req, res);
-        if (!_id) return;
-
-        const data = await quota.checkAndReserve(_id, preBody.value.deltas);
-        return res.status(200).json({ success: true, data });
-    } catch (e) {
-        if (e?.code === "QUOTA_EXCEEDED") {
-            return send(res, e, req);
-        }
-        console.error("tenant.reserveQuotas error:", e);
+        const data = await setTenantQuotaLimits(_id, req.body.limits);
+        return res.json({ success: true, data });
+    } catch (error) {
+        log.error("tenant.patchQuotaLimits error", { error });
         return send(res, ERR.internal(), req);
     }
 };
 
-/**
- * POST /tenants/:tenantId/quotas/release
- * Body: { deltas: { ... } }  // releases usage (clamped >= 0)
- */
-exports.releaseQuotas = async (req, res) => {
+export const reserveQuotas: Handler = async (req, res) => {
     try {
-        const preParams = validateParams(req.params);
-        if (!preParams.ok) return send(res, ERR.validationPre(preParams.errors), req);
+        const params = validateParams(req.params);
+        if (!params.ok) return send(res, ERR.validationPre(params.errors), req);
 
-        const preBody = validateReserveBody(req.body);
-        if (!preBody.ok) return send(res, ERR.validationPre(preBody.errors), req);
+        const body = validateReserveBody(req.body);
+        if (!body.ok) return send(res, ERR.validationPre(body.errors), req);
 
-        const _id = await getTenantObjectIdOr404(preParams.value.tenantId, req, res);
+        const _id = await getTenantObjectIdOr404(params.value!.tenantId, req, res);
         if (!_id) return;
 
-        const data = await quota.release(_id, preBody.value.deltas);
-        return res.status(200).json({ success: true, data });
-    } catch (e) {
-        console.error("tenant.releaseQuotas error:", e);
-        return send(res, ERR.internal(), req);
-    }
-};
-
-/**
- * POST /tenants/:tenantId/quotas/recalculate
- * Body: { tenantId, fullInventory, tenantResourceLinks? }
- * Enforces that body.tenantId matches route param.
- */
-exports.recalculateQuotas = async (req, res) => {
-    try {
-        const preParams = validateParams(req.params);
-        if (!preParams.ok) return send(res, ERR.validationPre(preParams.errors), req);
-
-        const body = { ...req.body, tenantId: preParams.value.tenantId };
-
-        const preBody = validateRecalcBody(body);
-        if (!preBody.ok) return send(res, ERR.validationPre(preBody.errors), req);
-
-        const _id = await getTenantObjectIdOr404(preParams.value.tenantId, req, res);
-        if (!_id) return;
-
-        const data = await quota.recalcUsedFromInventory({
-            tenantId: _id,
-            fullInventory: preBody.value.fullInventory,
-            tenantResourceLinks: preBody.value.tenantResourceLinks,
+        const result = await holdQuota(_id, body.value!.deltas, req.body.taskId, {
+            ttlMs: req.body.ttlMs,
         });
+        return res.json({ success: true, data: result });
+    } catch (error) {
+        log.error("tenant.reserveQuotas error", { error });
+        return send(res, ERR.internal(), req);
+    }
+};
 
-        return res.status(200).json({ success: true, data });
-    } catch (e) {
-        console.error("tenant.recalculateQuotas error:", e);
+export const releaseQuotas: Handler = async (req, res) => {
+    try {
+        await releaseHold(req.body.taskId);
+        return res.json({ success: true });
+    } catch (error) {
+        log.error("tenant.releaseQuotas error", { error });
+        return send(res, ERR.internal(), req);
+    }
+};
+
+export const recalculateQuotas: Handler = async (req, res) => {
+    try {
+        const params = validateParams(req.params);
+        if (!params.ok) return send(res, ERR.validationPre(params.errors), req);
+
+        const body = validateRecalcBody(req.body);
+        if (!body.ok) return send(res, ERR.validationPre(body.errors), req);
+
+        const _id = await getTenantObjectIdOr404(params.value!.tenantId, req, res);
+        if (!_id) return;
+
+        const data = await recalcUsedFromInventory({
+            tenantId: _id,
+            fullInventory: body.value!.fullInventory,
+            tenantResourceLinks: body.value!.tenantResourceLinks,
+        });
+        return res.json({ success: true, data });
+    } catch (error) {
+        log.error("tenant.recalculateQuotas error", { error });
         return send(res, ERR.internal(), req);
     }
 };

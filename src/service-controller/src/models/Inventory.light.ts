@@ -1,12 +1,20 @@
-// @ts-nocheck
-const mongoose = require("mongoose");
+import { Schema, model, type HydratedDocument, type Model } from "mongoose";
+import type { InventorySnapshot } from "./types";
 
-const InventoryLightSchema = new mongoose.Schema({
-    agentId: { type: String, index: true },
-    ts: { type: Date, index: true },
-    inventory: { type: Object },
-    raw: { type: Object },
-}, { minimize: false });
+export type InventoryLightDocument = HydratedDocument<InventorySnapshot>;
 
-module.exports = mongoose.model("InventoryLight", InventoryLightSchema);
+export type InventoryLightModel = Model<InventorySnapshot>;
 
+const inventoryLightSchema = new Schema<InventorySnapshot>(
+    {
+        agentId: { type: String, index: true },
+        ts: { type: Date, index: true },
+        inventory: { type: Object },
+        raw: { type: Object },
+    },
+    { minimize: false }
+);
+
+const InventoryLight = model<InventorySnapshot>("InventoryLight", inventoryLightSchema);
+
+export default InventoryLight;

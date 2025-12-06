@@ -1,19 +1,15 @@
-// @ts-nocheck
-// middlewares/requireAdmin.js
-// Ensure the caller carries an "admin" role.
-// Usually enforced by the API Gateway; this is just a safety net.
+import type { NextFunction, Response } from "express";
+import type { ControllerRequest } from "../types/express";
 
-module.exports = function requireAdmin() {
-    return (req, res, next) => {
-        // Look for roles injected by the gateway headers or the decoded user payload
-        const rolesHeader = req.headers["x-roles"] || req.headers["x-role"];
-        const roles = rolesHeader
-            ? rolesHeader.split(",").map(r => r.trim().toLowerCase())
+export default function requireAdmin() {
+    return (req: ControllerRequest, res: Response, next: NextFunction) => {
+        const headerRoles = (req.headers["x-roles"] || req.headers["x-role"]) as string | undefined;
+        const roles = headerRoles
+            ? headerRoles.split(",").map((role) => role.trim().toLowerCase())
             : [];
 
-        // Merge roles coming from req.user when the gateway already decoded the token
-        if (req.user?.roles) {
-            roles.push(...req.user.roles.map(r => r.toLowerCase()));
+        if (Array.isArray(req.user?.roles)) {
+            roles.push(...req.user.roles.map((role) => String(role).toLowerCase()));
         }
 
         if (!roles.includes("admin")) {
@@ -22,4 +18,4 @@ module.exports = function requireAdmin() {
 
         next();
     };
-};
+}

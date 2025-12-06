@@ -1,16 +1,57 @@
-// @ts-nocheck
-
-// lib/score.js
-function roundTo(x, decimals = 3) {
-    const f = Math.pow(10, decimals);
-    return Math.round(x * f) / f;
+interface InventoryVm {
+    state?: string | null;
+    configuration?: {
+        processors?: {
+            count?: number | null;
+        };
+    };
+    memoryAssignedMB?: number | null;
 }
 
+interface InventoryHost {
+    hypervHost?: {
+        logicalProcessors?: number;
+        memoryCapacityMB?: number;
+    };
+    cpu?: {
+        logicalProcessors?: number;
+    };
+    memMB?: number;
+}
 
-// CPU: score = 1 - (vCPU_assigned_running / logicalCPU_total) ∈ [0..1]
-async function cpuScore(inv) {
-    const host = inv?.inventory?.inventory?.host || {};
-    const vms = inv?.inventory?.inventory?.vms || [];
+interface InventoryDatastore {
+    kind?: string | null;
+    path?: string | null;
+    drive?: string | null;
+    totalBytes?: number | null;
+    freeBytes?: number | null;
+}
+
+type InventoryDoc = {
+    inventory?: {
+        inventory?: {
+            host?: InventoryHost;
+            vms?: InventoryVm[];
+            datastores?: InventoryDatastore[];
+        };
+        datastores?: InventoryDatastore[];
+    };
+};
+
+export interface ScoreResult {
+    score: number;
+}
+
+const roundTo = (value: number, decimals = 3) => {
+    const factor = 10 ** decimals;
+    return Math.round(value * factor) / factor;
+};
+
+const runningVm = (vm: InventoryVm) => String(vm.state || "").toLowerCase() === "running";
+
+export async function cpuScore(inv: InventoryDoc | null | undefined): Promise<ScoreResult> {
+    const host = inv?.inventory?.inventory?.host;
+    const vms = inv?.inventory?.inventory?.vms ?? [];
 
     const totalLogicalCPU =
         host?.hypervHost?.logicalProcessors ??
@@ -18,48 +59,42 @@ async function cpuScore(inv) {
         0;
 
     const assignedVcpu = vms.reduce((sum, vm) => {
-        if (String(vm.state || "").toLowerCase() !== "running") return sum;
-        const count = vm?.configuration?.processors?.count ?? 0; // chemin stable
+        if (!runningVm(vm)) return sum;
+        const count = vm.configuration?.processors?.count ?? 0;
         return sum + count;
     }, 0);
 
     const ratio = totalLogicalCPU > 0 ? assignedVcpu / totalLogicalCPU : Infinity;
     const score = roundTo(Number.isFinite(ratio) ? Math.max(0, Math.min(1, 1 - ratio)) : 0, 3);
-
-    return {
-        score
-    };
+    return { score };
 }
 
-// MEM: score = 1 - (mem_assigned_running / mem_total) ∈ [0..1]
-async function memScore(inv) {
-    const host = inv?.inventory?.inventory?.host || {};
-    const vms = inv?.inventory?.inventory?.vms || [];
+export async function memScore(inv: InventoryDoc | null | undefined): Promise<ScoreResult> {
+    const host = inv?.inventory?.inventory?.host;
+    const vms = inv?.inventory?.inventory?.vms ?? [];
 
-    const totalMemMB = host?.memMB ?? 0;
+    const totalMemMB =
+        host?.hypervHost?.memoryCapacityMB ??
+        host?.memMB ??
+        0;
 
     const assignedMemMB = vms.reduce((sum, vm) => {
-        if (String(vm.state || "").toLowerCase() !== "running") return sum;
-        return sum + (vm?.memoryAssignedMB ?? 0);
+        if (!runningVm(vm)) return sum;
+        return sum + (vm.memoryAssignedMB ?? 0);
     }, 0);
 
     const ratio = totalMemMB > 0 ? assignedMemMB / totalMemMB : Infinity;
     const score = roundTo(Number.isFinite(ratio) ? Math.max(0, Math.min(1, 1 - ratio)) : 0, 3);
-
-    return {
-        score
-    };
+    return { score };
 }
 
-
-// DISK (root unique): 1 - (used / total) sur le seul datastore kind:"root"
-async function storageScore(inv) {
-    const ds =
+export async function storageScore(inv: InventoryDoc | null | undefined): Promise<ScoreResult> {
+    const datastores =
         inv?.inventory?.datastores ??
         inv?.inventory?.inventory?.datastores ??
         [];
 
-    const roots = ds.filter(d => d?.kind === "root");
+    const roots = datastores.filter((d) => d?.kind === "root");
 
     if (roots.length === 0) {
         throw new Error("No root datastore found for this agent");
@@ -68,33 +103,40 @@ async function storageScore(inv) {
         throw new Error(`Multiple root datastores found (${roots.length}) for this agent`);
     }
 
-    const d = roots[0];
-    const totalBytes = Number(d?.totalBytes ?? 0);
-    const freeBytes = Number(d?.freeBytes ?? 0);
+    const root = roots[0];
+    const totalBytes = Number(root?.totalBytes ?? 0);
+    const freeBytes = Number(root?.freeBytes ?? 0);
     const usedBytes = Math.max(0, totalBytes - freeBytes);
 
     const ratio = totalBytes > 0 ? usedBytes / totalBytes : Infinity;
     const score = roundTo(Number.isFinite(ratio) ? Math.max(0, Math.min(1, 1 - ratio)) : 0, 3);
+    return { score };
+}
 
-    return {
-        score,
+interface WeightedAgentScores {
+    scores?: {
+        cpu?: ScoreResult;
+        mem?: ScoreResult;
+        storage?: ScoreResult;
     };
 }
 
-function Score(agent, weights) {
+interface ScoreWeights {
+    cpu?: number;
+    mem?: number;
+    storage?: number;
+}
 
+export function Score(agent: WeightedAgentScores, weights: ScoreWeights): number {
     const { cpu, mem, storage } = agent.scores || {};
     const wCpu = Number(weights.cpu ?? 0);
     const wMem = Number(weights.mem ?? 0);
     const wStorage = Number(weights.storage ?? 0);
-    const norm = (wCpu + wMem + wStorage) || 1;
+    const norm = wCpu + wMem + wStorage || 1;
 
     const sCpu = cpu?.score ?? 0;
     const sMem = mem?.score ?? 0;
     const sStorage = storage?.score ?? 0;
 
     return roundTo((sCpu * wCpu + sMem * wMem + sStorage * wStorage) / norm, 3);
-
 }
-
-module.exports = { cpuScore, memScore, storageScore, Score };

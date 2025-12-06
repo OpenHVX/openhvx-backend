@@ -1,73 +1,73 @@
-// @ts-nocheck
-// services/resourcesReconcile.js
-// Remove TenantResource links for VMs no longer present in agent inventory.
-// Strategy:
-//  - Build PRESENT SET from FULL ∪ LIGHT (by guid, id, name as fallbacks).
-//  - For each tenant having VM links on this agent, delete links whose refId ∉ PRESENT.
-// Notes:
-//  - Run on FULL inventory commit (not LIGHT) to avoid transient false negatives.
+import TenantResource from "../models/TenantResource";
+import InventoryFull from "../models/Inventory.full";
+import InventoryLight from "../models/Inventory.light";
+import type { InventorySnapshot } from "../models/types";
+import type { TenantResourceLink } from "../models/TenantResource";
 
-const TenantResource = require("../models/TenantResource");
-const InventoryFull = require("../models/Inventory.full");
-const InventoryLight = require("../models/Inventory.light");
+type InventoryVm = {
+    guid?: string;
+    id?: string;
+    name?: string;
+};
 
-// helpers
-const arr = (v) => (Array.isArray(v) ? v : []);
-const root = (doc) => doc?.inventory?.inventory || doc?.inventory || {};
+type InventoryRoot = {
+    vms?: InventoryVm[];
+};
 
-function canon(x) {
-    return typeof x === "string" ? x.trim().toLowerCase() : x;
-}
-function vmKeys(vm) {
-    // prefer guid/id; name only as last resort (for legacy links)
-    const keys = [];
+const arr = <T = unknown>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
+
+const root = (doc?: InventorySnapshot | null): InventoryRoot =>
+    (doc?.inventory?.inventory || doc?.inventory || {}) as InventoryRoot;
+
+const canon = (value?: string | null) =>
+    typeof value === "string" ? value.trim().toLowerCase() : "";
+
+const vmKeys = (vm: InventoryVm) => {
+    const keys: string[] = [];
     if (vm?.guid) keys.push(String(vm.guid));
     if (vm?.id && vm.id !== vm.guid) keys.push(String(vm.id));
     if (vm?.name && vm.name !== vm.guid && vm.name !== vm.id) keys.push(String(vm.name));
     return keys;
-}
+};
 
-async function buildPresentKeySet(agentId) {
+async function buildPresentKeySet(agentId: string) {
     const [fullDoc, lightDoc] = await Promise.all([
-        InventoryFull.findOne({ agentId }, { inventory: 1 }).lean(),
-        InventoryLight.findOne({ agentId }, { inventory: 1 }).lean(),
+        InventoryFull.findOne({ agentId }, { inventory: 1 }).lean<InventorySnapshot | null>(),
+        InventoryLight.findOne({ agentId }, { inventory: 1 }).lean<InventorySnapshot | null>(),
     ]);
 
-    const present = new Set();
+    const present = new Set<string>();
 
-    // FULL
-    for (const vm of arr(root(fullDoc).vms)) {
-        for (const k of vmKeys(vm)) present.add(canon(k));
+    for (const vm of arr<InventoryVm>(root(fullDoc).vms)) {
+        vmKeys(vm).forEach((key) => present.add(canon(key)));
     }
-    // LIGHT (union) — harmless if FULL is already complete
-    for (const vm of arr(root(lightDoc).vms)) {
-        for (const k of vmKeys(vm)) present.add(canon(k));
+    for (const vm of arr<InventoryVm>(root(lightDoc).vms)) {
+        vmKeys(vm).forEach((key) => present.add(canon(key)));
     }
 
     return present;
 }
 
-/**
- * Reconcile a single tenant on a given agent (kind=vm).
- * Deletes TenantResource links whose refId is not present in FULL ∪ LIGHT.
- */
-async function reconcileTenantAgentVMs({ tenantId, agentId }) {
-    const present = await buildPresentKeySet(agentId);
+export interface ReconcileResult {
+    removed: number;
+    refIds: string[];
+}
 
-    // Load existing links for this tenant/agent/kind=vm
+export async function reconcileTenantAgentVMs({ tenantId, agentId }: { tenantId: string; agentId: string }): Promise<ReconcileResult> {
+    const presentKeys = await buildPresentKeySet(agentId);
     const links = await TenantResource.find(
         { tenantId, agentId, kind: "vm" },
         { _id: 1, refId: 1 }
-    ).lean();
+    ).lean<Array<TenantResourceLink & { _id: string }>>();
 
-    const toDeleteIds = [];
-    const missing = [];
+    const toDeleteIds: string[] = [];
+    const missing: string[] = [];
 
-    for (const l of links) {
-        const refK = canon(l.refId);
-        if (!present.has(refK)) {
-            toDeleteIds.push(l._id);
-            missing.push(l.refId);
+    for (const link of links) {
+        const refKey = canon(link.refId);
+        if (!presentKeys.has(refKey)) {
+            toDeleteIds.push(String(link._id));
+            missing.push(link.refId);
         }
     }
 
@@ -78,23 +78,12 @@ async function reconcileTenantAgentVMs({ tenantId, agentId }) {
     return { removed: toDeleteIds.length, refIds: missing };
 }
 
-/**
- * Reconcile all tenants that have VM links on this agent.
- */
-async function reconcileAllTenantsForAgent(agentId) {
-    const tenants = await TenantResource.distinct("tenantId", {
-        agentId,
-        kind: "vm",
-    });
-    const results = [];
+export async function reconcileAllTenantsForAgent(agentId: string) {
+    const tenants = await TenantResource.distinct("tenantId", { agentId, kind: "vm" });
+    const results: Array<{ tenantId: string } & ReconcileResult> = [];
     for (const tenantId of tenants) {
-        const r = await reconcileTenantAgentVMs({ tenantId, agentId });
-        results.push({ tenantId, ...r });
+        const outcome = await reconcileTenantAgentVMs({ tenantId, agentId });
+        results.push({ tenantId, ...outcome });
     }
     return results;
 }
-
-module.exports = {
-    reconcileTenantAgentVMs,
-    reconcileAllTenantsForAgent,
-};

@@ -1,100 +1,112 @@
-// @ts-nocheck
+import { resolvePath, type ImageEntry } from "../services/images";
+import { planNetTunnelOpen, planSerialOpen, type TunnelPlan } from "../services/console";
 
-// /lib/enrich.js
-const imagesService = require("../services/images");
-const consoleSvc = require("../services/console");
+type EnrichPayload = Record<string, unknown>;
+type MutablePayload = Record<string, unknown>;
+type Target = { ip: string; port: number };
 
+interface EnrichContext {
+    tenantId?: string;
+    agentId?: string;
+    user?: Record<string, unknown>;
+    refId?: string;
+    vm?: Record<string, unknown>;
+}
 
-const registry = {
-    // =========================
-    //       VM LIFECYCLE
-    // =========================
-    "vm.create": {
-        async auto({ object }) {
-            let out = { ...object };
-            if (!out.imagePath && out.imageId) {
-                const r = await imagesService.resolvePath(out.imageId);
-                if (!r || !r.path) throw new Error(`imageId not found: ${out.imageId}`);
-                out = { ...out, imagePath: r.path };
-            }
+interface EnrichOptions {
+    operation: string;
+    object: EnrichPayload;
+    ctx?: EnrichContext;
+}
 
-            out.generation = 2;
-            out.storageMB = 10240;
+interface EnrichResponse {
+    ok: boolean;
+    data?: EnrichPayload;
+    error?: string;
+}
 
-            if (!out.switch) {
-                out.switch = "fabric0";
-            }
+type EnrichHandler = (args: { object: EnrichPayload; ctx?: EnrichContext }) => Promise<EnrichPayload>;
 
-            return out;
-        },
-        async determineImage({ object }) {
-            if (object.imagePath) return { ...object };
-            if (!object.imageId) throw new Error("imageId is required for determineImage");
-            const r = await imagesService.resolvePath(object.imageId);
-            if (!r || !r.path) throw new Error(`imageId not found: ${object.imageId}`);
-            return { ...object, imagePath: r.path };
-        },
-    },
+type Registry = Record<string, Record<string, EnrichHandler>>;
 
-    "vm.clone": {
-        async auto(args) { return registry["vm.create"].auto(args); },
-        async determineImage(args) { return registry["vm.create"].determineImage(args); },
-    },
+const registry: Registry = {};
 
-    "vm.edit": {
-        async auto({ object }) { return { ...object }; },
-    },
-
-    // =========================
-    //   CONSOLE / TUNNELS
-    // =========================
-    "console.serial.open": {
-        async auto({ object, ctx }) {
-            const refId =
-                object.refId || object.vmId || ctx?.refId || ctx?.vm?._id;
-            if (!refId) throw new Error("refId/vmId is required");
-
-            const { agentData, ui } = await consoleSvc.planSerialOpen({
-                refId,
-                tenantId: ctx?.tenantId,
-                agentId: ctx?.agentId,
-                // sub optionnel si un jour on passe l'utilisateur dans ctx
-                sub: ctx?.user?.id,
-                ttlSeconds: object.ttlSeconds,
-            });
-
-            // Merge non destructif: on garde le payload d’origine et on ajoute ce qu’il faut pour l’agent
-            return { ...object, ...agentData, _console: ui };
-        },
-    },
-
-
-    "net.tunnel.open": {
-        async auto({ object, ctx }) {
-            const refId =
-                object.refId || object.vmId || ctx?.refId || ctx?.vm?._id;
-            if (!refId) throw new Error("refId/vmId is required");
-            if (!object?.target?.ip || !object?.target?.port) {
-                throw new Error("target.ip and target.port are required");
-            }
-
-            const { agentData, ui } = await consoleSvc.planNetTunnelOpen({
-                refId,
-                tenantId: ctx?.tenantId,
-                agentId: ctx?.agentId,
-                sub: ctx?.user?.id,
-                target: object.target,
-                mode: object.mode,
-                ttlSeconds: object.ttlSeconds,
-            });
-
-            return { ...object, ...agentData, _console: ui };
-        },
-    },
+const ensureImagePath = async (object: EnrichPayload) => {
+    if (object.imagePath || !object.imageId) return { ...object };
+    const result = await resolvePath(object.imageId as string);
+    if (!result?.path) throw new Error(`imageId not found: ${object.imageId}`);
+    return { ...object, imagePath: result.path };
 };
 
-/** Generic dispatcher */
-async function enrich(action, opts = {}) {
+const vmCreateAuto: EnrichHandler = async ({ object }) => {
+    const out = (await ensureImagePath(object)) as MutablePayload;
+    out.generation = out.generation ?? 2;
+    out.storageMB = out.storageMB ?? 10_240;
+    if (!out.switch) out.switch = "fabric0";
+    return out;
+};
+
+const vmDetermineImage: EnrichHandler = async ({ object }) => {
+    if (object.imagePath) return { ...object };
+    if (!object.imageId) throw new Error("imageId is required for determineImage");
+    const result = await resolvePath(object.imageId as string);
+    if (!result?.path) throw new Error(`imageId not found: ${object.imageId}`);
+    return { ...object, imagePath: result.path };
+};
+
+const consoleSerialAuto: EnrichHandler = async ({ object, ctx }) => {
+    const refId = (object.refId as string) || (object.vmId as string) || ctx?.refId || (ctx?.vm?._id as string);
+    if (!refId) throw new Error("refId/vmId is required");
+
+    const { agentData, ui } = await planSerialOpen({
+        refId,
+        tenantId: ctx?.tenantId,
+        agentId: (ctx?.agentId as string) || (object.agentId as string),
+        sub: ctx?.user?.id as string | undefined,
+        ttlSeconds: object.ttlSeconds as number | undefined,
+    });
+
+    return { ...object, ...agentData, _console: ui };
+};
+
+const netTunnelAuto: EnrichHandler = async ({ object, ctx }) => {
+    const refId = (object.refId as string) || (object.vmId as string) || ctx?.refId || (ctx?.vm?._id as string);
+    if (!refId) throw new Error("refId/vmId is required");
+    const targetCandidate = object.target as { ip?: string; port?: number } | undefined;
+    const target: Target = {
+        ip: targetCandidate?.ip || "",
+        port: targetCandidate?.port ?? 0,
+    };
+    if (!target?.ip || !target?.port) {
+        throw new Error("target.ip and target.port are required");
+    }
+
+    const { agentData, ui } = await planNetTunnelOpen({
+        refId,
+        tenantId: ctx?.tenantId,
+        agentId: (ctx?.agentId as string) || (object.agentId as string),
+        sub: ctx?.user?.id as string | undefined,
+        target,
+        mode: (object.mode as "serial" | "net") || "net",
+        ttlSeconds: object.ttlSeconds as number | undefined,
+    });
+
+    return { ...object, ...agentData, _console: ui };
+};
+
+const registerDefaultHandlers = () => {
+    register("vm.create", "auto", vmCreateAuto);
+    register("vm.create", "determineImage", vmDetermineImage);
+    register("vm.clone", "auto", vmCreateAuto);
+    register("vm.clone", "determineImage", vmDetermineImage);
+    register("vm.edit", "auto", async ({ object }) => ({ ...object }));
+    register("console.serial.open", "auto", consoleSerialAuto);
+    register("net.tunnel.open", "auto", netTunnelAuto);
+};
+
+registerDefaultHandlers();
+
+export async function enrich(action: string, opts: EnrichOptions): Promise<EnrichResponse> {
     const act = String(action || "");
     if (!act) return { ok: false, error: "action is required" };
     if (!opts || typeof opts !== "object") return { ok: false, error: "opts must be an object" };
@@ -115,14 +127,12 @@ async function enrich(action, opts = {}) {
     try {
         const data = await handler({ object, ctx });
         return { ok: true, data };
-    } catch (err) {
-        return { ok: false, error: err?.message || String(err) };
+    } catch (error) {
+        return { ok: false, error: (error as Error)?.message || String(error) };
     }
 }
 
-function register(action, operation, handler) {
+export function register(action: string, operation: string, handler: EnrichHandler) {
     if (!registry[action]) registry[action] = {};
     registry[action][operation] = handler;
 }
-
-module.exports = { enrich, register };

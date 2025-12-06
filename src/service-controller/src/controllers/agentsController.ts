@@ -1,79 +1,75 @@
-// @ts-nocheck
-// controllers/agentController.js
-const Heartbeat = require("../models/Heartbeat");
-const Inventory = require("../models/Inventory.full");
+import type { Response } from "express";
+import Heartbeat from "../models/Heartbeat";
+import Inventory from "../models/Inventory.full";
+import type { ControllerRequest } from "../types/express";
+import logger from "../lib/logger";
 
-const ONLINE_THRESHOLD_MS = parseInt(process.env.AGENT_ONLINE_THRESHOLD_MS || '90000', 10);
+const ONLINE_THRESHOLD_MS = parseInt(process.env.AGENT_ONLINE_THRESHOLD_MS || "90000", 10);
 
-exports.getStatus = async (req, res) => {
+type ControllerHandler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
+const log = logger.child(["controller", "agents"]);
+
+const isOnline = (lastSeen?: Date | string | null) => {
+    const ts = lastSeen ? new Date(lastSeen).getTime() : 0;
+    return !!(ts && Date.now() - ts < ONLINE_THRESHOLD_MS);
+};
+
+export const getStatus: ControllerHandler = async (req, res) => {
     try {
         const { agentId } = req.params;
-        const d = await Heartbeat.findOne({ agentId }, 'agentId version lastSeen capabilities host raw').lean();
-        if (!d) return res.status(404).json({ error: 'Not found' });
+        const doc = await Heartbeat.findOne(
+            { agentId },
+            "agentId version lastSeen capabilities host raw"
+        ).lean();
+        if (!doc) return res.status(404).json({ error: "Not found" });
 
-        const ts = d.lastSeen ? new Date(d.lastSeen).getTime() : 0;
-        const online = ts && (Date.now() - ts) < ONLINE_THRESHOLD_MS;
-
-
-        res.json({
-            id: d.agentId,
-            host: d.host,
-            capabilities: d.capabilities,
-            version: d.version || null,
-            status: online ? 'online' : 'offline',
+        const online = isOnline(doc.lastSeen);
+        return res.json({
+            id: doc.agentId,
+            host: doc.host,
+            capabilities: doc.capabilities,
+            version: doc.version || null,
+            status: online ? "online" : "offline",
             heartbeatOk: online,
-            lastHeartbeat: d.lastSeen || null,
+            lastHeartbeat: doc.lastSeen || null,
         });
-    } catch (e) {
-        console.error('getAgentStatus error:', e);
-        res.status(500).json({ error: 'Server error' });
+    } catch (error) {
+        log.error("getAgentStatus error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };
 
-
-exports.getInventory = async (req, res) => {
+export const getInventory: ControllerHandler = async (req, res) => {
     try {
         const { agentId } = req.params;
-        const inv = await Inventory.findOne({ agentId }).lean(); // unique document per agent
-
+        const inv = await Inventory.findOne({ agentId }).lean();
         if (!inv) return res.status(404).json({ error: "Not found" });
-        res.json({ success: true, data: inv });
-    } catch (e) {
-        console.error("getInventory error:", e);
-        res.status(500).json({ error: "Server error" });
+        return res.json({ success: true, data: inv });
+    } catch (error) {
+        log.error("getInventory error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };
 
-// controllers/admin.controller.js
-// Assumptions:
-// - Heartbeat model exposes at least agentId (string), createdAt (Date), ideally ts (Date), host, version, heartbeatOk (bool)
-// - Recommended index: { agentId: 1, ts: -1 } or { agentId: 1, createdAt: -1 }
-
-
-exports.getAgents = async (req, res) => {
+export const getAgents: ControllerHandler = async (_req, res) => {
     try {
         const now = Date.now();
-
-        // read every heartbeat (one doc per agent) – lightweight and enough here
-        const docs = await Heartbeat.find({}, 'agentId version lastSeen host capabilities raw').lean();
-        const data = docs.map(d => {
-            const ts = d.lastSeen ? new Date(d.lastSeen).getTime() : 0;
-            const online = ts && (now - ts) < ONLINE_THRESHOLD_MS;
-
+        const docs = await Heartbeat.find({}, "agentId version lastSeen host capabilities raw").lean();
+        const data = docs.map((doc) => {
+            const online = doc.lastSeen ? now - new Date(doc.lastSeen).getTime() < ONLINE_THRESHOLD_MS : false;
             return {
-                id: d.agentId,
-                host: d.host,
-                capabilities: d.capabilities,
-                version: d.version || null,
-                status: online ? 'online' : 'offline',
+                id: doc.agentId,
+                host: doc.host,
+                capabilities: doc.capabilities,
+                version: doc.version || null,
+                status: online ? "online" : "offline",
                 heartbeatOk: online,
-                lastHeartbeat: d.lastSeen || null,
+                lastHeartbeat: doc.lastSeen || null,
             };
         });
-
-        res.json(data);
-    } catch (e) {
-        console.error('getAgents error:', e);
-        res.status(500).json({ error: 'Server error' });
+        return res.json(data);
+    } catch (error) {
+        log.error("getAgents error", { error });
+        return res.status(500).json({ error: "Server error" });
     }
 };

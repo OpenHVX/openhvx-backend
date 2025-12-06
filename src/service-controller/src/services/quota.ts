@@ -1,74 +1,16 @@
-// @ts-nocheck
-"use strict";
+import type { Types } from "mongoose";
+import Tenant from "../models/Tenant";
+import TenantResource from "../models/TenantResource";
+import QuotaHold from "../models/quota/hold";
+import type { QuotaDeltas, QuotaKey, QuotaLimits, Quotas } from "../types/domain";
+import { ERR } from "../lib/errors/http-errors";
+import logger from "../lib/logger";
 
-/**
- * Quota Service (with holds/leases) + logger(lib)
- * -----------------------------------------------
- * Keeps per-tenant resource limits and usage.
- * Provides:
- *  - read/patch limits
- *  - atomic check+reserve and release
- *  - TTL-based "hold" reservations for async tasks (enqueue → hold; success → consume; failure/timeout → release)
- *  - recalc 'used' from full inventory
- *  - helpers to compute deltas from VM specs
- *
- * Conventions:
- *  - Limit -1 means "unlimited"
- *  - memory/storage in MB
- *  - All ints
- */
+const log = logger.child("quota");
+const logHold = log.child("hold");
+const logReaper = log.child("reaper");
 
-const Tenant = require("../models/Tenant");
-const TenantResource = require("../models/TenantResource"); // only used in recalc fallback
-const QuotaHold = require("../models/quota/hold");
-const { ERR } = require("../lib/errors/http-errors");
-
-// --- logger -----------------------------------------------------------------
-const logger = require("../lib/logger");
-const log = logger.child("quota");            // → [quota]
-const logHold = log.child("hold");            // → [quota:hold]
-const logReaper = log.child("reaper");        // → [quota:reaper]
-
-// --- small helpers ----------------------------------------------------------
-
-function safeJson(obj) { try { return JSON.stringify(obj); } catch { return "[unserializable-meta]"; } }
-function compactDeltas(d) {
-    if (!d || typeof d !== "object") return d;
-    const out = {};
-    for (const [k, v] of Object.entries(d)) if (v) out[k] = v | 0;
-    return out;
-}
-function tid(x) { return typeof x === "string" ? x : String(x); }
-
-function parseSizeToMB(v) {
-    if (v == null) return 0;
-    if (Number.isFinite(v)) return v | 0;
-    if (typeof v !== "string") return 0;
-    const s = v.trim().toLowerCase();
-    // support "2048", "2048mb", "2gb", "2 g", "2gib", etc.
-    const m = s.match(/^(\d+(?:\.\d+)?)\s*(k|kb|kib|m|mb|mib|g|gb|gib)?$/i);
-    if (!m) return 0;
-    const num = parseFloat(m[1]);
-    const unit = (m[2] || "mb").toLowerCase();
-    const MB = 1;
-    const KB = 1 / 1024;
-    const GB = 1024;
-    switch (unit) {
-        case "k":
-        case "kb":
-        case "kib": return Math.round(num * KB);
-        case "m":
-        case "mb":
-        case "mib": return Math.round(num * MB);
-        case "g":
-        case "gb":
-        case "gib": return Math.round(num * GB);
-        default: return 0;
-    }
-}
-
-// Default limits if a tenant has no quotas yet.
-const DEFAULTS = Object.freeze({
+const DEFAULTS: Record<QuotaKey, number> = Object.freeze({
     cpu: 0,
     memoryMB: 0,
     storageMB: 0,
@@ -76,97 +18,133 @@ const DEFAULTS = Object.freeze({
     networkCount: 0,
 });
 
-// Default hold TTL (can be overridden per call)
-const DEFAULT_HOLD_TTL_MS = 15 * 60 * 1000; // 15 minutes
+export const DEFAULT_HOLD_TTL_MS = 15 * 60 * 1000;
 
-// ----  validation / shape helpers ------------------------------------------
+type TenantIdentifier = Types.ObjectId | string;
 
-/** Ensure integer limits (partial). -1 allowed. */
-function sanitizeLimits(obj) {
-    const out = {};
-    if (!obj || typeof obj !== "object") return out;
-    for (const [k, v] of Object.entries(obj)) {
-        if (v == null) continue;
-        if (!Number.isFinite(v) || (v | 0) !== v) {
-            throw ERR.validationPre([{ path: `quotas.${k}.limit`, message: "must be integer" }]);
-        }
-        out[k] = v | 0;
+const compactDeltas = (deltas: QuotaDeltas | undefined) => {
+    if (!deltas || typeof deltas !== "object") return deltas;
+    const out: QuotaDeltas = {};
+    for (const [key, value] of Object.entries(deltas)) {
+        if (value) out[key as QuotaKey] = value | 0;
     }
     return out;
-}
+};
 
-/** Ensure integer deltas (partial). */
-function sanitizeDeltas(obj) {
-    const out = {};
-    if (!obj || typeof obj !== "object") {
+const tid = (value: TenantIdentifier) => (typeof value === "string" ? value : String(value));
+
+export const parseSizeToMB = (value: number | string | null | undefined) => {
+    if (value == null) return 0;
+    if (typeof value === "number" && Number.isFinite(value)) return value | 0;
+    if (typeof value !== "string") return 0;
+    const normalized = (value as string).trim().toLowerCase();
+    const match = normalized.match(/^(\d+(?:\.\d+)?)\s*(k|kb|kib|m|mb|mib|g|gb|gib)?$/i);
+    if (!match) return 0;
+    const num = parseFloat(match[1]);
+    const unit = (match[2] || "mb").toLowerCase();
+    const KB = 1 / 1024;
+    const MB = 1;
+    const GB = 1024;
+    switch (unit) {
+        case "k":
+        case "kb":
+        case "kib":
+            return Math.round(num * KB);
+        case "m":
+        case "mb":
+        case "mib":
+            return Math.round(num * MB);
+        case "g":
+        case "gb":
+        case "gib":
+            return Math.round(num * GB);
+        default:
+            return 0;
+    }
+};
+
+const sanitizeLimits = (input: QuotaLimits | undefined) => {
+    const out: QuotaLimits = {};
+    if (!input || typeof input !== "object") return out;
+    for (const [key, value] of Object.entries(input)) {
+        if (value == null) continue;
+        if (!Number.isFinite(value) || ((value as number) | 0) !== value) {
+            throw ERR.validationPre([{ path: `quotas.${key}.limit`, message: "must be integer" }]);
+        }
+        out[key as QuotaKey] = (value as number) | 0;
+    }
+    return out;
+};
+
+const sanitizeDeltas = (input: Record<string, unknown> | undefined) => {
+    if (!input || typeof input !== "object") {
         throw ERR.validationPre([{ path: "deltas", message: "must be an object" }]);
     }
-    for (const [k, v] of Object.entries(obj)) {
-        if (v == null) continue;
-        let n = v;
-        if (typeof n === "string" && /^-?\d+$/.test(n.trim())) n = Number(n.trim());
-        if (!Number.isFinite(n) || (n | 0) !== n) {
-            throw ERR.validationPre([{ path: `limits.${k}`, message: "must be integer" }]);
+    const out: QuotaDeltas = {};
+    for (const [key, value] of Object.entries(input)) {
+        if (value == null) continue;
+        let val: number;
+        if (typeof value === "string") {
+            if (!/^-?\d+$/.test(value.trim())) {
+                throw ERR.validationPre([{ path: `limits.${key}`, message: "must be integer" }]);
+            }
+            val = Number(value.trim());
+        } else if (typeof value === "number") {
+            val = value;
+        } else {
+            continue;
         }
-        out[k] = n | 0;
+        if (!Number.isFinite(val) || (val | 0) !== val) {
+            throw ERR.validationPre([{ path: `limits.${key}`, message: "must be integer" }]);
+        }
+        out[key as QuotaKey] = val | 0;
     }
     return out;
-}
+};
 
-/** Merge with defaults and coerce used>=0. */
-function hydrateWithDefaults(quotas = {}) {
-    const keys = new Set([...Object.keys(DEFAULTS), ...Object.keys(quotas)]);
-    const out = {};
-    for (const k of keys) {
-        const q = quotas[k] || {};
-        out[k] = {
-            limit: Number.isFinite(q.limit) ? (q.limit | 0) : (DEFAULTS[k] | 0),
-            used: Number.isFinite(q.used) ? Math.max(0, q.used | 0) : 0,
+const hydrateWithDefaults = (quotas: Partial<Quotas> = {}) => {
+    const keys = new Set<QuotaKey>([...Object.keys(DEFAULTS), ...Object.keys(quotas)] as QuotaKey[]);
+    const out = {} as Quotas;
+    for (const key of keys) {
+        const quota = quotas[key];
+        out[key] = {
+            limit: Number.isFinite(quota?.limit) ? (quota!.limit | 0) : DEFAULTS[key],
+            used: Number.isFinite(quota?.used) ? Math.max(0, quota!.used | 0) : 0,
         };
     }
     return out;
+};
+
+export async function getTenantQuotas(tenantId: TenantIdentifier) {
+    const tenant = await Tenant.findById(tenantId, { quotas: 1 }).lean();
+    if (!tenant) throw ERR.notFound("Tenant not found");
+    return hydrateWithDefaults(tenant.quotas);
 }
 
-// ---- public API: quotas read/patch ----------------------------------------
-
-/** Read quotas for a tenant (_id). */
-async function getTenantQuotas(tenantId) {
-    const t = await Tenant.findById(tenantId, { quotas: 1 }).lean();
-    if (!t) throw ERR.notFound("Tenant not found");
-    return hydrateWithDefaults(t.quotas);
-}
-
-/** Patch quota limits (partial). */
-async function setTenantQuotaLimits(tenantId, partialLimits) {
+export async function setTenantQuotaLimits(tenantId: TenantIdentifier, partialLimits: QuotaLimits) {
     const limits = sanitizeLimits(partialLimits);
-    const $set = {};
-    for (const [k, v] of Object.entries(limits)) $set[`quotas.${k}.limit`] = v;
+    const $set: Record<string, number> = {};
+    for (const [key, value] of Object.entries(limits)) {
+        $set[`quotas.${key}.limit`] = value;
+    }
 
-    const t = await Tenant.findByIdAndUpdate(
+    const tenant = await Tenant.findByIdAndUpdate(
         tenantId,
         { $set },
         { new: true, projection: { quotas: 1 }, runValidators: true }
     ).lean();
-    if (!t) throw ERR.notFound("Tenant not found");
+    if (!tenant) throw ERR.notFound("Tenant not found");
 
     log.info("limits patched", { tenantId: tid(tenantId), limits: $set });
-    return hydrateWithDefaults(t.quotas);
+    return hydrateWithDefaults(tenant.quotas);
 }
 
-// ---- core primitives: check/reserve/release (direct) ----------------------
+export async function checkAndReserve(tenantId: TenantIdentifier, deltas: QuotaDeltas) {
+    const increments = sanitizeDeltas(deltas);
 
-/**
- * Atomically check and reserve usage.
- * Positive deltas reserve; -1 limit is unlimited.
- * NOTE: used internally by holdQuota, can also be used for sync/inline ops.
- */
-async function checkAndReserve(tenantId, deltas) {
-    const incs = sanitizeDeltas(deltas);
-
-    // Build $expr constraints for positive deltas.
-    const and = [];
-    for (const [key, inc] of Object.entries(incs)) {
-        if (inc <= 0) continue;
+    const and: Record<string, unknown>[] = [];
+    for (const [key, inc] of Object.entries(increments)) {
+        if ((inc as number) <= 0) continue;
         and.push({
             $or: [
                 { $eq: [`$quotas.${key}.limit`, -1] },
@@ -180,12 +158,12 @@ async function checkAndReserve(tenantId, deltas) {
         });
     }
 
-    const filter = { _id: tenantId };
+    const filter: Record<string, unknown> = { _id: tenantId };
     if (and.length) filter.$expr = { $and: and };
 
-    const $inc = {};
-    for (const [k, v] of Object.entries(incs)) {
-        if (v !== 0) $inc[`quotas.${k}.used`] = v;
+    const $inc: Record<string, number> = {};
+    for (const [key, value] of Object.entries(increments)) {
+        if (value !== 0) $inc[`quotas.${key}.used`] = value as number;
     }
 
     const updated = await Tenant.findOneAndUpdate(
@@ -195,71 +173,71 @@ async function checkAndReserve(tenantId, deltas) {
     ).lean();
 
     if (!updated) {
-        // Build reason from current values
         const current = await Tenant.findById(tenantId, { quotas: 1 }).lean();
         if (!current) throw ERR.notFound("Tenant not found");
-        const reasons = [];
-        for (const [k, v] of Object.entries(incs)) {
-            if (v <= 0) continue;
-            const limit = current.quotas?.[k]?.limit ?? 0;
-            const used = current.quotas?.[k]?.used ?? 0;
-            if (limit !== -1 && used + v > limit) reasons.push(`${k}: ${used} + ${v} > ${limit}`);
+        const reasons: string[] = [];
+        for (const [key, inc] of Object.entries(increments)) {
+            if ((inc as number) <= 0) continue;
+            const limit = current.quotas?.[key as QuotaKey]?.limit ?? 0;
+            const used = current.quotas?.[key as QuotaKey]?.used ?? 0;
+            if (limit !== -1 && used + (inc as number) > limit) {
+                reasons.push(`${key}: ${used} + ${inc} > ${limit}`);
+            }
         }
         log.warn("reserve denied (quota exceeded)", {
             tenantId: tid(tenantId),
-            deltas: compactDeltas(incs),
+            deltas: compactDeltas(increments),
             reasons,
         });
         throw ERR.quotaExceeded(reasons.length ? `Quota exceeded (${reasons.join(", ")})` : "Quota exceeded");
     }
 
-    log.info("reserved", { tenantId: tid(tenantId), deltas: compactDeltas(incs) });
+    log.info("reserved", { tenantId: tid(tenantId), deltas: compactDeltas(increments) });
     return hydrateWithDefaults(updated.quotas);
 }
 
-/** Release usage (clamped to >=0). */
-async function release(tenantId, deltas) {
-    const incs = sanitizeDeltas(deltas);
-    const $inc = {};
-    for (const [k, v] of Object.entries(incs)) {
-        if (v !== 0) $inc[`quotas.${k}.used`] = -Math.abs(v);
+export async function release(tenantId: TenantIdentifier, deltas: QuotaDeltas) {
+    const increments = sanitizeDeltas(deltas);
+    const $inc: Record<string, number> = {};
+    for (const [key, value] of Object.entries(increments)) {
+        if (value !== 0) $inc[`quotas.${key}.used`] = -Math.abs(value as number);
     }
 
-    let t = await Tenant.findByIdAndUpdate(
+    const tenant = await Tenant.findByIdAndUpdate(
         tenantId,
         Object.keys($inc).length ? { $inc } : {},
         { new: true, projection: { quotas: 1 }, runValidators: true }
     ).lean();
-    if (!t) throw ERR.notFound("Tenant not found");
+    if (!tenant) throw ERR.notFound("Tenant not found");
 
-    const quotas = hydrateWithDefaults(t.quotas);
+    const quotas = hydrateWithDefaults(tenant.quotas);
     let needClamp = false;
-    for (const [k, q] of Object.entries(quotas)) {
-        if (q.used < 0) { quotas[k].used = 0; needClamp = true; }
+    for (const [key, quota] of Object.entries(quotas)) {
+        if (quota.used < 0) {
+            quota.used = 0;
+            quotas[key as QuotaKey] = quota;
+            needClamp = true;
+        }
     }
     if (needClamp) {
-        const $set = {};
-        for (const [k, q] of Object.entries(quotas)) $set[`quotas.${k}.used`] = q.used;
+        const $set: Record<string, number> = {};
+        for (const [key, quota] of Object.entries(quotas)) $set[`quotas.${key}.used`] = quota.used;
         await Tenant.updateOne({ _id: tenantId }, { $set });
     }
 
-    log.info("released", { tenantId: tid(tenantId), deltas: compactDeltas(incs) });
+    log.info("released", { tenantId: tid(tenantId), deltas: compactDeltas(increments) });
     return quotas;
 }
 
-// ---- HOLD (lease) API ------------------------------------------------------
-
-/**
- * Place a hold at enqueue:
- * - Idempotent on taskId (if already held/consumed/released, returns existing)
- * - Atomically reserves quotas via checkAndReserve
- * - Creates QuotaHold with status=held and TTL
- */
-async function holdQuota(tenantId, deltas, taskId, { ttlMs = DEFAULT_HOLD_TTL_MS } = {}) {
+export async function holdQuota(
+    tenantId: TenantIdentifier,
+    deltas: QuotaDeltas,
+    taskId: string,
+    { ttlMs = DEFAULT_HOLD_TTL_MS }: { ttlMs?: number } = {}
+) {
     if (!taskId) throw ERR.validationPre([{ path: "taskId", message: "required" }]);
-    const incs = sanitizeDeltas(deltas);
-    console.log(deltas)
-    // Idempotence quick path
+    const increments = sanitizeDeltas(deltas);
+
     const existing = await QuotaHold.findOne({ taskId }).lean();
     if (existing) {
         logHold.debug("hold exists (idempotent)", {
@@ -270,14 +248,13 @@ async function holdQuota(tenantId, deltas, taskId, { ttlMs = DEFAULT_HOLD_TTL_MS
         return existing;
     }
 
-    // Reserve first
-    await checkAndReserve(tenantId, incs);
+    await checkAndReserve(tenantId, increments);
 
     try {
         const hold = await QuotaHold.create({
             tenantId,
             taskId,
-            deltas: incs,
+            deltas: increments,
             status: "held",
             expiresAt: new Date(Date.now() + ttlMs),
         });
@@ -285,30 +262,31 @@ async function holdQuota(tenantId, deltas, taskId, { ttlMs = DEFAULT_HOLD_TTL_MS
             taskId,
             tenantId: tid(tenantId),
             ttlMs,
-            deltas: compactDeltas(incs),
+            deltas: compactDeltas(increments),
         });
         return hold.toObject();
-    } catch (e) {
-        // Duplicate taskId (rare race) -> rollback reservation and return the existing hold
-        if (e && e.code === 11000) {
-            await release(tenantId, incs);
+    } catch (error: unknown) {
+        if ((error as { code?: number })?.code === 11000) {
+            await release(tenantId, increments);
             const again = await QuotaHold.findOne({ taskId }).lean();
             logHold.warn("hold duplicate on create (rolled back reserve)", { taskId, tenantId: tid(tenantId) });
             if (again) return again;
         }
-        // Other error: rollback and throw
-        try { await release(tenantId, incs); } catch (_) { /* ignore */ }
+        try {
+            await release(tenantId, increments);
+        } catch {
+            // ignore
+        }
         logHold.error("hold create failed (rolled back reserve)", {
             taskId,
             tenantId: tid(tenantId),
-            error: e?.message || String(e),
+            error: (error as Error)?.message || String(error),
         });
-        throw e;
+        throw error;
     }
 }
 
-/** Extend hold TTL (e.g., on agent "started"/ACK). */
-async function extendHold(taskId, { ttlMs = DEFAULT_HOLD_TTL_MS } = {}) {
+export async function extendHold(taskId: string, { ttlMs = DEFAULT_HOLD_TTL_MS } = {}) {
     const hold = await QuotaHold.findOneAndUpdate(
         { taskId, status: "held" },
         { $set: { expiresAt: new Date(Date.now() + ttlMs) } },
@@ -322,8 +300,7 @@ async function extendHold(taskId, { ttlMs = DEFAULT_HOLD_TTL_MS } = {}) {
     return hold;
 }
 
-/** Consume hold on success: mark consumed (no change to 'used' — already reserved). */
-async function consumeHold(taskId) {
+export async function consumeHold(taskId: string) {
     const hold = await QuotaHold.findOneAndUpdate(
         { taskId, status: "held" },
         { $set: { status: "consumed" } },
@@ -342,8 +319,7 @@ async function consumeHold(taskId) {
     return existing || null;
 }
 
-/** Release hold on failure/abort/timeout: decrement used and mark released. */
-async function releaseHold(taskId) {
+export async function releaseHold(taskId: string) {
     const hold = await QuotaHold.findOne({ taskId }).lean();
     if (!hold) {
         logHold.warn("release ignored (hold not found)", { taskId });
@@ -359,34 +335,34 @@ async function releaseHold(taskId) {
         });
         return { ...hold, status: "released" };
     }
-    // consumed/released -> idempotent no-op
     logHold.debug("release idempotent (already terminal)", { taskId, status: hold.status });
     return hold;
 }
 
-/** Reaper: free all expired holds still in 'held' status. */
-async function reapExpiredHolds({ limit = 200 } = {}) {
+export async function reapExpiredHolds({ limit = 200 }: { limit?: number } = {}) {
     const now = new Date();
     const expired = await QuotaHold.find({ status: "held", expiresAt: { $lte: now } })
-        .limit(limit).lean();
+        .limit(limit)
+        .lean();
 
-    let ok = 0, fail = 0;
-    for (const h of expired) {
+    let ok = 0;
+    let fail = 0;
+    for (const hold of expired) {
         try {
-            await release(h.tenantId, h.deltas);
-            await QuotaHold.updateOne({ _id: h._id }, { $set: { status: "released" } });
+            await release(hold.tenantId, hold.deltas);
+            await QuotaHold.updateOne({ _id: hold._id }, { $set: { status: "released" } });
             ok++;
             logReaper.info("reaped hold", {
-                taskId: h.taskId,
-                tenantId: tid(h.tenantId),
-                deltas: compactDeltas(h.deltas),
+                taskId: hold.taskId,
+                tenantId: tid(hold.tenantId),
+                deltas: compactDeltas(hold.deltas),
             });
-        } catch (e) {
+        } catch (error) {
             fail++;
             logReaper.error("reap failed", {
-                taskId: h.taskId,
-                tenantId: tid(h.tenantId),
-                error: e?.message || String(e),
+                taskId: hold.taskId,
+                tenantId: tid(hold.tenantId),
+                error: (error as Error)?.message || String(error),
             });
         }
     }
@@ -394,146 +370,180 @@ async function reapExpiredHolds({ limit = 200 } = {}) {
     return expired.length;
 }
 
-// ---- recalc from inventory --------------------------------------------------
+interface InventoryVm {
+    id?: string;
+    uuid?: string;
+    _id?: string;
+    name?: string;
+    cpu?: number;
+    vCPU?: number;
+    memoryMB?: number;
+    memoryMiB?: number;
+    disks?: Array<{
+        sizeMB?: number;
+        sizeMiB?: number;
+        sizeGB?: number;
+        sizeBytes?: number;
+        virtualSizeBytes?: number;
+    }>;
+    storageMB?: number;
+    rootDiskMB?: number;
+    osDiskMB?: number;
+    imageSizeMB?: number;
+    imageSizeBytes?: number;
+    dynamic_memory?: boolean;
+    ram?: string;
+    min_ram?: string;
+}
 
-/**
- * Recalculate 'used' from FULL inventory (authoritative).
- * Falls back to TenantResource for VM ownership if links not provided.
- */
-async function recalcUsedFromInventory({ tenantId, fullInventory, tenantResourceLinks }) {
+interface InventoryNetwork {
+    tenantId?: string;
+    tenants?: string[];
+}
+
+export async function recalcUsedFromInventory({
+    tenantId,
+    fullInventory,
+    tenantResourceLinks,
+}: {
+    tenantId: TenantIdentifier;
+    fullInventory: { vms?: InventoryVm[]; networks?: InventoryNetwork[] };
+    tenantResourceLinks?: Record<string, unknown> | Set<string>;
+}) {
     if (!tenantId) throw ERR.validationPre([{ path: "tenantId", message: "required" }]);
     if (!fullInventory) throw ERR.validationPre([{ path: "fullInventory", message: "required" }]);
 
-    // Build membership check
-    let belongs;
+    let belongs: (vmId: string) => boolean;
     if (tenantResourceLinks && typeof tenantResourceLinks === "object") {
-        const set = tenantResourceLinks instanceof Set ? tenantResourceLinks : new Set(Object.keys(tenantResourceLinks));
+        const set =
+            tenantResourceLinks instanceof Set
+                ? tenantResourceLinks
+                : new Set(Object.keys(tenantResourceLinks));
         belongs = (vmId) => set.has(String(vmId));
     } else {
-        const links = await TenantResource.find(
-            { tenantId },
-            { "resource.kind": 1, "resource.ref": 1 }
-        ).lean();
-        const set = new Set(
-            links.filter(l => l?.resource?.kind === "vm").map(l => String(l.resource.ref))
-        );
+        const links = await TenantResource.find({ tenantId, kind: "vm" }, { refId: 1 }).lean();
+        const set = new Set(links.map((link) => String(link.refId)));
         belongs = (vmId) => set.has(String(vmId));
     }
 
     const vms = Array.isArray(fullInventory?.vms) ? fullInventory.vms : [];
     const nets = Array.isArray(fullInventory?.networks) ? fullInventory.networks : [];
 
-    let cpu = 0, memoryMB = 0, storageMB = 0, vmCount = 0, networkCount = 0;
+    let cpu = 0;
+    let memoryMB = 0;
+    let storageMB = 0;
+    let vmCount = 0;
+    let networkCount = 0;
 
     for (const vm of vms) {
         const id = vm?.id || vm?.uuid || vm?._id || vm?.name;
         if (!id || !belongs(String(id))) continue;
 
-        const vcpu = Number.isFinite(vm?.cpu) ? (vm.cpu | 0) :
-            (Number.isFinite(vm?.vCPU) ? (vm.vCPU | 0) : 0);
-        const mem = Number.isFinite(vm?.memoryMB) ? (vm.memoryMB | 0) :
-            (Number.isFinite(vm?.memoryMiB) ? (vm.memoryMiB | 0) : 0);
+        const vcpu = Number.isFinite(vm?.cpu) ? (vm.cpu as number) : (Number.isFinite(vm?.vCPU) ? (vm.vCPU as number) : 0);
+        const mem = Number.isFinite(vm?.memoryMB)
+            ? (vm.memoryMB as number)
+            : Number.isFinite(vm?.memoryMiB)
+            ? (vm.memoryMiB as number)
+            : 0;
 
         let vmStorageMB = 0;
         if (Array.isArray(vm?.disks)) {
-            for (const d of vm.disks) {
-                const bytes = Number.isFinite(d?.sizeBytes) ? d.sizeBytes :
-                    Number.isFinite(d?.virtualSizeBytes) ? d.virtualSizeBytes : 0;
-                if (bytes > 0) vmStorageMB += Math.round(bytes / (1024 * 1024));
+            for (const disk of vm.disks) {
+                if (Number.isFinite(disk?.sizeMB)) vmStorageMB += disk!.sizeMB!;
+                else if (Number.isFinite(disk?.sizeMiB)) vmStorageMB += disk!.sizeMiB!;
+                else if (Number.isFinite(disk?.sizeGB)) vmStorageMB += disk!.sizeGB! * 1024;
+                else if (Number.isFinite(disk?.sizeBytes)) vmStorageMB += Math.round((disk!.sizeBytes as number) / 1024 / 1024);
+                else if (Number.isFinite(disk?.virtualSizeBytes))
+                    vmStorageMB += Math.round((disk!.virtualSizeBytes as number) / 1024 / 1024);
             }
         } else if (Number.isFinite(vm?.storageMB)) {
-            vmStorageMB = vm.storageMB | 0;
+            vmStorageMB = vm.storageMB as number;
         }
 
-        cpu += Math.max(0, vcpu);
-        memoryMB += Math.max(0, mem);
-        storageMB += Math.max(0, vmStorageMB);
+        cpu += Math.max(0, vcpu | 0);
+        memoryMB += Math.max(0, mem | 0);
+        storageMB += Math.max(0, vmStorageMB | 0);
         vmCount += 1;
     }
 
-    for (const n of nets) {
+    for (const net of nets) {
         const owned =
-            String(n?.tenantId || "") === String(tenantId) ||
-            (Array.isArray(n?.tenants) && n.tenants.map(String).includes(String(tenantId)));
+            String(net?.tenantId || "") === String(tenantId) ||
+            (Array.isArray(net?.tenants) && net.tenants.map(String).includes(String(tenantId)));
         if (owned) networkCount += 1;
     }
 
     const used = { cpu, memoryMB, storageMB, vmCount, networkCount };
-    const $set = {};
-    for (const [k, v] of Object.entries(used)) $set[`quotas.${k}.used`] = v | 0;
+    const $set: Record<string, number> = {};
+    for (const [key, value] of Object.entries(used)) $set[`quotas.${key}.used`] = value | 0;
 
-    const t = await Tenant.findByIdAndUpdate(
+    const tenant = await Tenant.findByIdAndUpdate(
         tenantId,
         { $set },
         { new: true, projection: { quotas: 1 }, runValidators: true }
     ).lean();
-    if (!t) throw ERR.notFound("Tenant not found");
+    if (!tenant) throw ERR.notFound("Tenant not found");
 
     log.info("recalc used from inventory", { tenantId: tid(tenantId), used });
-    return hydrateWithDefaults(t.quotas);
+    return hydrateWithDefaults(tenant.quotas);
 }
 
-// ---- deltas helpers --------------------------------------------------------
+export function deltasFromVmSpec(vmSpec: InventoryVm = {}) {
+    const cpu = Math.max(0, (Number.isFinite(vmSpec.cpu) ? vmSpec.cpu : vmSpec.vCPU) || 0);
 
-/** Convert a VM spec to quota deltas for create/resize. */
-function deltasFromVmSpec(vmSpec = {}) {
-    // CPU
-    const cpu = Math.max(0, (Number.isFinite(vmSpec.cpu) ? vmSpec.cpu : vmSpec.vCPU) | 0);
+    let memory = 0;
+    if (Number.isFinite(vmSpec.memoryMB)) memory = vmSpec.memoryMB!;
+    else if (Number.isFinite(vmSpec.memoryMiB)) memory = vmSpec.memoryMiB!;
+    else if (vmSpec.ram) memory = parseSizeToMB(vmSpec.ram);
 
-    // Memory (accept memoryMB or memoryMiB; fallback to string "ram")
-    let memoryMB = 0;
-    if (Number.isFinite(vmSpec.memoryMB)) memoryMB = vmSpec.memoryMB | 0;
-    else if (Number.isFinite(vmSpec.memoryMiB)) memoryMB = vmSpec.memoryMiB | 0;
-    else if (vmSpec.ram) memoryMB = parseSizeToMB(vmSpec.ram);
-
-    // If dynamic memory is enabled, reserve at least the startup/min value
     if (vmSpec.dynamic_memory) {
-        const startup = vmSpec.ram ? parseSizeToMB(vmSpec.ram) : memoryMB;
+        const startup = vmSpec.ram ? parseSizeToMB(vmSpec.ram) : memory;
         const minRam = vmSpec.min_ram ? parseSizeToMB(vmSpec.min_ram) : 0;
-        memoryMB = Math.max(minRam, startup, 0);
+        memory = Math.max(minRam, startup, 0);
     }
 
-
-    let storageMB = 0;
+    let storage = 0;
     if (Array.isArray(vmSpec.disks) && vmSpec.disks.length) {
-        for (const d of vmSpec.disks) {
-            if (Number.isFinite(d?.sizeMB)) storageMB += d.sizeMB | 0;
-            else if (Number.isFinite(d?.sizeMiB)) storageMB += d.sizeMiB | 0;
-            else if (Number.isFinite(d?.sizeGB)) storageMB += (d.sizeGB | 0) * 1024;
-            else if (Number.isFinite(d?.sizeBytes)) storageMB += Math.round(d.sizeBytes / (1024 * 1024));
-            else if (Number.isFinite(d?.virtualSizeBytes)) storageMB += Math.round(d.virtualSizeBytes / (1024 * 1024));
+        for (const disk of vmSpec.disks) {
+            if (Number.isFinite(disk?.sizeMB)) storage += disk!.sizeMB!;
+            else if (Number.isFinite(disk?.sizeMiB)) storage += disk!.sizeMiB!;
+            else if (Number.isFinite(disk?.sizeGB)) storage += disk!.sizeGB! * 1024;
+            else if (Number.isFinite(disk?.sizeBytes)) storage += Math.round((disk!.sizeBytes as number) / 1024 / 1024);
+            else if (Number.isFinite(disk?.virtualSizeBytes))
+                storage += Math.round((disk!.virtualSizeBytes as number) / 1024 / 1024);
         }
     } else {
-        if (Number.isFinite(vmSpec.rootDiskMB)) storageMB += vmSpec.rootDiskMB | 0;
-        if (Number.isFinite(vmSpec.osDiskMB)) storageMB += vmSpec.osDiskMB | 0;
-        if (Number.isFinite(vmSpec.imageSizeMB)) storageMB += vmSpec.imageSizeMB | 0;
-        else if (Number.isFinite(vmSpec.imageSizeBytes)) storageMB += Math.round(vmSpec.imageSizeBytes / (1024 * 1024));
+        if (Number.isFinite(vmSpec.storageMB)) storage += vmSpec.storageMB!;
+        if (Number.isFinite(vmSpec.rootDiskMB)) storage += vmSpec.rootDiskMB!;
+        if (Number.isFinite(vmSpec.osDiskMB)) storage += vmSpec.osDiskMB!;
+        if (Number.isFinite(vmSpec.imageSizeMB)) storage += vmSpec.imageSizeMB!;
+        else if (Number.isFinite(vmSpec.imageSizeBytes))
+            storage += Math.round((vmSpec.imageSizeBytes as number) / 1024 / 1024);
     }
 
-    return { cpu, memoryMB: Math.max(0, memoryMB | 0), storageMB: Math.max(0, storageMB | 0), vmCount: 1 };
+    return {
+        cpu,
+        memoryMB: Math.max(0, memory | 0),
+        storageMB: Math.max(0, storage | 0),
+        vmCount: 1,
+    };
 }
 
-/** Map action → deltas. Extend as you add actions. */
-function computeDeltas(action, payload) {
-    if (action === "vm.create") return deltasFromVmSpec(payload || {});
-    // TODO: add vm.resize, disk.attach, vm.clone, etc.
+export function computeDeltas(action: string, payload: unknown) {
+    if (action === "vm.create") return deltasFromVmSpec(payload as InventoryVm);
     return null;
 }
 
-/** Resolve tenantId (string) → _id (ObjectId) */
-async function getTenantObjectIdOrThrow(tenantIdStr) {
-    const t = await Tenant.findOne({ tenantId: tenantIdStr }, { _id: 1 }).lean();
-    if (!t) throw ERR.notFound("Tenant not found");
-    return t._id;
+export async function getTenantObjectIdOrThrow(tenantIdStr: string) {
+    const tenant = await Tenant.findOne({ tenantId: tenantIdStr }, { _id: 1 }).lean();
+    if (!tenant) throw ERR.notFound("Tenant not found");
+    return tenant._id;
 }
 
-// ---- legacy helper (kept for sync paths) -----------------------------------
-
-/**
- * Legacy: reserve quotas then run critical section in-process.
- * For async tasks, prefer the hold API.
- */
-async function reserveAndRun({ tenantIdStr, action, payload }, runFn) {
+export async function reserveAndRun<T>(
+    { tenantIdStr, action, payload }: { tenantIdStr: string; action: string; payload: unknown },
+    runFn: () => Promise<T>
+): Promise<T> {
     const deltas = computeDeltas(action, payload);
     if (!deltas) return runFn();
 
@@ -542,35 +552,12 @@ async function reserveAndRun({ tenantIdStr, action, payload }, runFn) {
 
     try {
         return await runFn();
-    } catch (err) {
-        try { await release(tenantObjectId, deltas); } catch (_) { /* ignore */ }
-        throw err;
+    } catch (error) {
+        try {
+            await release(tenantObjectId, deltas);
+        } catch {
+            // ignore
+        }
+        throw error;
     }
 }
-
-module.exports = {
-    // read/patch
-    getTenantQuotas,
-    setTenantQuotaLimits,
-
-    // primitives
-    checkAndReserve,
-    release,
-
-    // holds
-    holdQuota,
-    extendHold,
-    consumeHold,
-    releaseHold,
-    reapExpiredHolds,
-    DEFAULT_HOLD_TTL_MS,
-
-    // recalc & helpers
-    recalcUsedFromInventory,
-    deltasFromVmSpec,
-    computeDeltas,
-    getTenantObjectIdOrThrow,
-
-    // legacy
-    reserveAndRun,
-};

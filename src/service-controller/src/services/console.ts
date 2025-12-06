@@ -1,194 +1,214 @@
-// @ts-nocheck
-// services/console.js
-const jwt = require('jsonwebtoken');
-const { randomUUID } = require('node:crypto');
-const mongoose = require('mongoose');
-const TenantResource = require('../models/TenantResource');
+import jwt from "jsonwebtoken";
+import { randomUUID } from "node:crypto";
+import { isValidObjectId, Types } from "mongoose";
+import TenantResource from "../models/TenantResource";
+import type { TenantResourceLink } from "../models/TenantResource";
 
-function reqEnv(name) {
-    const v = process.env[name];
-    if (!v) throw new Error(`${name} is required`);
-    return v;
+type TunnelMode = "serial" | "net";
+
+interface BasePlanOptions {
+    refId: string;
+    tenantId?: string;
+    agentId?: string;
+    sub?: string;
+    ttlSeconds?: number;
 }
 
-// The browser always goes through the API Gateway (/api/v1/console/*)
-const publicWsBase = () => {
-    const base = reqEnv('PUBLIC_WS_BASE').replace(/\/$/, '');
-    return base.endsWith('/api') ? base : `${base}/api`;
+export interface SerialPlanOptions extends BasePlanOptions {}
+
+export interface NetTunnelPlanOptions extends BasePlanOptions {
+    target: {
+        ip: string;
+        port: number;
+    };
+    mode?: TunnelMode;
+}
+
+export interface TunnelPlan {
+    agentData: {
+        vmId: string;
+        tunnelId: string;
+        ticket: string;
+        agentWsUrl: string;
+        ttlSeconds: number;
+        target?: NetTunnelPlanOptions["target"];
+    };
+    ui: {
+        tunnelId: string;
+        wsUrl: string;
+        expiresAt: string;
+        mode: TunnelMode;
+    };
+    vm: TenantResourceLink & { _id: Types.ObjectId };
+}
+
+const requiredEnv = (name: string) => {
+    const value = process.env[name];
+    if (!value) throw new Error(`${name} is required`);
+    return value;
 };
 
-// Agents now connect to the dedicated WS broker instead of the controller
-const brokerWsBase = () => reqEnv('BROKER_WS_BASE').replace(/\/$/, '');
+const AGENT_SECRET = () => requiredEnv("JWT_AGENT_SECRET");
+const BROWSER_SECRET = () => requiredEnv("JWT_BROWSER_SECRET");
 
-const AGENT_SECRET = () => reqEnv('JWT_AGENT_SECRET');
-const BROWSER_SECRET = () => reqEnv('JWT_BROWSER_SECRET');
+const publicWsBase = () => {
+    const base = requiredEnv("PUBLIC_WS_BASE").replace(/\/$/, "");
+    return base.endsWith("/api") ? base : `${base}/api`;
+};
 
-function genTunnelId() {
-    return randomUUID().replace(/-/g, '').slice(0, 22);
-}
+const brokerWsBase = () => requiredEnv("BROKER_WS_BASE").replace(/\/$/, "");
 
-function isObjectIdLike(v) {
-    return typeof v === 'string' && mongoose.Types.ObjectId.isValid(v);
-}
+const browserWsUrl = (mode: TunnelMode, token: string) => {
+    if (mode === "serial") return `${publicWsBase()}/v1/console/serial/ws?t=${token}`;
+    return `${publicWsBase()}/v1/console/net/ws?t=${token}`;
+};
 
-/**
- * Robust lookup for a "TenantResource" VM
- * - when refId looks like an ObjectId, try _id first
- * - otherwise search by refId, then fall back to guid
- * - you can narrow by tenantId/agentId if provided
- */
-async function loadVmOrThrow({ refId, tenantId, agentId }) {
-    if (!refId) throw new Error('vm refId is required');
+const agentWsUrl = (tunnelId: string, agentTicket: string) => {
+    return `${brokerWsBase()}/ws/tunnel/${tunnelId}?ticket=${agentTicket}`;
+};
 
-    const base = { kind: 'vm' };
+const genTunnelId = () => randomUUID().replace(/-/g, "").slice(0, 22);
+
+const signAgentTicket = (payload: {
+    tunnelId: string;
+    vmId: string;
+    tenantId: string;
+    agentId?: string;
+    action: string;
+}) => {
+    return jwt.sign({ aud: "agent", ...payload }, AGENT_SECRET(), { expiresIn: "2m" });
+};
+
+const signBrowserToken = (payload: {
+    tunnelId: string;
+    vmId: string;
+    tenantId: string;
+    sub?: string;
+    mode: TunnelMode;
+}) => {
+    return jwt.sign({ aud: "browser", ...payload }, BROWSER_SECRET(), { expiresIn: "5m" });
+};
+
+type VmQuery = {
+    refId: string;
+    tenantId?: string;
+    agentId?: string;
+};
+
+type VmDocument = (TenantResourceLink & { _id: Types.ObjectId }) | null;
+
+const findVm = async (filter: Record<string, unknown>): Promise<VmDocument> => {
+    return TenantResource.findOne(filter).lean<VmDocument>().catch(() => null);
+};
+
+async function loadVmOrThrow({ refId, tenantId, agentId }: VmQuery): Promise<NonNullable<VmDocument>> {
+    if (!refId) throw new Error("vm refId is required");
+
+    const base: Record<string, unknown> = { kind: "vm" };
     if (tenantId) base.tenantId = tenantId;
     if (agentId) base.agentId = agentId;
 
-    let vm = null;
-
-    // 1) direct lookup by _id when refId is a valid ObjectId
-    if (isObjectIdLike(refId)) {
-        vm = await TenantResource.findOne({ ...base, _id: refId }).lean().catch(() => null);
-        if (vm) return vm;
+    if (typeof refId === "string" && isValidObjectId(refId)) {
+        const doc = await findVm({ ...base, _id: refId });
+        if (doc) return doc;
     }
 
-    // 2) fallback to refId (external GUID/UUID)
-    vm = await TenantResource.findOne({ ...base, refId }).lean().catch(() => null);
-    if (vm) return vm;
+    const byRef = await findVm({ ...base, refId });
+    if (byRef) return byRef;
 
-    // 3) final fallback on guid
-    vm = await TenantResource.findOne({ ...base, guid: refId }).lean().catch(() => null);
-    if (vm) return vm;
+    const byGuid = await findVm({ ...base, guid: refId });
+    if (byGuid) return byGuid;
 
-    throw new Error('vm not found');
+    throw new Error("vm not found");
 }
 
-// If the caller specifies agentId and the VM is linked to another agent → reject
-function assertAgent(vm, agentId) {
+const assertAgent = (vm: TenantResourceLink & { _id?: Types.ObjectId }, agentId?: string) => {
     if (agentId && vm.agentId && vm.agentId !== agentId) {
-        throw new Error(`agentId mismatch for vm ${vm._id}`);
+        throw new Error(`agentId mismatch for vm ${vm._id ?? vm.refId}`);
     }
-}
+};
 
-function makeAgentTicket({ tunnelId, vmId, tenantId, agentId, action }) {
-    return jwt.sign(
-        { aud: 'agent', act: action, tunnelId, vmId, tenantId, agentId },
-        AGENT_SECRET(),
-        { expiresIn: '2m' }
-    );
-}
+const buildUiPayload = (tunnelId: string, mode: TunnelMode, browserToken: string) => ({
+    tunnelId,
+    wsUrl: browserWsUrl(mode, browserToken),
+    expiresAt: new Date(Date.now() + 5 * 60e3).toISOString(),
+    mode,
+});
 
-function makeBrowserToken({ tunnelId, vmId, tenantId, sub, mode }) {
-    return jwt.sign(
-        { aud: 'browser', mode, tunnelId, vmId, tenantId, sub },
-        BROWSER_SECRET(),
-        { expiresIn: '5m' }
-    );
-}
-
-function browserWsUrl(mode, browserToken) {
-    if (mode === 'serial') return `${publicWsBase()}/v1/console/serial/ws?t=${browserToken}`;
-    return `${publicWsBase()}/v1/console/net/ws?t=${browserToken}`;
-}
-
-function agentWsUrl(tunnelId, agentTicket) {
-    // Agents connect straight to the WS broker
-    return `${brokerWsBase()}/ws/tunnel/${tunnelId}?ticket=${agentTicket}`;
-}
-
-/** Serial console */
-async function planSerialOpen({ refId, tenantId, agentId, sub, ttlSeconds }) {
+export async function planSerialOpen(options: SerialPlanOptions): Promise<TunnelPlan> {
+    const { refId, tenantId, agentId, sub, ttlSeconds } = options;
     const vm = await loadVmOrThrow({ refId, tenantId, agentId });
     assertAgent(vm, agentId);
 
     const vmId = String(vm._id);
     const tunnelId = genTunnelId();
 
-    const ticket = makeAgentTicket({
+    const ticket = signAgentTicket({
         tunnelId,
         vmId,
         tenantId: vm.tenantId,
         agentId: agentId || vm.agentId,
-        action: 'console.serial.open',
+        action: "console.serial.open",
     });
-    const agentUrl = agentWsUrl(tunnelId, ticket);
 
-    const browserToken = makeBrowserToken({
+    const browserToken = signBrowserToken({
         tunnelId,
         vmId,
         tenantId: vm.tenantId,
         sub,
-        mode: 'serial',
+        mode: "serial",
     });
-    const browserUrl = browserWsUrl('serial', browserToken);
 
     return {
         agentData: {
             vmId,
             tunnelId,
             ticket,
-            agentWsUrl: agentUrl,
+            agentWsUrl: agentWsUrl(tunnelId, ticket),
             ttlSeconds: ttlSeconds || 900,
         },
-        ui: {
-            tunnelId,
-            wsUrl: browserUrl,
-            expiresAt: new Date(Date.now() + 5 * 60e3).toISOString(),
-            mode: 'serial',
-        },
+        ui: buildUiPayload(tunnelId, "serial", browserToken),
         vm,
     };
 }
 
-/** Generic TCP tunnel (SSH/RDP/VNC…) */
-async function planNetTunnelOpen({ refId, tenantId, agentId, target, mode, ttlSeconds, sub }) {
-    if (!target?.ip || !target?.port) throw new Error('target.ip and target.port are required');
+export async function planNetTunnelOpen(options: NetTunnelPlanOptions): Promise<TunnelPlan> {
+    const { refId, tenantId, agentId, target, mode, ttlSeconds, sub } = options;
+    if (!target?.ip || !target?.port) throw new Error("target.ip and target.port are required");
 
     const vm = await loadVmOrThrow({ refId, tenantId, agentId });
     assertAgent(vm, agentId);
 
     const vmId = String(vm._id);
     const tunnelId = genTunnelId();
+    const resolvedMode: TunnelMode = mode || "net";
 
-    const ticket = makeAgentTicket({
+    const ticket = signAgentTicket({
         tunnelId,
         vmId,
         tenantId: vm.tenantId,
         agentId: agentId || vm.agentId,
-        action: 'net.tunnel.open',
+        action: "net.tunnel.open",
     });
-    const agentUrl = agentWsUrl(tunnelId, ticket);
 
-    const _mode = mode || 'net';
-    const browserToken = makeBrowserToken({
+    const browserToken = signBrowserToken({
         tunnelId,
         vmId,
         tenantId: vm.tenantId,
         sub,
-        mode: _mode,
+        mode: resolvedMode,
     });
-    const browserUrl = browserWsUrl(_mode, browserToken);
 
     return {
         agentData: {
             vmId,
             tunnelId,
             ticket,
-            agentWsUrl: agentUrl,
+            agentWsUrl: agentWsUrl(tunnelId, ticket),
             ttlSeconds: ttlSeconds || 900,
             target,
         },
-        ui: {
-            tunnelId,
-            wsUrl: browserUrl,
-            expiresAt: new Date(Date.now() + 5 * 60e3).toISOString(),
-            mode: _mode,
-        },
+        ui: buildUiPayload(tunnelId, resolvedMode, browserToken),
         vm,
     };
 }
-
-module.exports = {
-    planSerialOpen,
-    planNetTunnelOpen,
-};

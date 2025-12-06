@@ -1,12 +1,18 @@
-// @ts-nocheck
-// lib/schemas/election.js
-const { objectStrict, arrayOf, isString, isInteger, isDate } = require("../validate");
+import { arrayOf, isInteger, isString, objectStrict, validate } from "../validate";
+import type { ValidationResult } from "../validate";
+import type { ElectionRequirements } from "../../types/domain";
 
-const AgentsSchema = objectStrict({
+export interface ElectionPayload extends Record<string, unknown> {
+    requirements: ElectionRequirements;
+}
+
+export const AgentsSchema = objectStrict<ElectionPayload>({
     requirements: objectStrict({
         freshness: isInteger,
         capabilities: arrayOf(isString),
     }),
 });
 
-module.exports = { AgentsSchema };
+export function validateElectionPayload(body: unknown): ValidationResult<ElectionPayload> {
+    return validate(AgentsSchema, body);
+}

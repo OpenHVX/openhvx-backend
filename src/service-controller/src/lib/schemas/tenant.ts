@@ -1,83 +1,93 @@
-// @ts-nocheck
-// lib/schemas/tenant.js
-"use strict";
-
-/**
- * Tenant contract validation
- * - Reuses QuotaLimitsSchema from lib/schemas/quota.js
- * - Provides normalizeCreate/normalizeUpdate using normalizeQuota
- */
-
-const {
-    validate,
+import {
+    isEnum,
+    isString,
     objectStrict,
     optional,
     recordOf,
-    isString,
-    isEnum,
-} = require("../validate");
+    validate,
+} from "../validate";
+import type { ValidationResult } from "../validate";
+import type { QuotaItem, QuotaKey, QuotaLimits } from "../../types/domain";
+import { QuotaLimitsSchema, normalizeQuota } from "./quota";
 
-const {
-    QuotaLimitsSchema,
-    normalizeQuota,
-} = require("./quota");
+export interface TenantIdParamsShape extends Record<string, unknown> {
+    tenantId: string;
+}
 
-// Status enum
-const isStatus = isEnum(["active", "disabled"]);
+type NormalizedQuota = Partial<Record<QuotaKey, QuotaItem>>;
 
-// Free-form metadata
+export interface TenantCreateBodyShape extends Record<string, unknown> {
+    tenantId: string;
+    name: string;
+    description?: string;
+    quotas?: QuotaLimits;
+    metadata?: Record<string, string>;
+    status?: "active" | "disabled";
+}
+
+export interface TenantUpdateBodyShape extends Record<string, unknown> {
+    name?: string;
+    status?: "active" | "disabled";
+    description?: string;
+    quotas?: QuotaLimits;
+    metadata?: Record<string, string>;
+}
+
+const isStatus = isEnum(["active", "disabled"] as const);
 const MetadataSchema = recordOf(isString);
 
-// Params: /tenants/:tenantId
-const TenantIdParams = objectStrict({
+const TenantIdParams = objectStrict<TenantIdParamsShape>({
     tenantId: isString,
 });
 
-// Body: POST /tenants
-const TenantCreateBody = objectStrict({
+const TenantCreateBody = objectStrict<TenantCreateBodyShape>({
     tenantId: isString,
     name: isString,
     description: optional(isString),
-    quotas: optional(QuotaLimitsSchema), // flat limits
+    quotas: optional(QuotaLimitsSchema),
     metadata: optional(MetadataSchema),
+    status: optional(isStatus),
 });
 
-// Body: PATCH /tenants/:tenantId
-const TenantUpdateBody = objectStrict({
+const TenantUpdateBody = objectStrict<TenantUpdateBodyShape>({
     name: optional(isString),
     status: optional(isStatus),
     description: optional(isString),
-    quotas: optional(QuotaLimitsSchema), // flat limits
+    quotas: optional(QuotaLimitsSchema),
     metadata: optional(MetadataSchema),
 });
 
-// Helpers for controllers
-function validateCreate(body) { return validate(TenantCreateBody, body || {}); }
-function validateUpdate(body) { return validate(TenantUpdateBody, body || {}); }
-function validateParams(p) { return validate(TenantIdParams, p || {}); }
-
-/** Normalize flat limits -> model shape */
-function normalizeCreate(value) {
-    const v = { ...value };
-    if (v.quotas) {
-        const q = normalizeQuota(v.quotas);
-        if (q) v.quotas = q; else delete v.quotas;
-    }
-    return v;
-}
-function normalizeUpdate(value) {
-    const v = { ...value };
-    if (v.quotas) {
-        const q = normalizeQuota(v.quotas);
-        if (q) v.quotas = q; else delete v.quotas;
-    }
-    return v;
+export function validateCreate(body: unknown): ValidationResult<TenantCreateBodyShape> {
+    return validate(TenantCreateBody, body || {});
 }
 
-module.exports = {
-    validateCreate,
-    validateUpdate,
-    validateParams,
-    normalizeCreate,
-    normalizeUpdate,
-};
+export function validateUpdate(body: unknown): ValidationResult<TenantUpdateBodyShape> {
+    return validate(TenantUpdateBody, body || {});
+}
+
+export function validateParams(params: unknown): ValidationResult<TenantIdParamsShape> {
+    return validate(TenantIdParams, params || {});
+}
+
+type Normalized<T> = Omit<T, "quotas"> & { quotas?: NormalizedQuota };
+
+function normalizeValue<T extends { quotas?: QuotaLimits }>(value: T): Normalized<T> {
+    const out = { ...value } as Normalized<T>;
+    if (value.quotas) {
+        const normalized = normalizeQuota(value.quotas);
+        if (normalized) {
+            out.quotas = normalized;
+        } else {
+            delete out.quotas;
+        }
+    }
+    return out;
+}
+
+export function normalizeCreate(value: TenantCreateBodyShape): Normalized<TenantCreateBodyShape> {
+    return normalizeValue(value);
+}
+
+export function normalizeUpdate(value: TenantUpdateBodyShape): Normalized<TenantUpdateBodyShape> {
+    return normalizeValue(value);
+}

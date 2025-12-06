@@ -1,122 +1,119 @@
-// @ts-nocheck
-// lib/validate.js (CommonJS)
+type ValidatorFn<T> = ((value: unknown, path?: string) => T) & { __optional?: boolean };
 
-// ----- Helpers -----
-const isPlainObject = (x) =>
-    typeof x === "object" && x !== null && Object.getPrototypeOf(x) === Object.prototype;
+export type Validator<T> = ValidatorFn<T>;
 
-const joinPath = (base, key) => (base ? `${base}.${key}` : String(key));
-const err = (path, msg) => new Error(`${path || "value"}: ${msg}`);
-
-// ----- Primitives -----
-function isString(v, path = "") {
-    if (typeof v !== "string") throw err(path, "expected string");
-    return v;
+export interface ValidationResult<T> {
+    ok: boolean;
+    value: T | undefined;
+    errors: string[];
 }
 
-function isNumber(v, path = "") {
-    if (typeof v !== "number" || !Number.isFinite(v)) throw err(path, "expected finite number");
-    return v;
+function isPlainObject(input: unknown): input is Record<string, unknown> {
+    return typeof input === "object" && input !== null && Object.getPrototypeOf(input) === Object.prototype;
 }
 
-function isInteger(v, path = "") {
-    if (!Number.isInteger(v)) throw err(path, "expected integer");
-    return v;
-}
+const joinPath = (base: string, key: string) => (base ? `${base}.${key}` : String(key));
 
-function isDate(v, path = "") {
-    if (!(v instanceof Date) || Number.isNaN(v.getTime())) throw err(path, "expected valid Date");
-    return v;
-}
+const err = (path: string, message: string) => new Error(`${path || "value"}: ${message}`);
 
-function isEnum(values) {
+export const isString: ValidatorFn<string> = (value, path = "") => {
+    if (typeof value !== "string") throw err(path, "expected string");
+    return value;
+};
+
+export const isNumber: ValidatorFn<number> = (value, path = "") => {
+    if (typeof value !== "number" || !Number.isFinite(value)) throw err(path, "expected finite number");
+    return value;
+};
+
+export const isInteger: ValidatorFn<number> = (value, path = "") => {
+    if (typeof value !== "number" || !Number.isInteger(value)) throw err(path, "expected integer");
+    return value;
+};
+
+export const isDate: ValidatorFn<Date> = (value, path = "") => {
+    if (!(value instanceof Date) || Number.isNaN(value.getTime())) throw err(path, "expected valid Date");
+    return value;
+};
+
+export function isEnum<T extends string | number | boolean>(values: readonly T[]): ValidatorFn<T> {
     const set = new Set(values);
-    return (v, path = "") => {
-        if (!set.has(v)) throw err(path, `expected one of ${values.map(String).join(", ")}`);
-        return v;
-    };
+    return ((value: unknown, path = "") => {
+        if (!set.has(value as T)) {
+            throw err(path, `expected one of ${values.map(String).join(", ")}`);
+        }
+        return value as T;
+    }) as ValidatorFn<T>;
 }
 
-// ----- Modificateurs / combinators -----
-function optional(validator) {
-    const fn = (v, path = "") => {
-        if (v === undefined) return undefined;
-        return validator(v, path);
-    };
+export function optional<T>(validator: ValidatorFn<T>): ValidatorFn<T | undefined> {
+    const fn = ((value: unknown, path = "") => {
+        if (value === undefined) return undefined;
+        return validator(value, path);
+    }) as ValidatorFn<T | undefined>;
     fn.__optional = true;
     return fn;
 }
 
-function arrayOf(itemValidator) {
-    return (v, path = "") => {
-        if (!Array.isArray(v)) throw err(path, "expected array");
-        return v.map((val, i) => itemValidator(val, `${path}[${i}]`));
-    };
+export function arrayOf<T>(itemValidator: ValidatorFn<T>): ValidatorFn<T[]> {
+    return ((value: unknown, path = "") => {
+        if (!Array.isArray(value)) throw err(path, "expected array");
+        return value.map((val, index) => itemValidator(val, `${path}[${index}]`));
+    }) as ValidatorFn<T[]>;
 }
 
-function recordOf(valueValidator) {
-    return (v, path = "") => {
-        if (!isPlainObject(v)) throw err(path, "expected plain object");
-        const out = {};
-        for (const k of Object.keys(v)) {
-            out[k] = valueValidator(v[k], joinPath(path, k));
+export function recordOf<T>(valueValidator: ValidatorFn<T>): ValidatorFn<Record<string, T>> {
+    return ((value: unknown, path = "") => {
+        if (!isPlainObject(value)) throw err(path, "expected plain object");
+        const out: Record<string, T> = {};
+        for (const key of Object.keys(value)) {
+            out[key] = valueValidator(value[key], joinPath(path, key));
         }
         return out;
-    };
+    }) as ValidatorFn<Record<string, T>>;
 }
 
-// ----- Strict object schema ----
-function objectStrict(shape) {
-    const requiredKeys = [];
-    for (const k of Object.keys(shape)) {
-        const val = shape[k];
-        if (typeof val !== "function") throw new Error(`shape.${k}: validator must be a function`);
-        if (!val.__optional) requiredKeys.push(k);
+type Shape<T> = { [K in keyof T]: ValidatorFn<T[K]> };
+
+export function objectStrict<T extends Record<string, unknown>>(shape: Shape<T>): ValidatorFn<T> {
+    const requiredKeys: string[] = [];
+    for (const key of Object.keys(shape)) {
+        const validator = shape[key as keyof T];
+        if (typeof validator !== "function") throw new Error(`shape.${key}: validator must be a function`);
+        if (!validator.__optional) requiredKeys.push(key);
     }
-    const allKeys = new Set(Object.keys(shape));
 
-    return (v, path = "") => {
-        if (!isPlainObject(v)) throw err(path, "expected plain object");
+    const allowedKeys = new Set(Object.keys(shape));
 
-        for (const k of Object.keys(v)) {
-            if (!allKeys.has(k)) throw err(joinPath(path, k), "unexpected key");
+    return ((value: unknown, path = "") => {
+        if (!isPlainObject(value)) throw err(path, "expected plain object");
+
+        for (const key of Object.keys(value)) {
+            if (!allowedKeys.has(key)) throw err(joinPath(path, key), "unexpected key");
         }
 
-        for (const k of requiredKeys) {
-            if (!(k in v)) throw err(joinPath(path, k), "missing required key");
+        for (const key of requiredKeys) {
+            if (!(key in value)) throw err(joinPath(path, key), "missing required key");
         }
 
-        const out = {};
-        for (const k of Object.keys(shape)) {
-            const validator = shape[k];
-            if (k in v) {
-                out[k] = validator(v[k], joinPath(path, k));
+        const out: Record<string, unknown> = {};
+        for (const key of Object.keys(shape)) {
+            if (key in value) {
+                const validator = shape[key as keyof T];
+                out[key] = validator(value[key], joinPath(path, key));
             }
         }
-        return out;
-    };
+
+        return out as T;
+    }) as ValidatorFn<T>;
 }
 
-// ----- validate(schema, value) -----
-function validate(schema, value) {
+export function validate<T>(schema: ValidatorFn<T>, value: unknown): ValidationResult<T> {
     try {
         const validated = schema(value, "");
         return { ok: true, value: validated, errors: [] };
-    } catch (e) {
-        return { ok: false, value: undefined, errors: [String(e.message || e)] };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ok: false, value: undefined, errors: [message] };
     }
 }
-
-// ----- Exports -----
-module.exports = {
-    validate,
-    objectStrict,
-    arrayOf,
-    recordOf,
-    optional,
-    isString,
-    isNumber,
-    isInteger,
-    isDate,
-    isEnum,
-};

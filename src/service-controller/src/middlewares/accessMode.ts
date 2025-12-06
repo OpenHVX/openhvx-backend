@@ -1,13 +1,16 @@
-// @ts-nocheck
-// middlewares/accessMode.js
-exports.asTenantMode = () => (req, _res, next) => {
+import type { NextFunction, Response } from "express";
+import type { ControllerRequest } from "../types/express";
+
+type Middleware = (req: ControllerRequest, res: Response, next: NextFunction) => void;
+
+export const asTenantMode = (): Middleware => (req, _res, next) => {
     req.enforceTenant = true;
     req.isAdmin = false;
     next();
 };
 
-exports.asAdminMode = () => (req, _res, next) => {
+export const asAdminMode = (): Middleware => (req, _res, next) => {
     req.enforceTenant = false;
-    req.isAdmin = true;     // <-- important
+    req.isAdmin = true;
     next();
 };
