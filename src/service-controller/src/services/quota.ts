@@ -1,7 +1,13 @@
+// Quota service:
+// - keeps tenant quota limits and usage sane
+// - offers holds/reservations to make async tasks safer
+// - recomputes usage from the latest stored inventory + TenantResource links
+// This file tries to be resilient to partial/heterogeneous inventories.
 import type { Types } from "mongoose";
 import Tenant from "../models/Tenant";
-import TenantResource from "../models/TenantResource";
+import TenantResource, { type TenantResourceLink } from "../models/TenantResource";
 import QuotaHold from "../models/quota/hold";
+import InventoryFull from "../models/Inventory.full";
 import type { QuotaDeltas, QuotaKey, QuotaLimits, Quotas } from "../types/domain";
 import { ERR } from "../lib/errors/http-errors";
 import logger from "../lib/logger";
@@ -370,21 +376,25 @@ export async function reapExpiredHolds({ limit = 200 }: { limit?: number } = {})
     return expired.length;
 }
 
+// Local, tolerant view of inventory VMs; we only care about fields needed for quota math
+// and accept multiple key variants because stored inventories may vary over time.
 interface InventoryVm {
     id?: string;
     uuid?: string;
     _id?: string;
     name?: string;
-    cpu?: number;
+    cpu?: number | { vcpus?: number | null };
     vCPU?: number;
     memoryMB?: number;
     memoryMiB?: number;
+    memoryMb?: number;
     disks?: Array<{
         sizeMB?: number;
         sizeMiB?: number;
         sizeGB?: number;
         sizeBytes?: number;
         virtualSizeBytes?: number;
+        size?: number;
     }>;
     storageMB?: number;
     rootDiskMB?: number;
@@ -396,38 +406,82 @@ interface InventoryVm {
     min_ram?: string;
 }
 
+// Local, tolerant view of networks to check ownership/links.
 interface InventoryNetwork {
+    id?: string;
+    name?: string;
     tenantId?: string;
     tenants?: string[];
 }
 
+// Recompute usage by looking at TenantResource links and the latest inventories stored per agent:
+// 1) load VM/switch links for the tenant
+// 2) fetch inventories for the involved agents
+// 3) match links to inventory entries (agentId + refId/name)
+// 4) sum resources; drop links that no longer exist in the inventory
 export async function recalcUsedFromInventory({
     tenantId,
-    fullInventory,
-    tenantResourceLinks,
 }: {
     tenantId: TenantIdentifier;
-    fullInventory: { vms?: InventoryVm[]; networks?: InventoryNetwork[] };
-    tenantResourceLinks?: Record<string, unknown> | Set<string>;
 }) {
     if (!tenantId) throw ERR.validationPre([{ path: "tenantId", message: "required" }]);
-    if (!fullInventory) throw ERR.validationPre([{ path: "fullInventory", message: "required" }]);
 
-    let belongs: (vmId: string) => boolean;
-    if (tenantResourceLinks && typeof tenantResourceLinks === "object") {
-        const set =
-            tenantResourceLinks instanceof Set
-                ? tenantResourceLinks
-                : new Set(Object.keys(tenantResourceLinks));
-        belongs = (vmId) => set.has(String(vmId));
-    } else {
-        const links = await TenantResource.find({ tenantId, kind: "vm" }, { refId: 1 }).lean();
-        const set = new Set(links.map((link) => String(link.refId)));
-        belongs = (vmId) => set.has(String(vmId));
+    const links = await TenantResource.find(
+        { tenantId, kind: { $in: ["vm", "switch"] } },
+        { kind: 1, agentId: 1, refId: 1, name: 1 }
+    ).lean<Array<TenantResourceLink & { _id: Types.ObjectId; name?: string }>>();
+
+    const vmLinks = links.filter((l) => l.kind === "vm");
+    const switchLinks = links.filter((l) => l.kind === "switch");
+
+    const agentIds = Array.from(new Set(links.map((l) => String(l.agentId))));
+    const inventories = agentIds.length
+        ? await InventoryFull.find(
+              { agentId: { $in: agentIds } },
+              { agentId: 1, inventory: 1 }
+          ).lean<Array<{ agentId: string; inventory?: { vms?: InventoryVm[]; networks?: InventoryNetwork[] } }>>()
+        : [];
+
+    const invByAgent = new Map<string, { vms?: InventoryVm[]; networks?: InventoryNetwork[] }>();
+    for (const id of agentIds) invByAgent.set(id, {});
+    for (const doc of inventories) {
+        invByAgent.set(String(doc.agentId), (doc.inventory as { vms?: InventoryVm[]; networks?: InventoryNetwork[] }) || {});
     }
 
-    const vms = Array.isArray(fullInventory?.vms) ? fullInventory.vms : [];
-    const nets = Array.isArray(fullInventory?.networks) ? fullInventory.networks : [];
+    const arr = <T = unknown>(value: unknown): T[] =>
+        Array.isArray(value) ? (value as T[]) : [];
+    const norm = (value: string | number | undefined | null) =>
+        value == null ? "" : String(value).toLowerCase();
+
+    const vmIdxByAgent = new Map<string, Map<string, InventoryVm>>();
+    for (const [agentId, inv] of invByAgent.entries()) {
+        const idx = new Map<string, InventoryVm>();
+        for (const vm of arr<InventoryVm>(inv?.vms)) {
+            const keys = [
+                vm?.id,
+                vm?.uuid,
+                vm?._id,
+                vm?.name,
+            ].filter(Boolean) as string[];
+            keys.forEach((key) => idx.set(norm(key), vm));
+        }
+        vmIdxByAgent.set(agentId, idx);
+    }
+
+    const netIdxByAgent = new Map<string, Map<string, InventoryNetwork>>();
+    for (const [agentId, inv] of invByAgent.entries()) {
+        const idx = new Map<string, InventoryNetwork>();
+        for (const net of arr<InventoryNetwork>(inv?.networks)) {
+            const keys = [
+                net?.id,
+                net?.name,
+                net?.tenantId,
+                ...(Array.isArray(net?.tenants) ? net!.tenants! : []),
+            ].filter(Boolean) as string[];
+            keys.forEach((key) => idx.set(norm(key), net));
+        }
+        netIdxByAgent.set(agentId, idx);
+    }
 
     let cpu = 0;
     let memoryMB = 0;
@@ -435,15 +489,41 @@ export async function recalcUsedFromInventory({
     let vmCount = 0;
     let networkCount = 0;
 
-    for (const vm of vms) {
-        const id = vm?.id || vm?.uuid || vm?._id || vm?.name;
-        if (!id || !belongs(String(id))) continue;
+    let missingVms = 0;
+    let missingNets = 0;
+    const missingVmIds: string[] = [];
+    const missingNetIds: string[] = [];
 
-        const vcpu = Number.isFinite(vm?.cpu) ? (vm.cpu as number) : (Number.isFinite(vm?.vCPU) ? (vm.vCPU as number) : 0);
+    for (const link of vmLinks) {
+        const idx = vmIdxByAgent.get(String(link.agentId)) || new Map<string, InventoryVm>();
+        const wanted = [link.refId, (link as { name?: string }).name].filter(Boolean).map(norm);
+        let vm: InventoryVm | undefined;
+        for (const key of wanted) {
+            if (idx.has(key)) {
+                vm = idx.get(key);
+                break;
+            }
+        }
+        if (!vm) {
+            missingVms++;
+            missingVmIds.push(String(link._id));
+            continue;
+        }
+
+        const vcpu = Number.isFinite(vm?.cpu)
+            ? (vm.cpu as number)
+            : Number.isFinite((vm?.cpu as { vcpus?: number })?.vcpus)
+            ? ((vm?.cpu as { vcpus?: number }).vcpus as number)
+            : Number.isFinite(vm?.vCPU)
+            ? (vm.vCPU as number)
+            : 0;
+
         const mem = Number.isFinite(vm?.memoryMB)
             ? (vm.memoryMB as number)
             : Number.isFinite(vm?.memoryMiB)
             ? (vm.memoryMiB as number)
+            : Number.isFinite(vm?.memoryMb)
+            ? (vm.memoryMb as number)
             : 0;
 
         let vmStorageMB = 0;
@@ -455,6 +535,7 @@ export async function recalcUsedFromInventory({
                 else if (Number.isFinite(disk?.sizeBytes)) vmStorageMB += Math.round((disk!.sizeBytes as number) / 1024 / 1024);
                 else if (Number.isFinite(disk?.virtualSizeBytes))
                     vmStorageMB += Math.round((disk!.virtualSizeBytes as number) / 1024 / 1024);
+                else if (Number.isFinite(disk?.size)) vmStorageMB += Math.round((disk!.size as number) / 1024 / 1024);
             }
         } else if (Number.isFinite(vm?.storageMB)) {
             vmStorageMB = vm.storageMB as number;
@@ -466,11 +547,17 @@ export async function recalcUsedFromInventory({
         vmCount += 1;
     }
 
-    for (const net of nets) {
-        const owned =
-            String(net?.tenantId || "") === String(tenantId) ||
-            (Array.isArray(net?.tenants) && net.tenants.map(String).includes(String(tenantId)));
-        if (owned) networkCount += 1;
+    for (const link of switchLinks) {
+        const idx = netIdxByAgent.get(String(link.agentId)) || new Map<string, InventoryNetwork>();
+        const wanted = [link.refId, (link as { name?: string }).name]
+            .filter(Boolean)
+            .map(norm);
+        const found = wanted.some((key) => idx.has(key));
+        if (found) networkCount += 1;
+        else {
+            missingNets++;
+            missingNetIds.push(String(link._id));
+        }
     }
 
     const used = { cpu, memoryMB, storageMB, vmCount, networkCount };
@@ -484,16 +571,32 @@ export async function recalcUsedFromInventory({
     ).lean();
     if (!tenant) throw ERR.notFound("Tenant not found");
 
-    log.info("recalc used from inventory", { tenantId: tid(tenantId), used });
+    if (missingVmIds.length) await TenantResource.deleteMany({ _id: { $in: missingVmIds } });
+    if (missingNetIds.length) await TenantResource.deleteMany({ _id: { $in: missingNetIds } });
+
+    log.info("recalc used from inventory", {
+        tenantId: tid(tenantId),
+        used,
+        missingVms,
+        missingNetworks: missingNets,
+    });
     return hydrateWithDefaults(tenant.quotas);
 }
 
 export function deltasFromVmSpec(vmSpec: InventoryVm = {}) {
-    const cpu = Math.max(0, (Number.isFinite(vmSpec.cpu) ? vmSpec.cpu : vmSpec.vCPU) || 0);
+    const cpuVal = Number.isFinite(vmSpec.cpu)
+        ? (vmSpec.cpu as number)
+        : Number.isFinite((vmSpec.cpu as { vcpus?: number })?.vcpus)
+        ? ((vmSpec.cpu as { vcpus?: number }).vcpus as number)
+        : Number.isFinite(vmSpec.vCPU)
+        ? (vmSpec.vCPU as number)
+        : 0;
+    const cpu = Math.max(0, cpuVal | 0);
 
     let memory = 0;
     if (Number.isFinite(vmSpec.memoryMB)) memory = vmSpec.memoryMB!;
     else if (Number.isFinite(vmSpec.memoryMiB)) memory = vmSpec.memoryMiB!;
+    else if (Number.isFinite(vmSpec.memoryMb)) memory = vmSpec.memoryMb!;
     else if (vmSpec.ram) memory = parseSizeToMB(vmSpec.ram);
 
     if (vmSpec.dynamic_memory) {

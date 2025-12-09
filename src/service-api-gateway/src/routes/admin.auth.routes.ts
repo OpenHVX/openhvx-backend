@@ -36,5 +36,27 @@ export default ({ AUTH_URL }: RouterOptions) => {
 
     router.post("/register", onlyAdminHost, stripSpoofable, mkProxy(AUTH_URL, () => "/auth/admin/register"));
 
+    router.post(
+        "/pats",
+        onlyAdminHost,
+        stripSpoofable,
+        ensureBearer,
+        mkProxy(AUTH_URL, (origPath) => `/auth/admin${origPath}`),
+    );
+    router.get(
+        "/pats",
+        onlyAdminHost,
+        stripSpoofable,
+        ensureBearer,
+        mkProxy(AUTH_URL, (origPath) => `/auth/admin${origPath}`),
+    );
+    router.delete(
+        "/pats/:patId",
+        onlyAdminHost,
+        stripSpoofable,
+        ensureBearer,
+        mkProxy(AUTH_URL, (origPath) => `/auth/admin${origPath}`),
+    );
+
     return router;
 };

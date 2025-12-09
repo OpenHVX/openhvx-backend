@@ -23,6 +23,7 @@ import {
 import TenantResource from "../models/TenantResource";
 import type { ControllerRequest } from "../types/express";
 import logger from "../lib/logger";
+import { respondEnvelope } from "../middlewares/addEnveloppe";
 
 const log = logger.child(["controller", "tenants"]);
 type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
@@ -42,7 +43,7 @@ export const createTenant: Handler = async (req, res) => {
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
         const norm = normalizeCreate(pre.value!);
         const doc = await Tenant.create(norm);
-        return res.status(201).json({ success: true, data: doc });
+        return respondEnvelope(res.status(201), req, "Tenants", { success: true, data: doc });
     } catch (error: unknown) {
         if ((error as { code?: number })?.code === 11000) {
             return send(res, { status: 409, code: "TENANT_CONFLICT", message: "tenantId already exists" }, req);
@@ -52,12 +53,12 @@ export const createTenant: Handler = async (req, res) => {
     }
 };
 
-export const listTenants: Handler = async (_req, res) => {
+export const listTenants: Handler = async (req, res) => {
     try {
         const rows = await Tenant.find({}, { _id: 0, tenantId: 1, name: 1, status: 1 })
             .sort({ tenantId: 1 })
             .lean();
-        return res.json({ success: true, data: rows });
+        return respondEnvelope(res, req, "Tenants", { success: true, data: rows });
     } catch (error) {
         log.error("tenant.list error", { error });
         return res.status(500).json({ error: "Server error" });
@@ -74,7 +75,7 @@ export const getTenant: Handler = async (req, res) => {
         if (!tenant) {
             return send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
         }
-        return res.json({ success: true, data: tenant });
+        return respondEnvelope(res, req, "Tenants", { success: true, data: tenant });
     } catch (error) {
         log.error("tenant.get error", { error });
         return send(res, ERR.internal(), req);
@@ -108,7 +109,7 @@ export const updateTenant: Handler = async (req, res) => {
         if (!tenant) {
             return send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
         }
-        return res.json({ success: true, data: tenant });
+        return respondEnvelope(res, req, "Tenants", { success: true, data: tenant });
     } catch (error) {
         log.error("tenant.update error", { error });
         return send(res, ERR.internal(), req);
@@ -140,7 +141,7 @@ export const removeTenant: Handler = async (req, res) => {
             return send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
         }
 
-        return res.json({ success: true });
+        return respondEnvelope(res, req, "Tenants", { success: true });
     } catch (error) {
         log.error("tenant.remove error", { error });
         return send(res, ERR.internal(), req);
@@ -156,7 +157,7 @@ export const getQuotas: Handler = async (req, res) => {
         if (!_id) return;
 
         const data = await getTenantQuotas(_id);
-        return res.json({ success: true, data });
+        return respondEnvelope(res, req, "Tenants", { success: true, data });
     } catch (error) {
         log.error("tenant.getQuotas error", { error });
         return send(res, ERR.internal(), req);
@@ -176,7 +177,7 @@ export const patchQuotaLimits: Handler = async (req, res) => {
         if (!_id) return;
 
         const data = await setTenantQuotaLimits(_id, req.body.limits);
-        return res.json({ success: true, data });
+        return respondEnvelope(res, req, "Tenants", { success: true, data });
     } catch (error) {
         log.error("tenant.patchQuotaLimits error", { error });
         return send(res, ERR.internal(), req);
@@ -197,7 +198,7 @@ export const reserveQuotas: Handler = async (req, res) => {
         const result = await holdQuota(_id, body.value!.deltas, req.body.taskId, {
             ttlMs: req.body.ttlMs,
         });
-        return res.json({ success: true, data: result });
+        return respondEnvelope(res, req, "Tenants", { success: true, data: result });
     } catch (error) {
         log.error("tenant.reserveQuotas error", { error });
         return send(res, ERR.internal(), req);
@@ -207,7 +208,7 @@ export const reserveQuotas: Handler = async (req, res) => {
 export const releaseQuotas: Handler = async (req, res) => {
     try {
         await releaseHold(req.body.taskId);
-        return res.json({ success: true });
+        return respondEnvelope(res, req, "Tenants", { success: true });
     } catch (error) {
         log.error("tenant.releaseQuotas error", { error });
         return send(res, ERR.internal(), req);
@@ -222,15 +223,17 @@ export const recalculateQuotas: Handler = async (req, res) => {
         const body = validateRecalcBody(req.body);
         if (!body.ok) return send(res, ERR.validationPre(body.errors), req);
 
+        if (body.value?.tenantId && body.value.tenantId !== params.value!.tenantId) {
+            return send(res, ERR.validationPre([{ path: "tenantId", message: "mismatch with URL" }]), req);
+        }
+
         const _id = await getTenantObjectIdOr404(params.value!.tenantId, req, res);
         if (!_id) return;
 
         const data = await recalcUsedFromInventory({
             tenantId: _id,
-            fullInventory: body.value!.fullInventory,
-            tenantResourceLinks: body.value!.tenantResourceLinks,
         });
-        return res.json({ success: true, data });
+        return respondEnvelope(res, req, "Tenants", { success: true, data });
     } catch (error) {
         log.error("tenant.recalculateQuotas error", { error });
         return send(res, ERR.internal(), req);

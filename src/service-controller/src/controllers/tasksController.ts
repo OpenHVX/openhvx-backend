@@ -1,3 +1,8 @@
+// Tasks controller:
+// - validates and enqueues agent tasks
+// - performs capability + ownership checks
+// - manages quota holds around long-running actions
+// - auto-selects agentId in a few cases (vm.create via election, refId-based via TenantResource)
 import type { Response } from "express";
 import { randomUUID } from "node:crypto";
 import { publishTask, type PublishTaskPayload } from "../services/amqp";
@@ -16,6 +21,7 @@ import {
     holdQuota,
 } from "../services/quota";
 import type { ControllerRequest } from "../types/express";
+import { respondEnvelope } from "../middlewares/addEnveloppe";
 
 type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
 const log = logger.child(["controller", "tasks"]);
@@ -68,11 +74,15 @@ const getTenantIdFromReq = (req: ControllerRequest): string | null => {
 const getTenantIdFromJWT = (req: ControllerRequest) => req?.tenant?.tenantId || req?.tenantId || null;
 
 export const enqueueTask: Handler = async (req, res) => {
+    let action: string | undefined;
+    let agentId: string | undefined;
+    let tenantId: string | null | undefined;
     try {
+        // Parse + validate request ------------------------------------------------
         const admin = !!req.isAdmin;
         const body = (req.body || {}) as Record<string, unknown>;
 
-        const action = String(body.action || "").trim();
+        action = String(body.action || "").trim();
         if (!action) return send(res, ERR.missingAction(), req);
 
         const target = (body.target && typeof body.target === "object" ? body.target : null) as Record<string, unknown> | null;
@@ -89,11 +99,12 @@ export const enqueueTask: Handler = async (req, res) => {
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
         const userData = pre.value as Record<string, unknown>;
 
-        const tenantId = admin ? ((body.tenantId as string) || getTenantIdFromReq(req)) : getTenantIdFromJWT(req);
+        tenantId = admin ? ((body.tenantId as string) || getTenantIdFromReq(req)) : getTenantIdFromJWT(req);
         if (!tenantId) {
             return send(res, admin ? ERR.tenantIdRequiredForAdmin() : ERR.tenantContextMissing(), req);
         }
 
+        // Resolve target agent ---------------------------------------------------
         if (action === "vm.create" && !target.agentId) {
             const freshness = Number(process.env.AGENT_FRESHNESS_SEC || 60);
             const needCap = requiredCapability(action);
@@ -102,7 +113,30 @@ export const enqueueTask: Handler = async (req, res) => {
             body.target = { ...target };
         }
 
-        const agentId = target?.agentId as string | undefined;
+        agentId = target?.agentId as string | undefined;
+        if (!agentId && needsRefId) {
+            // Auto-pick agentId from TenantResource when there is a single match for this refId/kind.
+            const linkQuery: Record<string, unknown> = {
+                refId: target.refId,
+                kind: target.kind,
+            };
+            if (tenantId) linkQuery.tenantId = tenantId;
+            const links = await TenantResource.find(linkQuery, { agentId: 1 })
+                .limit(2)
+                .lean<Array<{ agentId?: string }>>();
+            if (links.length === 1 && links[0].agentId) {
+                agentId = links[0].agentId;
+                target.agentId = agentId;
+                body.target = { ...target };
+                log.debug("auto-selected agentId from TenantResource", {
+                    tenantId,
+                    refId: target.refId,
+                    kind: target.kind,
+                    agentId,
+                });
+            }
+        }
+
         if (!agentId) return send(res, ERR.missingAgentId(), req);
 
         if (!admin && needsRefId) {
@@ -130,6 +164,7 @@ export const enqueueTask: Handler = async (req, res) => {
         const lastSeen = hb.lastSeen ? new Date(hb.lastSeen).getTime() : 0;
         const agentOnline = !!(lastSeen && Date.now() - lastSeen < staleMs);
 
+        // Enrich payload for agent + quota hold if needed ------------------------
         const data: Record<string, unknown> = { ...userData };
         if (needsRefId && !data.id && target.refId) data.id = target.refId;
         type AgentPayload = Record<string, unknown> & { _console?: unknown };
@@ -209,9 +244,16 @@ export const enqueueTask: Handler = async (req, res) => {
         };
         if (consoleMeta) resp.console = consoleMeta;
 
-        return res.status(202).json(resp);
+        return respondEnvelope(res.status(202), req, "Tasks", resp);
     } catch (error) {
-        log.error("enqueueTask error", { error });
+        const err = error as Error;
+        log.error("enqueueTask error", {
+            error: err?.message || err,
+            stack: err?.stack,
+            action,
+            agentId,
+            tenantId,
+        });
         return send(res, ERR.internal(), req);
     }
 };
@@ -224,7 +266,7 @@ export const getTask: Handler = async (req, res) => {
         if (admin) {
             const doc = await Task.findOne({ taskId }).lean();
             if (!doc) return send(res, ERR.taskNotFound(), req);
-            return res.json({ success: true, data: doc });
+            return respondEnvelope(res, req, "Tasks", { success: true, data: doc });
         }
 
         const tenantId = getTenantIdFromJWT(req);
@@ -233,7 +275,7 @@ export const getTask: Handler = async (req, res) => {
         const doc = await Task.findOne({ taskId, tenantId }).lean();
         if (!doc) return send(res, ERR.taskNotFound(), req);
 
-        return res.json({ success: true, data: doc });
+        return respondEnvelope(res, req, "Tasks", { success: true, data: doc });
     } catch (error) {
         log.error("getTask error", { error });
         return send(res, ERR.internal(), req);

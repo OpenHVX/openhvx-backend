@@ -6,6 +6,7 @@ import Tenant from "../models/Tenant";
 import TenantResource from "../models/TenantResource";
 import type { ControllerRequest } from "../types/express";
 import logger from "../lib/logger";
+import { respondEnvelope } from "../middlewares/addEnveloppe";
 
 const ONLINE_THRESHOLD_MS = Number(process.env.AGENT_STALE_MS || 120000);
 
@@ -22,7 +23,17 @@ const latestInventoriesByAgent = async () => {
     return map;
 };
 
-const pickRootDatastore = (ds: Array<{ kind?: string; path?: string; totalBytes?: number; freeBytes?: number; drive?: string }> = []) => {
+const pickRootDatastore = (
+    ds: Array<{
+        kind?: string;
+        path?: string;
+        totalBytes?: number;
+        freeBytes?: number;
+        sizeBytes?: number;
+        free?: number;
+        drive?: string;
+    }> = []
+) => {
     if (!Array.isArray(ds) || ds.length === 0) {
         return { totalBytes: 0, freeBytes: 0, item: null as unknown };
     }
@@ -33,8 +44,8 @@ const pickRootDatastore = (ds: Array<{ kind?: string; path?: string; totalBytes?
     );
     if (root) {
         return {
-            totalBytes: Number(root.totalBytes || 0),
-            freeBytes: Number(root.freeBytes || 0),
+            totalBytes: Number(root.totalBytes ?? root.sizeBytes ?? 0),
+            freeBytes: Number(root.freeBytes ?? root.free ?? 0),
             item: root,
         };
     }
@@ -43,8 +54,8 @@ const pickRootDatastore = (ds: Array<{ kind?: string; path?: string; totalBytes?
         const drive = String(d?.drive || "").toUpperCase();
         if (!drive) continue;
         const current = byDrive.get(drive);
-        const total = Number(d.totalBytes || 0);
-        const free = Number(d.freeBytes || 0);
+        const total = Number(d.totalBytes ?? d.sizeBytes ?? 0);
+        const free = Number(d.freeBytes ?? d.free ?? 0);
         if (!current || total > current.totalBytes) byDrive.set(drive, { totalBytes: total, freeBytes: free, item: d });
     }
     let totalBytes = 0;
@@ -67,7 +78,7 @@ const tasksCountsLast24h = async (filter: Record<string, unknown> = {}) => {
     return { queued, done, error, since };
 };
 
-export const adminOverview: Handler = async (_req, res) => {
+export const adminOverview: Handler = async (req, res) => {
     try {
         const now = Date.now();
         const [hbs, invMap] = await Promise.all([
@@ -97,18 +108,25 @@ export const adminOverview: Handler = async (_req, res) => {
         let dsFreeBytes = 0;
 
         for (const [agentId, doc] of invMap.entries()) {
-            const inv = (doc?.inventory as Record<string, any>)?.inventory || doc?.inventory || {};
+            const inv = (doc?.inventory as Record<string, any>) || {};
             const cores =
-                inv.host?.hypervHost?.logicalProcessors ?? inv.host?.cpu?.logicalProcessors ?? 0;
+                inv.host?.hypervHost?.logicalProcessors ??
+                inv.host?.cpu?.logicalProcessors ??
+                inv.host?.cpu?.threads ??
+                inv.host?.cpu?.cores ??
+                0;
             const hostMemMB =
-                inv.host?.hypervHost?.memoryCapacityMB ?? inv.host?.memMB ?? 0;
+                inv.host?.hypervHost?.memoryCapacityMB ??
+                inv.host?.memMB ??
+                inv.host?.memoryMb ??
+                0;
             cpuCores += Number(cores || 0);
             memMB += Number(hostMemMB || 0);
 
             const vms = inv.vms || [];
             vmsTotal += vms.length;
             for (const vm of vms) {
-                const state = String(vm.state || "Unknown");
+                const state = String(vm.state || vm.powerState || "Unknown");
                 vmStates[state] = (vmStates[state] || 0) + 1;
             }
 
@@ -120,7 +138,8 @@ export const adminOverview: Handler = async (_req, res) => {
 
         const tasks = await tasksCountsLast24h();
 
-        return res.json({
+        return respondEnvelope(res, req, "Quota", {
+            success: true,
             agents,
             tenants,
             vms: { total: vmsTotal, byState: vmStates },
@@ -135,7 +154,7 @@ export const adminOverview: Handler = async (_req, res) => {
     }
 };
 
-export const adminDatastores: Handler = async (_req, res) => {
+export const adminDatastores: Handler = async (req, res) => {
     try {
         const invMap = await latestInventoriesByAgent();
         const byAgent: Array<Record<string, unknown>> = [];
@@ -156,14 +175,20 @@ export const adminDatastores: Handler = async (_req, res) => {
             });
         }
 
-        return res.json({ totalBytes, freeBytes, byAgent, ts: new Date().toISOString() });
+        return respondEnvelope(res, req, "Quota", {
+            success: true,
+            totalBytes,
+            freeBytes,
+            byAgent,
+            ts: new Date().toISOString(),
+        });
     } catch (error) {
         log.error("[metrics] adminDatastores", { error });
         return res.status(500).json({ error: "metrics failed" });
     }
 };
 
-export const adminCompute: Handler = async (_req, res) => {
+export const adminCompute: Handler = async (req, res) => {
     try {
         const invMap = await latestInventoriesByAgent();
         const rows: Array<Record<string, unknown>> = [];
@@ -171,11 +196,18 @@ export const adminCompute: Handler = async (_req, res) => {
         let memMB = 0;
 
         for (const [agentId, doc] of invMap.entries()) {
-            const inv = (doc?.inventory as Record<string, any>)?.inventory || doc?.inventory || {};
+            const inv = (doc?.inventory as Record<string, any>) || {};
             const cores =
-                inv.host?.hypervHost?.logicalProcessors ?? inv.host?.cpu?.logicalProcessors ?? 0;
+                inv.host?.hypervHost?.logicalProcessors ??
+                inv.host?.cpu?.logicalProcessors ??
+                inv.host?.cpu?.threads ??
+                inv.host?.cpu?.cores ??
+                0;
             const hostMemMB =
-                inv.host?.hypervHost?.memoryCapacityMB ?? inv.host?.memMB ?? 0;
+                inv.host?.hypervHost?.memoryCapacityMB ??
+                inv.host?.memMB ??
+                inv.host?.memoryMb ??
+                0;
             cpuCores += Number(cores || 0);
             memMB += Number(hostMemMB || 0);
 
@@ -187,7 +219,8 @@ export const adminCompute: Handler = async (_req, res) => {
             });
         }
 
-        return res.json({
+        return respondEnvelope(res, req, "Quota", {
+            success: true,
             total: { cpuCores, memMB },
             byAgent: rows,
             ts: new Date().toISOString(),
@@ -198,28 +231,30 @@ export const adminCompute: Handler = async (_req, res) => {
     }
 };
 
-export const adminVMs: Handler = async (_req, res) => {
+export const adminVMs: Handler = async (req, res) => {
     try {
         const invMap = await latestInventoriesByAgent();
         const rows: Array<Record<string, unknown>> = [];
 
         for (const [agentId, doc] of invMap.entries()) {
-            const inv = (doc?.inventory as Record<string, any>)?.inventory || doc?.inventory || {};
+            const inv = (doc?.inventory as Record<string, any>) || {};
             const vms = inv.vms || [];
             rows.push({ agentId, vms });
         }
 
-        return res.json({ rows, ts: new Date().toISOString() });
+        return respondEnvelope(res, req, "Quota", { success: true, rows, ts: new Date().toISOString() });
     } catch (error) {
         log.error("[metrics] adminComputeVms", { error });
         return res.status(500).json({ error: "metrics failed" });
     }
 };
 
-export const adminTenantOverview: Handler = async (_req, res) => {
+export const adminTenantOverview: Handler = async (req, res) => {
     try {
-        const tenants = await Tenant.find({}, { tenantId: 1, name: 1, quotas: 1 }).lean();
-        return res.json({ success: true, data: tenants });
+        const tenantId = (req.query?.tenantId as string | undefined)?.trim();
+        const filter = tenantId ? { tenantId } : {};
+        const tenants = await Tenant.find(filter, { tenantId: 1, name: 1, quotas: 1 }).lean();
+        return respondEnvelope(res, req, "Quota", { success: true, data: tenants });
     } catch (error) {
         log.error("[metrics] adminTenantOverview", { error });
         return res.status(500).json({ error: "metrics failed" });
@@ -236,7 +271,7 @@ export const tenantOverview: Handler = async (req, res) => {
             TenantResource.countDocuments({ tenantId }),
         ]);
 
-        return res.json({
+        return respondEnvelope(res, req, "Quota", {
             success: true,
             data: {
                 tasks: tasksSummary,

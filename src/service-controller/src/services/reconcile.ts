@@ -1,3 +1,8 @@
+// Not used today, but kept for possible future use.
+// Reconcile service:
+// - compares TenantResource VM links with the latest inventories (full + light) per agent
+// - removes links whose refId/name no longer appear in the agent inventory
+// - can run for a single tenant/agent or for all tenants of an agent
 import TenantResource from "../models/TenantResource";
 import InventoryFull from "../models/Inventory.full";
 import InventoryLight from "../models/Inventory.light";
@@ -5,7 +10,6 @@ import type { InventorySnapshot } from "../models/types";
 import type { TenantResourceLink } from "../models/TenantResource";
 
 type InventoryVm = {
-    guid?: string;
     id?: string;
     name?: string;
 };
@@ -14,19 +18,22 @@ type InventoryRoot = {
     vms?: InventoryVm[];
 };
 
+// Defensively handle possibly missing/partial inventories.
 const arr = <T = unknown>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
 
-const root = (doc?: InventorySnapshot | null): InventoryRoot =>
-    (doc?.inventory?.inventory || doc?.inventory || {}) as InventoryRoot;
+const root = (doc?: InventorySnapshot | null): InventoryRoot => {
+    const inv = doc?.inventory as InventoryRoot | undefined;
+    if (inv && typeof inv === "object" && Object.keys(inv).length) return inv as InventoryRoot;
+    return {} as InventoryRoot;
+};
 
 const canon = (value?: string | null) =>
     typeof value === "string" ? value.trim().toLowerCase() : "";
 
 const vmKeys = (vm: InventoryVm) => {
     const keys: string[] = [];
-    if (vm?.guid) keys.push(String(vm.guid));
-    if (vm?.id && vm.id !== vm.guid) keys.push(String(vm.id));
-    if (vm?.name && vm.name !== vm.guid && vm.name !== vm.id) keys.push(String(vm.name));
+    if (vm?.id) keys.push(String(vm.id));
+    if (vm?.name && vm.name !== vm.id) keys.push(String(vm.name));
     return keys;
 };
 
@@ -54,6 +61,7 @@ export interface ReconcileResult {
 }
 
 export async function reconcileTenantAgentVMs({ tenantId, agentId }: { tenantId: string; agentId: string }): Promise<ReconcileResult> {
+    // Build a set of VM identifiers currently present in inventory (id and/or name).
     const presentKeys = await buildPresentKeySet(agentId);
     const links = await TenantResource.find(
         { tenantId, agentId, kind: "vm" },

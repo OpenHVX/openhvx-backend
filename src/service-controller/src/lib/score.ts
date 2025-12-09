@@ -1,11 +1,14 @@
 interface InventoryVm {
     state?: string | null;
+    powerState?: string | null;
     configuration?: {
         processors?: {
             count?: number | null;
         };
     };
+    cpu?: { vcpus?: number | null };
     memoryAssignedMB?: number | null;
+    memoryMb?: number | null;
 }
 
 interface InventoryHost {
@@ -15,43 +18,59 @@ interface InventoryHost {
     };
     cpu?: {
         logicalProcessors?: number;
+        sockets?: number | null;
+        cores?: number | null;
+        threads?: number | null;
+        [key: string]: unknown;
     };
     memMB?: number;
+    memoryMb?: number;
+    [key: string]: unknown;
 }
 
 interface InventoryDatastore {
+    id?: string | null;
     kind?: string | null;
     path?: string | null;
     drive?: string | null;
     totalBytes?: number | null;
     freeBytes?: number | null;
+    sizeBytes?: number | null;
+    free?: number | null;
 }
 
 type InventoryDoc = {
-    inventory?: {
-        inventory?: {
-            host?: InventoryHost;
-            vms?: InventoryVm[];
-            datastores?: InventoryDatastore[];
-        };
-        datastores?: InventoryDatastore[];
-    };
-};
+    inventory?: Record<string, unknown> | null;
+} | null;
 
 export interface ScoreResult {
     score: number;
 }
 
+// Simple helpers to score agent capacity from a canonical inventory snapshot.
 const roundTo = (value: number, decimals = 3) => {
     const factor = 10 ** decimals;
     return Math.round(value * factor) / factor;
 };
 
-const runningVm = (vm: InventoryVm) => String(vm.state || "").toLowerCase() === "running";
+const extractRoot = (inv?: InventoryDoc | null) => {
+    const payload = inv?.inventory;
+    if (!payload || typeof payload !== "object") return {};
+    return {
+        host: (payload as { host?: InventoryHost }).host,
+        vms: (payload as { vms?: InventoryVm[] }).vms,
+        datastores: (payload as { datastores?: InventoryDatastore[] }).datastores,
+    };
+};
 
-export async function cpuScore(inv: InventoryDoc | null | undefined): Promise<ScoreResult> {
-    const host = inv?.inventory?.inventory?.host;
-    const vms = inv?.inventory?.inventory?.vms ?? [];
+const runningVm = (vm: InventoryVm) =>
+    String(vm.state || vm.powerState || "").toLowerCase() === "running";
+
+export async function cpuScore(inv: unknown): Promise<ScoreResult> {
+    // CPU score = ratio of assigned vCPUs of running VMs to host logical CPUs (clamped 0-1).
+    const r = extractRoot(inv as InventoryDoc | null);
+    const host = r.host;
+    const vms = r.vms ?? [];
 
     const totalLogicalCPU =
         host?.hypervHost?.logicalProcessors ??
@@ -60,7 +79,7 @@ export async function cpuScore(inv: InventoryDoc | null | undefined): Promise<Sc
 
     const assignedVcpu = vms.reduce((sum, vm) => {
         if (!runningVm(vm)) return sum;
-        const count = vm.configuration?.processors?.count ?? 0;
+        const count = vm.cpu?.vcpus ?? vm.configuration?.processors?.count ?? 0;
         return sum + count;
     }, 0);
 
@@ -69,18 +88,21 @@ export async function cpuScore(inv: InventoryDoc | null | undefined): Promise<Sc
     return { score };
 }
 
-export async function memScore(inv: InventoryDoc | null | undefined): Promise<ScoreResult> {
-    const host = inv?.inventory?.inventory?.host;
-    const vms = inv?.inventory?.inventory?.vms ?? [];
+export async function memScore(inv: unknown): Promise<ScoreResult> {
+    // Memory score = ratio of assigned memory on running VMs to host capacity (clamped 0-1).
+    const r = extractRoot(inv as InventoryDoc | null);
+    const host = r.host;
+    const vms = r.vms ?? [];
 
     const totalMemMB =
         host?.hypervHost?.memoryCapacityMB ??
         host?.memMB ??
+        host?.memoryMb ??
         0;
 
     const assignedMemMB = vms.reduce((sum, vm) => {
         if (!runningVm(vm)) return sum;
-        return sum + (vm.memoryAssignedMB ?? 0);
+        return sum + (vm.memoryAssignedMB ?? vm.memoryMb ?? 0);
     }, 0);
 
     const ratio = totalMemMB > 0 ? assignedMemMB / totalMemMB : Infinity;
@@ -88,11 +110,10 @@ export async function memScore(inv: InventoryDoc | null | undefined): Promise<Sc
     return { score };
 }
 
-export async function storageScore(inv: InventoryDoc | null | undefined): Promise<ScoreResult> {
-    const datastores =
-        inv?.inventory?.datastores ??
-        inv?.inventory?.inventory?.datastores ??
-        [];
+export async function storageScore(inv: unknown): Promise<ScoreResult> {
+    // Storage score = ratio of used bytes on the root datastore (clamped 0-1).
+    const r = extractRoot(inv as InventoryDoc | null);
+    const datastores = r.datastores ?? [];
 
     const roots = datastores.filter((d) => d?.kind === "root");
 
@@ -103,9 +124,9 @@ export async function storageScore(inv: InventoryDoc | null | undefined): Promis
         throw new Error(`Multiple root datastores found (${roots.length}) for this agent`);
     }
 
-    const root = roots[0];
-    const totalBytes = Number(root?.totalBytes ?? 0);
-    const freeBytes = Number(root?.freeBytes ?? 0);
+    const rootDs = roots[0];
+    const totalBytes = Number(rootDs?.totalBytes ?? rootDs?.sizeBytes ?? 0);
+    const freeBytes = Number(rootDs?.freeBytes ?? rootDs?.free ?? 0);
     const usedBytes = Math.max(0, totalBytes - freeBytes);
 
     const ratio = totalBytes > 0 ? usedBytes / totalBytes : Infinity;

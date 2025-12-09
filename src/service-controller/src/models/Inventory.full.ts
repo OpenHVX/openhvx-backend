@@ -1,3 +1,4 @@
+//models/Inventory.full.ts
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import type { InventorySnapshot } from "./types";
 

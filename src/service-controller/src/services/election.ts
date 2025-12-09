@@ -43,7 +43,7 @@ export async function election(requirements: ElectionRequirements): Promise<stri
 
     const scoredAgents: ScoredAgent[] = await Promise.all(
         eligible.map(async (agent) => {
-            const inv = await Inventory.findOne({ agentId: agent.agentId }).lean();
+            const inv = (await Inventory.findOne({ agentId: agent.agentId }).lean()) as unknown;
             const scores = {
                 mem: await memScore(inv),
                 cpu: await cpuScore(inv),

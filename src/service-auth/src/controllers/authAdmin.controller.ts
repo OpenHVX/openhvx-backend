@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 const User = require('../models/user.base.model');       // base model (discriminatorKey: 'kind')
 const UserAdmin = require('../models/user.admin.model'); // discriminator 'admin'
 const { signAdmin, cfg } = require('../lib/jwt');
+const { mintPat, verifyPatToken, listPatsForUser, revokePat } = require('../lib/pat');
 
 const REGISTER_ENABLED = process.env.REGISTER_ENABLED === 'true';
 const REGISTER_API_KEY = process.env.REGISTER_API_KEY || '';
@@ -45,6 +46,37 @@ function publicUser(u) {
         createdAt: u.createdAt,
         updatedAt: u.updatedAt,
     };
+}
+
+function bearerToken(req) {
+    const h = req.get('authorization') || '';
+    return h.startsWith('Bearer ') ? h.slice(7) : null;
+}
+
+function expFromPat(pat) {
+    if (pat?.expiresAt instanceof Date) return Math.floor(pat.expiresAt.getTime() / 1000);
+    return Math.floor(Date.now() / 1000) + 300; // short-lived cache for non-expiring PATs
+}
+
+async function resolveAdminAuth(token) {
+    if (!token) return null;
+    try {
+        const decoded = jwt.verify(token, cfg.admin.secret, {
+            issuer: cfg.admin.iss,
+            audience: cfg.admin.aud,
+        });
+        const user = await UserAdmin.findById(decoded.sub)
+            .select('email username roles scopes createdAt updatedAt isActive')
+            .lean();
+        if (!user || user.isActive === false) return null;
+        return { source: 'jwt', user, decoded };
+    } catch {
+        /* fall through to PAT */
+    }
+
+    const pat = await verifyPatToken({ token, kind: 'admin' });
+    if (pat) return { source: 'pat', user: pat.user, pat: pat.pat };
+    return null;
 }
 
 function resolveRegisterMode(req) {
@@ -110,30 +142,26 @@ exports.login = async (req, res) => {
 exports.introspect = async (req, res) => {
     const rid = ridOf(req);
     try {
-        let token = req.body?.token;
-        if (!token) {
-            const h = req.get('authorization') || '';
-            token = h.startsWith('Bearer ') ? h.slice(7) : null;
-        }
+        const token = req.body?.token || bearerToken(req);
         if (!token) return res.status(400).json({ active: false, error: 'missing token' });
 
-        try {
-            const decoded = jwt.verify(token, cfg.admin.secret, {
-                issuer: cfg.admin.iss,
-                audience: cfg.admin.aud,
-            });
-            return res.json({
-                active: true,
-                sub: decoded.sub,
-                roles: decoded.roles || [],
-                scopes: decoded.scopes || [],
-                exp: decoded.exp,
-                iss: decoded.iss,
-                aud: decoded.aud,
-            });
-        } catch {
-            return res.json({ active: false });
-        }
+        const resolved = await resolveAdminAuth(token);
+        if (!resolved) return res.json({ active: false });
+
+        const roles = resolved.user.roles || [];
+        const scopes = resolved.user.scopes || [];
+        const exp = resolved.source === 'jwt' ? resolved.decoded?.exp : expFromPat(resolved.pat);
+
+        return res.json({
+            active: true,
+            sub: String(resolved.user._id),
+            roles,
+            scopes,
+            exp,
+            iss: cfg.admin.iss,
+            aud: cfg.admin.aud,
+            token_type: resolved.source,
+        });
     } catch (e) {
         console.error(`[auth][${rid}] introspect: error`, e);
         return res.status(500).json({ active: false, error: e.message });
@@ -147,24 +175,10 @@ exports.introspect = async (req, res) => {
 exports.me = async (req, res) => {
     const rid = ridOf(req);
     try {
-        const h = req.get('authorization') || '';
-        const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-        if (!token) return res.status(401).json({ error: 'missing bearer token' });
+        const resolved = await resolveAdminAuth(bearerToken(req));
+        if (!resolved) return res.status(401).json({ error: 'invalid or missing token' });
 
-        let decoded;
-        try {
-            decoded = jwt.verify(token, cfg.admin.secret, {
-                issuer: cfg.admin.iss,
-                audience: cfg.admin.aud,
-            });
-        } catch {
-            return res.status(401).json({ error: 'invalid token' });
-        }
-
-        const user = await UserAdmin.findById(decoded.sub).lean();
-        if (!user) return res.status(404).json({ error: 'user not found' });
-
-        return res.json(publicUser(user));
+        return res.json(publicUser(resolved.user));
     } catch (e) {
         console.error(`[auth][${rid}] me: error`, e);
         return res.status(500).json({ error: e.message });
@@ -178,27 +192,19 @@ exports.me = async (req, res) => {
 exports.userinfo = async (req, res) => {
     const rid = ridOf(req);
     try {
-        const h = req.get('authorization') || '';
-        const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-        if (!token) return res.status(401).json({ error: 'missing bearer token' });
+        const resolved = await resolveAdminAuth(bearerToken(req));
+        if (!resolved) return res.status(401).json({ error: 'invalid or missing token' });
 
-        let decoded;
-        try {
-            decoded = jwt.verify(token, cfg.admin.secret, {
-                issuer: cfg.admin.iss,
-                audience: cfg.admin.aud,
-            });
-        } catch {
-            return res.status(401).json({ error: 'invalid token' });
-        }
+        const exp = resolved.source === 'jwt' ? resolved.decoded?.exp : expFromPat(resolved.pat);
 
         return res.json({
-            sub: decoded.sub,
-            roles: decoded.roles || [],
-            scopes: decoded.scopes || [],
-            exp: decoded.exp,
-            iss: decoded.iss,
-            aud: decoded.aud,
+            sub: String(resolved.user._id),
+            roles: resolved.user.roles || [],
+            scopes: resolved.user.scopes || [],
+            exp,
+            iss: cfg.admin.iss,
+            aud: cfg.admin.aud,
+            token_type: resolved.source,
         });
     } catch (e) {
         console.error(`[auth][${rid}] userinfo: error`, e);
@@ -277,6 +283,92 @@ exports.register = async (req, res) => {
             return res.status(409).json({ error: 'DuplicateKey', details: e.keyValue });
         }
         console.error(`[auth][${rid}] register: error`, e);
+        return res.status(500).json({ error: e.message });
+    }
+};
+
+/**
+ * POST /auth/admin/pats
+ * header: Authorization: Bearer <admin>
+ * body: { label?: string, expiresInDays?: number }
+ */
+exports.createPat = async (req, res) => {
+    const rid = ridOf(req);
+    try {
+        const resolved = await resolveAdminAuth(bearerToken(req));
+        if (!resolved) return res.status(401).json({ error: 'invalid or missing token' });
+
+        const { label = null, expiresInDays = null } = req.body || {};
+        const expiresNum = Number.isFinite(Number(expiresInDays)) ? Number(expiresInDays) : null;
+
+        const { token, pat } = await mintPat({
+            user: resolved.user,
+            kind: 'admin',
+            label,
+            expiresInDays: expiresNum,
+        });
+
+        return res.status(201).json({
+            token,
+            pat: {
+                id: String(pat._id),
+                label: pat.label,
+                createdAt: pat.createdAt,
+                expiresAt: pat.expiresAt,
+                lastUsedAt: pat.lastUsedAt,
+            },
+        });
+    } catch (e) {
+        console.error(`[auth][${rid}] createPat: error`, e);
+        return res.status(500).json({ error: e.message });
+    }
+};
+
+/**
+ * GET /auth/admin/pats
+ * header: Authorization: Bearer <admin>
+ */
+exports.listPats = async (req, res) => {
+    const rid = ridOf(req);
+    try {
+        const resolved = await resolveAdminAuth(bearerToken(req));
+        if (!resolved) return res.status(401).json({ error: 'invalid or missing token' });
+
+        const rows = await listPatsForUser({ userId: resolved.user._id, kind: 'admin' });
+        return res.json({
+            pats: rows.map((p) => ({
+                id: String(p._id),
+                label: p.label,
+                createdAt: p.createdAt,
+                expiresAt: p.expiresAt,
+                lastUsedAt: p.lastUsedAt,
+            })),
+        });
+    } catch (e) {
+        console.error(`[auth][${rid}] listPats: error`, e);
+        return res.status(500).json({ error: e.message });
+    }
+};
+
+/**
+ * DELETE /auth/admin/pats/:patId
+ * header: Authorization: Bearer <admin>
+ */
+exports.revokePat = async (req, res) => {
+    const rid = ridOf(req);
+    try {
+        const resolved = await resolveAdminAuth(bearerToken(req));
+        if (!resolved) return res.status(401).json({ error: 'invalid or missing token' });
+
+        const patId = req.params?.patId;
+        if (!patId) return res.status(400).json({ error: 'patId required' });
+
+        const ok = await revokePat({ userId: resolved.user._id, kind: 'admin', patId });
+        if (!ok) return res.status(404).json({ error: 'pat not found' });
+
+        return res.json({ ok: true });
+    } catch (e) {
+        console.error(`[auth][${rid}] revokePat: error`, e);
         return res.status(500).json({ error: e.message });
     }
 };

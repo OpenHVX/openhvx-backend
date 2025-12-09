@@ -1,5 +1,6 @@
 import type { Response } from "express";
 import type { ControllerRequest } from "../../types/express";
+import { envelope, scopeForReq } from "../../middlewares/addEnveloppe";
 
 export interface HttpErrorPayload {
     status: number;
@@ -23,13 +24,15 @@ export function send(res: Response, err: HttpErrorPayload, req?: ControllerReque
         undefined;
 
     const status = err.status || 500;
-    return res.status(status).json({
+    const kind = (req as { envelopeKind?: string } | undefined)?.envelopeKind || "Errors";
+    const scope = req ? scopeForReq(req) : "tenant";
+    return res.status(status).json(envelope(scope, kind, {
         ok: false,
         code: err.code || "INTERNAL_ERROR",
         message: err.message || "Internal server error",
         ...(err.details !== undefined ? { details: err.details } : {}),
         ...(traceId ? { traceId } : {}),
-    });
+    }));
 }
 
 export const ERR = {

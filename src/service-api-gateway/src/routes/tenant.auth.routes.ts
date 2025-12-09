@@ -42,6 +42,28 @@ export default ({ AUTH_URL }: RouterOptions) => {
     );
 
     router.post(
+        "/pats",
+        onlyTenantHost,
+        stripSpoofable,
+        ensureBearer,
+        mkProxy(AUTH_URL, (origPath) => `/auth/tenant${origPath}`),
+    );
+    router.get(
+        "/pats",
+        onlyTenantHost,
+        stripSpoofable,
+        ensureBearer,
+        mkProxy(AUTH_URL, (origPath) => `/auth/tenant${origPath}`),
+    );
+    router.delete(
+        "/pats/:patId",
+        onlyTenantHost,
+        stripSpoofable,
+        ensureBearer,
+        mkProxy(AUTH_URL, (origPath) => `/auth/tenant${origPath}`),
+    );
+
+    router.post(
         "/introspect",
         onlyTenantHost,
         stripSpoofable,
