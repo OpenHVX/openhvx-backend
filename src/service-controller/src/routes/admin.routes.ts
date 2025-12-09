@@ -63,7 +63,6 @@ router.get("/metrics/compute", adminCompute);
 router.get("/metrics/datastores", adminDatastores);
 router.get("/metrics/vms", adminVMs);
 router.get("/metrics/tenant/overview", adminTenantOverview);
-
 router.get("/images", listImages);
 router.get("/images/:imageId", getImage);
 router.get("/images/:imageId/resolve", resolveImage);

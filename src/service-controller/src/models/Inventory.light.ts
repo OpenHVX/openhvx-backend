@@ -1,5 +1,6 @@
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import type { InventorySnapshot } from "./types";
+import InventoryFull from "./Inventory.full"
 
 export type InventoryLightDocument = HydratedDocument<InventorySnapshot>;
 

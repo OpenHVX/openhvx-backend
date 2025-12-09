@@ -31,6 +31,30 @@ type Registry = Record<string, Record<string, EnrichHandler>>;
 
 const registry: Registry = {};
 
+const normalizeAction = (action?: string) => String(action || "").trim();
+const normalizeOperation = (operation?: string) => String(operation || "").trim();
+
+const resolveRefId = (object: EnrichPayload, ctx?: EnrichContext) =>
+    (object.refId as string) || (object.vmId as string) || ctx?.refId || (ctx?.vm?._id as string) || "";
+
+const requireRefId = (object: EnrichPayload, ctx?: EnrichContext) => {
+    const refId = resolveRefId(object, ctx);
+    if (!refId) throw new Error("refId/vmId is required");
+    return refId;
+};
+
+const requireTarget = (object: EnrichPayload): Target => {
+    const targetCandidate = object.target as { ip?: string; port?: number } | undefined;
+    const target: Target = {
+        ip: targetCandidate?.ip || "",
+        port: targetCandidate?.port ?? 0,
+    };
+    if (!target.ip || !target.port) {
+        throw new Error("target.ip and target.port are required");
+    }
+    return target;
+};
+
 const ensureImagePath = async (object: EnrichPayload) => {
     if (object.imagePath || !object.imageId) return { ...object };
     const result = await resolvePath(object.imageId as string);
@@ -55,8 +79,7 @@ const vmDetermineImage: EnrichHandler = async ({ object }) => {
 };
 
 const consoleSerialAuto: EnrichHandler = async ({ object, ctx }) => {
-    const refId = (object.refId as string) || (object.vmId as string) || ctx?.refId || (ctx?.vm?._id as string);
-    if (!refId) throw new Error("refId/vmId is required");
+    const refId = requireRefId(object, ctx);
 
     const { agentData, ui } = await planSerialOpen({
         refId,
@@ -70,16 +93,8 @@ const consoleSerialAuto: EnrichHandler = async ({ object, ctx }) => {
 };
 
 const netTunnelAuto: EnrichHandler = async ({ object, ctx }) => {
-    const refId = (object.refId as string) || (object.vmId as string) || ctx?.refId || (ctx?.vm?._id as string);
-    if (!refId) throw new Error("refId/vmId is required");
-    const targetCandidate = object.target as { ip?: string; port?: number } | undefined;
-    const target: Target = {
-        ip: targetCandidate?.ip || "",
-        port: targetCandidate?.port ?? 0,
-    };
-    if (!target?.ip || !target?.port) {
-        throw new Error("target.ip and target.port are required");
-    }
+    const refId = requireRefId(object, ctx);
+    const target = requireTarget(object);
 
     const { agentData, ui } = await planNetTunnelOpen({
         refId,
@@ -95,26 +110,31 @@ const netTunnelAuto: EnrichHandler = async ({ object, ctx }) => {
 };
 
 const registerDefaultHandlers = () => {
-    register("vm.create", "auto", vmCreateAuto);
-    register("vm.create", "determineImage", vmDetermineImage);
-    register("vm.clone", "auto", vmCreateAuto);
-    register("vm.clone", "determineImage", vmDetermineImage);
-    register("vm.edit", "auto", async ({ object }) => ({ ...object }));
-    register("console.serial.open", "auto", consoleSerialAuto);
-    register("net.tunnel.open", "auto", netTunnelAuto);
+    const defaults: Array<{ action: string; operation: string; handler: EnrichHandler }> = [
+        { action: "vm.create", operation: "auto", handler: vmCreateAuto },
+        { action: "vm.create", operation: "determineImage", handler: vmDetermineImage },
+        { action: "vm.clone", operation: "auto", handler: vmCreateAuto },
+        { action: "vm.clone", operation: "determineImage", handler: vmDetermineImage },
+        { action: "vm.edit", operation: "auto", handler: async ({ object }) => ({ ...object }) },
+        { action: "console.serial.open", operation: "auto", handler: consoleSerialAuto },
+        { action: "net.tunnel.open", operation: "auto", handler: netTunnelAuto },
+    ];
+
+    defaults.forEach(({ action, operation, handler }) => register(action, operation, handler));
 };
 
 registerDefaultHandlers();
 
 export async function enrich(action: string, opts: EnrichOptions): Promise<EnrichResponse> {
-    const act = String(action || "");
+    const act = normalizeAction(action);
     if (!act) return { ok: false, error: "action is required" };
     if (!opts || typeof opts !== "object") return { ok: false, error: "opts must be an object" };
 
-    const operation = String(opts.operation || "");
+    const operation = normalizeOperation(opts.operation);
     const { object, ctx } = opts;
+
     if (!operation) return { ok: false, error: "opts.operation is required" };
-    if (!object) return { ok: false, error: "opts.object is required" };
+    if (!object || typeof object !== "object") return { ok: false, error: "opts.object is required" };
 
     const ops = registry[act];
     if (!ops) return { ok: false, error: `unsupported action: ${act}` };

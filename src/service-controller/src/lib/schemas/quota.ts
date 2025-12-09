@@ -123,34 +123,11 @@ const netItemLoose = (value: unknown): value is NetworkItemLoose => {
 };
 
 export interface RecalcBody extends Record<string, unknown> {
-    tenantId: string;
-    fullInventory: {
-        vms?: VmItemLoose[];
-        networks?: NetworkItemLoose[];
-    };
-    tenantResourceLinks?: Record<string, unknown>;
+    tenantId?: string;
 }
 
 const recalcBody = objectStrict<RecalcBody>({
-    tenantId: idStr,
-    fullInventory: objectStrict({
-        vms: optional((value) => {
-            if (!Array.isArray(value) || !value.every(vmItemLoose)) {
-                throw new Error("fullInventory.vms: invalid payload");
-            }
-            return value;
-        }),
-        networks: optional((value) => {
-            if (!Array.isArray(value) || !value.every(netItemLoose)) {
-                throw new Error("fullInventory.networks: invalid payload");
-            }
-            return value;
-        }),
-    }),
-    tenantResourceLinks: optional((value) => {
-        if (typeof value !== "object" || value == null) throw new Error("tenantResourceLinks: must be object");
-        return value as Record<string, unknown>;
-    }),
+    tenantId: optional(idStr),
 });
 
 export function validatePatchLimits(body: unknown): ValidationResult<{ limits: QuotaLimits }> {

@@ -3,6 +3,7 @@ import Heartbeat from "../models/Heartbeat";
 import Inventory from "../models/Inventory.full";
 import type { ControllerRequest } from "../types/express";
 import logger from "../lib/logger";
+import { respondEnvelope, scopeForReq } from "../middlewares/addEnveloppe";
 
 const ONLINE_THRESHOLD_MS = parseInt(process.env.AGENT_ONLINE_THRESHOLD_MS || "90000", 10);
 
@@ -24,14 +25,17 @@ export const getStatus: ControllerHandler = async (req, res) => {
         if (!doc) return res.status(404).json({ error: "Not found" });
 
         const online = isOnline(doc.lastSeen);
-        return res.json({
-            id: doc.agentId,
-            host: doc.host,
-            capabilities: doc.capabilities,
-            version: doc.version || null,
-            status: online ? "online" : "offline",
-            heartbeatOk: online,
-            lastHeartbeat: doc.lastSeen || null,
+        return respondEnvelope(res, req, "Agents", {
+            success: true,
+            data: {
+                id: doc.agentId,
+                host: doc.host,
+                capabilities: doc.capabilities,
+                version: doc.version || null,
+                status: online ? "online" : "offline",
+                heartbeatOk: online,
+                lastHeartbeat: doc.lastSeen || null,
+            },
         });
     } catch (error) {
         log.error("getAgentStatus error", { error });
@@ -44,7 +48,7 @@ export const getInventory: ControllerHandler = async (req, res) => {
         const { agentId } = req.params;
         const inv = await Inventory.findOne({ agentId }).lean();
         if (!inv) return res.status(404).json({ error: "Not found" });
-        return res.json({ success: true, data: inv });
+        return respondEnvelope(res, req, "Agents", { success: true, data: inv });
     } catch (error) {
         log.error("getInventory error", { error });
         return res.status(500).json({ error: "Server error" });
@@ -67,7 +71,7 @@ export const getAgents: ControllerHandler = async (_req, res) => {
                 lastHeartbeat: doc.lastSeen || null,
             };
         });
-        return res.json(data);
+        return respondEnvelope(res, _req, "Agents", { success: true, data });
     } catch (error) {
         log.error("getAgents error", { error });
         return res.status(500).json({ error: "Server error" });

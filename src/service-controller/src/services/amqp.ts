@@ -14,6 +14,7 @@ import TenantResource from "../models/TenantResource";
 import type { TaskRecord } from "../models/Task";
 import type { Heartbeat } from "../models/Heartbeat";
 import * as quota from "../services/quota";
+import { getTenantObjectIdOrThrow } from "../services/quota";
 import logger from "../lib/logger";
 
 const log = logger.child("amqp");
@@ -34,6 +35,39 @@ const isLightInventory = (headers: Options.MessagePropertyHeaders, env: Record<s
     const mode = headers?.["x-merge-mode"] || env?.mergeMode;
     const source = headers?.["x-source"] || env?.source;
     return mode === "patch-nondestructive" || source === "inventory.refresh.light";
+};
+
+const toInventoryPayload = (env: Record<string, unknown>) => {
+    const candidate =
+        (env?.inventory && typeof env.inventory === "object" ? env.inventory : env) ||
+        {};
+
+    const agentId =
+        (env.agentId as string | undefined) ||
+        (candidate as Record<string, unknown>).agentId ||
+        undefined;
+
+    const tsRawCandidate =
+        (env.ts as unknown) ||
+        (candidate as Record<string, unknown>).collectedAt ||
+        (candidate as Record<string, unknown>).ts ||
+        undefined;
+
+    const tsRaw =
+        typeof tsRawCandidate === "string" ||
+        typeof tsRawCandidate === "number" ||
+        tsRawCandidate instanceof Date
+            ? tsRawCandidate
+            : undefined;
+
+    const parsedTs = tsRaw ? new Date(tsRaw) : new Date();
+    const ts = Number.isFinite(parsedTs.getTime()) ? parsedTs : new Date();
+
+    return {
+        agentId,
+        ts,
+        inventory: candidate as Record<string, unknown>,
+    };
 };
 
 export async function connect(): Promise<Channel> {
@@ -132,13 +166,13 @@ export async function startTelemetryConsumers({ Heartbeat }: { Heartbeat: Model<
         try {
             const headers = msg.properties?.headers || {};
             const env = JSON.parse(msg.content.toString()) as Record<string, unknown>;
-            const agentId = env.agentId as string | undefined;
+            const { agentId, ts, inventory } = toInventoryPayload(env);
             if (!agentId) throw new Error("missing agentId");
 
             const doc = {
                 agentId,
-                ts: env.ts ? new Date(env.ts as string) : new Date(),
-                inventory: env.inventory as Record<string, unknown>,
+                ts,
+                inventory,
                 raw: env,
             };
 
@@ -231,7 +265,7 @@ export async function startResultsToMongo(TaskModel: TaskModelInput, { queueName
                 const existing = await TaskModel.findOne(
                     { taskId: payload.taskId },
                     { hasQuotaHold: 1, action: 1, tenantId: 1, agentId: 1 }
-                ).lean<{ hasQuotaHold?: boolean; action?: string; agentId?: string } | null>();
+                ).lean<{ hasQuotaHold?: boolean; action?: string; agentId?: string; tenantId?: string } | null>();
 
                 const update = {
                     $set: {
@@ -264,6 +298,41 @@ export async function startResultsToMongo(TaskModel: TaskModelInput, { queueName
                         await onTaskSucceededUpsertTenantLink(TaskModel, payload);
                     } catch (error) {
                         logRes.warn("tenant link upsert failed", { taskId: payload.taskId, error });
+                    }
+                }
+
+                // For non-create actions, recompute tenant quota usage from the latest inventory.
+                if (payload.ok && existing?.tenantId && existing?.agentId) {
+                    const action = existing.action || "";
+                    const isCreate = /\.create$/i.test(action);
+                    if (!isCreate) {
+                        try {
+                            const inv = await InventoryFull.findOne(
+                                { agentId: existing.agentId },
+                                { inventory: 1 }
+                            ).lean();
+                            if (inv?.inventory) {
+                                const tenantObjectId = await getTenantObjectIdOrThrow(
+                                    existing.tenantId as string
+                                );
+                                await quota.recalcUsedFromInventory({
+                                    tenantId: tenantObjectId,
+                                });
+                                logRes.info("quota recalculated from inventory", {
+                                    taskId: payload.taskId,
+                                    tenantId: existing.tenantId,
+                                    agentId: existing.agentId,
+                                    action,
+                                });
+                            }
+                        } catch (error) {
+                            logRes.warn("quota recalc failed after task", {
+                                taskId: payload.taskId,
+                                tenantId: existing.tenantId,
+                                agentId: existing.agentId,
+                                error,
+                            });
+                        }
                     }
                 }
 

@@ -1,3 +1,5 @@
+// Internal view of the canonical inventory used by resourcesController to expose VM/switch/disk data.
+// Kept narrow to the fields the API surfaces so the controller stays easy to reason about.
 export type ResourceData = Record<string, any>;
 
 export interface PickedResource {
@@ -10,28 +12,21 @@ export interface PickedResource {
 }
 
 export interface InventoryNetworkAdapter {
+    id?: string;
+    networkId?: string;
+    macAddress?: string;
+    primary?: boolean;
+    ipAddresses?: string[];
     switch?: string;
     [key: string]: unknown;
 }
 
-export interface InventoryVm {
-    guid?: string;
+export interface InventoryDisk {
     id?: string;
-    name?: string;
-    state?: string;
-    configuration?: {
-        processors?: { count?: number };
-        memory?: { startupMB?: number };
-    };
-    cpu?: number;
-    memoryAssignedMB?: number;
-    networkAdapters?: InventoryNetworkAdapter[];
-    storage?: VmStorage[];
-    [key: string]: unknown;
-}
-
-export interface VmStorage {
     path?: string | null;
+    sizeBytes?: number | null;
+    boot?: boolean;
+    datastoreId?: string;
     vhd?: {
         path?: string | null;
         format?: string | null;
@@ -47,41 +42,56 @@ export interface VmStorage {
     [key: string]: unknown;
 }
 
+export interface InventoryVm {
+    id?: string;
+    name?: string;
+    powerState?: string;
+    state?: string;
+    cpu?: { vcpus?: number | null };
+    memoryMb?: number;
+    memoryAssignedMB?: number;
+    disks?: InventoryDisk[];
+    nics?: InventoryNetworkAdapter[];
+    networkAdapters?: InventoryNetworkAdapter[];
+    tags?: string[];
+    [key: string]: unknown;
+}
+
 export interface InventorySwitch {
+    id?: string;
     name?: string;
     type?: string;
+    role?: ("tenant" | "public" | "management" | "storage")[];
     switchType?: string;
     isExternal?: boolean;
     [key: string]: unknown;
 }
 
 export interface InventoryDatastore {
+    id?: string;
     kind?: string;
-    agentId?: string;
+    name?: string;
+    path?: string;
+    sizeBytes?: number | null;
+    freeBytes?: number | null;
     [key: string]: unknown;
 }
 
 export interface InventoryDoc {
     agentId: string;
     ts?: Date | string;
-    inventory?: {
-        inventory?: {
-            vms?: InventoryVm[];
-            networks?: { switches?: InventorySwitch[] };
-            datastores?: InventoryDatastore[];
-        };
-        vms?: InventoryVm[];
-        networks?: { switches?: InventorySwitch[] };
-        datastores?: InventoryDatastore[];
-        collectedAt?: Date | string;
-    };
+    inventory?: InventoryRoot;
+    raw?: Record<string, unknown>;
     [key: string]: unknown;
 }
 
 export type InventoryRoot = {
-    vms?: InventoryVm[];
-    networks?: { switches?: InventorySwitch[] };
-    datastores?: InventoryDatastore[];
+    schemaVersion?: string;
+    agentId?: string;
     collectedAt?: string | Date;
+    host?: Record<string, unknown>;
+    networks?: InventorySwitch[];
+    datastores?: InventoryDatastore[];
+    vms?: InventoryVm[];
     [key: string]: unknown;
 };

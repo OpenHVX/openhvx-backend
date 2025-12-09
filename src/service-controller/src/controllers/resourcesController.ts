@@ -18,11 +18,12 @@ import {
     type InventoryRoot,
     type InventorySwitch,
     type InventoryVm,
+    type InventoryDisk,
     type PickedResource,
     type ResourceData,
-    type VmStorage,
 } from "../types/resources";
 import logger from "../lib/logger";
+import { respondEnvelope } from "../middlewares/addEnveloppe";
 
 const log = logger.child(["controller", "resources"]);
 type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
@@ -30,14 +31,22 @@ type Handler = (req: ControllerRequest, res: Response) => Promise<Response | voi
 const getTenantId = (req: ControllerRequest) =>
     req.params?.tenantId || req.tenantId || req.user?.tenantId || null;
 
+// Small helpers for defensively handling partially shaped inventories.
 const arr = <T = unknown>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
 const normPath = (input?: string | null) =>
     typeof input === "string" ? input.replace(/\//g, "\\").toLowerCase() : input ?? undefined;
 
+// Pull the canonical inventory root; if missing, work with an empty object.
 const root = (doc?: InventoryDoc | null): InventoryRoot =>
-    (doc?.inventory?.inventory || doc?.inventory || {}) as InventoryRoot;
+    (doc?.inventory as InventoryRoot | undefined) || ({} as InventoryRoot);
 
-const vmKey = (vm: InventoryVm) => vm.guid || vm.id || vm.name || null;
+// Normalize networks to an array; the agent always sends an array in the canonical shape.
+const networksOf = (inv: InventoryRoot): InventorySwitch[] => {
+    const nets = inv?.networks;
+    return Array.isArray(nets) ? nets : [];
+};
+
+const vmKey = (vm: InventoryVm) => vm.id || vm.name || null;
 
 const mapBy = <T>(list: T[], keyFn: (item: T) => string | null | undefined) => {
     const map = new Map<string, T>();
@@ -62,8 +71,7 @@ const getTs = (doc?: InventoryDoc | null) => {
     return null;
 };
 
-const vmKeysAll = (vm: InventoryVm) =>
-    [vm.guid, vm.id, vm.name].filter(Boolean).map((key) => String(key));
+const vmKeysAll = (vm: InventoryVm) => [vm.id, vm.name].filter(Boolean).map((key) => String(key));
 
 const lcase = (value?: string | null) => (typeof value === "string" ? value.toLowerCase() : value);
 
@@ -86,13 +94,16 @@ const isStale = (fullDoc?: InventoryDoc | null, lightDoc?: InventoryDoc | null, 
 
 const VOLATILE_FIELDS = [
     "state",
+    "powerState",
     "uptimeSec",
     "cpuUsagePct",
     "memoryAssignedMB",
+    "memoryMb",
     "automaticStart",
     "automaticStop",
 ];
 
+// Overlay volatile runtime fields from the light inventory onto the full snapshot.
 const mergeVm = (baseVm: InventoryVm, overlayVm?: InventoryVm) => {
     if (!overlayVm) return { ...baseVm };
     const out: InventoryVm = { ...baseVm };
@@ -103,37 +114,6 @@ const mergeVm = (baseVm: InventoryVm, overlayVm?: InventoryVm) => {
         }
     }
 
-    const baseDisks = arr<VmStorage>(baseVm.storage);
-    const ovDisks = arr<VmStorage>(overlayVm.storage);
-    const byPath = mapBy(ovDisks, (disk) => normPath(disk?.path || disk?.vhd?.path));
-
-    out.storage = baseDisks.map((bd) => {
-        const od = byPath.get(normPath(bd?.path || bd?.vhd?.path) || "");
-        if (!od) return bd;
-
-        const baseVhd = bd?.vhd || {};
-        const ov = od?.vhd || {};
-
-        const current = typeof baseVhd.fileSizeMB === "number" ? baseVhd.fileSizeMB : -Infinity;
-        const next =
-            typeof ov.fileSizeMB === "number" ? Math.max(current, ov.fileSizeMB) : current;
-
-        return {
-            ...bd,
-            vhd: {
-                ...baseVhd,
-                format: baseVhd.format ?? ov.format ?? null,
-                type: baseVhd.type ?? ov.type ?? null,
-                sizeMB: baseVhd.sizeMB ?? null,
-                fileSizeMB: Number.isFinite(next) ? next : baseVhd.fileSizeMB ?? null,
-                parentPath: baseVhd.parentPath ?? null,
-                blockSize: baseVhd.blockSize ?? null,
-                logicalSectorSize: baseVhd.logicalSectorSize ?? null,
-                physicalSectorSize: baseVhd.physicalSectorSize ?? null,
-            },
-        };
-    });
-
     return out;
 };
 
@@ -142,6 +122,9 @@ const combineAgent = (
     lightDoc?: InventoryDoc | null,
     allowLightOnlyKeys: Set<string> | null = null
 ) => {
+    // Merge full + light inventories into a single VM list:
+    // - prefer light for volatile state if it is newer
+    // - optionally allow light-only VMs when they match allowed refIds
     const fullVms = arr<InventoryVm>(root(fullDoc).vms);
     const lightVms = arr<InventoryVm>(root(lightDoc).vms);
 
@@ -197,6 +180,7 @@ const pickFromInv = (
     doc?: InventoryDoc | null,
     filter: { kind?: string; agentId?: string } = {}
 ): PickedResource[] => {
+    // Flatten a single inventory doc into PickedResource entries for VM/switch/disk
     if (!doc) return [];
     const out: Array<{
         kind: string;
@@ -207,7 +191,7 @@ const pickFromInv = (
     const agentId = filter.agentId || doc.agentId;
     if (!agentId) return out;
 
-    const inv = root(doc) as { vms?: InventoryVm[]; networks?: { switches?: InventorySwitch[] } };
+    const inv: InventoryRoot = root(doc);
     const includeVm = !filter.kind || filter.kind === "vm";
     const includeSwitch = !filter.kind || filter.kind === "switch";
     const includeDisk = !filter.kind || filter.kind === "disk";
@@ -222,16 +206,18 @@ const pickFromInv = (
                 refId: String(refId),
                 data: {
                     name: vm?.name ?? null,
-                    guid: vm?.guid ?? null,
-                    state: vm?.state ?? null,
-                    cpu: vm?.configuration?.processors?.count ?? vm?.cpu ?? null,
-                    ramMB:
-                        vm?.memoryAssignedMB ??
-                        vm?.configuration?.memory?.startupMB ??
-                        null,
-                    switches: arr<InventoryNetworkAdapter>(vm?.networkAdapters)
-                        .map((n) => n?.switch)
-                        .filter(Boolean),
+                    guid: vm?.id ?? null,
+                    state: vm?.state ?? vm?.powerState ?? null,
+                    cpu: (vm?.cpu as { vcpus?: number | null })?.vcpus ?? null,
+                    ramMB: vm?.memoryMb ?? null,
+                    switches: [
+                        ...arr<InventoryNetworkAdapter>(vm?.nics as InventoryNetworkAdapter[] | undefined)
+                            .map((n) => n?.networkId || n?.switch)
+                            .filter(Boolean),
+                        ...arr<InventoryNetworkAdapter>(vm?.networkAdapters)
+                            .map((n) => n?.switch || n?.networkId)
+                            .filter(Boolean),
+                    ],
                     raw: vm,
                 },
             });
@@ -239,15 +225,16 @@ const pickFromInv = (
     }
 
     if (includeSwitch) {
-        const switches = arr<InventorySwitch>(inv?.networks?.switches);
+        const switches = networksOf(inv);
         for (const sw of switches) {
-            if (!sw?.name) continue;
+            const name = sw?.name || sw?.id;
+            if (!name) continue;
             out.push({
                 kind: "switch",
                 agentId,
-                refId: String(sw.name),
+                refId: String(name),
                 data: {
-                    name: sw.name ?? null,
+                    name: name ?? null,
                     type: sw.type ?? sw.switchType ?? null,
                     isExternal: sw.isExternal ?? null,
                     raw: sw,
@@ -258,19 +245,18 @@ const pickFromInv = (
 
     if (includeDisk) {
         for (const vm of arr<InventoryVm>(inv.vms)) {
-            for (const disk of arr<VmStorage>(vm?.storage)) {
-                const vhdPath = disk?.vhd?.path || disk?.path;
-                if (!vhdPath) continue;
+            for (const disk of arr<InventoryDisk>(vm?.disks)) {
+                const path = disk?.path;
+                if (!path) continue;
                 out.push({
                     kind: "disk",
                     agentId,
-                    refId: String(vhdPath),
+                    refId: String(path),
                     data: {
                         name: vm?.name ?? null,
-                        vmGuid: vm?.guid ?? null,
-                        path: vhdPath,
-                        sizeMB: disk?.vhd?.sizeMB ?? null,
-                        fileSizeMB: disk?.vhd?.fileSizeMB ?? null,
+                        vmGuid: vm?.id ?? null,
+                        path,
+                        sizeMB: disk?.sizeBytes ? Math.round((disk.sizeBytes || 0) / (1024 * 1024)) : null,
                         raw: disk,
                     },
                 });
@@ -298,7 +284,7 @@ export const listResources: Handler = async (req, res) => {
         if (agentId) query.agentId = agentId;
 
         const links = await TenantResource.find(query).lean<TenantResourceLink[]>();
-        if (!links.length) return res.json({ success: true, data: [] });
+        if (!links.length) return respondEnvelope(res, req, "Resources", { success: true, data: [] });
 
         const agentIds = Array.from(new Set(links.map((link) => String(link.agentId))));
         const [fullDocs, lightDocs] = await Promise.all([
@@ -338,7 +324,7 @@ export const listResources: Handler = async (req, res) => {
             );
             const idx = new Map<string, InventoryVm>();
             for (const vm of merged) {
-                for (const key of [vm.guid, vm.id, vm.name].filter(Boolean).map(String)) {
+                for (const key of [vm.id, vm.name].filter(Boolean).map(String)) {
                     idx.set(key, vm);
                 }
             }
@@ -401,7 +387,9 @@ export const listResources: Handler = async (req, res) => {
 
             if (link.kind === "switch") {
                 const invFull = root(fullBy.get(link.agentId));
-                const sw = arr<InventorySwitch>(invFull?.networks?.switches).find((s) => s.name === link.refId);
+                const sw = networksOf(invFull).find(
+                    (s) => s.name === link.refId || s.id === link.refId
+                );
 
                 if (sw) {
                     out.push({
@@ -428,7 +416,7 @@ export const listResources: Handler = async (req, res) => {
             }
         }
 
-        return res.json({ success: true, data: out });
+        return respondEnvelope(res, req, "Resources", { success: true, data: out });
     } catch (error) {
         log.error("listResources error", { error });
         return send(res, ERR.internal(), req);
@@ -457,7 +445,7 @@ export const claimResources: Handler = async (req, res) => {
         }));
 
         await TenantResource.bulkWrite(ops);
-        return res.json({ success: true });
+        return respondEnvelope(res, req, "Resources", { success: true });
     } catch (error) {
         log.error("claimResources error", { error });
         return send(res, ERR.internal(), req);
@@ -479,7 +467,7 @@ export const unclaimResource: Handler = async (req, res) => {
         const { kind, agentId } = vq.value!;
 
         await TenantResource.deleteOne({ tenantId, kind, agentId, refId: resourceId });
-        return res.json({ success: true });
+        return respondEnvelope(res, req, "Resources", { success: true });
     } catch (error) {
         log.error("unclaimResource error", { error });
         return send(res, ERR.internal(), req);
@@ -505,7 +493,7 @@ export const listUnassignedResources: Handler = async (req, res) => {
 
         const cand: ReturnType<typeof pickFromInv> = [];
         for (const doc of invs) cand.push(...pickFromInv(doc, { kind, agentId: doc.agentId }));
-        if (cand.length === 0) return res.json({ success: true, data: [] });
+        if (cand.length === 0) return respondEnvelope(res, req, "Resources", { success: true, data: [] });
 
         const key = (r: { kind: string; agentId: string; refId: string }) =>
             `${r.kind}|${r.agentId}|${r.refId}`;
@@ -537,7 +525,7 @@ export const listUnassignedResources: Handler = async (req, res) => {
             invs.filter((doc) => isStale(doc, undefined)).map((doc) => doc.agentId)
         );
 
-        return res.json({
+        return respondEnvelope(res, req, "Resources", {
             success: true,
             count: out.length,
             data: out.map((r) => {
