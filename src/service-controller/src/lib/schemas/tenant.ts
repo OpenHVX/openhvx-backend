@@ -73,6 +73,11 @@ type Normalized<T> = Omit<T, "quotas"> & { quotas?: NormalizedQuota };
 
 function normalizeValue<T extends { quotas?: QuotaLimits }>(value: T): Normalized<T> {
     const out = { ...value } as Normalized<T>;
+
+    if ((out as Record<string, unknown>).tenantId && typeof (out as Record<string, unknown>).tenantId === "string") {
+        (out as Record<string, string>).tenantId = (out as Record<string, string>).tenantId.trim().toLowerCase();
+    }
+
     if (value.quotas) {
         const normalized = normalizeQuota(value.quotas);
         if (normalized) {

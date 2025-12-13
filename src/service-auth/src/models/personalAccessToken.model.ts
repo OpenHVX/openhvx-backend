@@ -4,6 +4,8 @@ const mongoose = require('mongoose');
 const PersonalAccessTokenSchema = new mongoose.Schema(
     {
         userId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
+        // `kind` tracks PAT audience (`tenant`|`admin`) and must stay aligned
+        // with the user discriminator; changing it requires data migration.
         kind: { type: String, enum: ['tenant', 'admin'], required: true, index: true },
         tenantId: { type: String, default: null, index: true },
         label: { type: String, default: null },

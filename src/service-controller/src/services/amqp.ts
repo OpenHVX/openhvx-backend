@@ -210,19 +210,26 @@ interface TaskResultPayload {
 async function onTaskSucceededUpsertTenantLink(TaskModel: TaskModelInput, payload: TaskResultPayload) {
     const task = await TaskModel.findOne(
         { taskId: payload.taskId },
-        { action: 1, tenantId: 1, agentId: 1 }
-    ).lean<{ action: string; tenantId?: string; agentId?: string } | null>();
+        { action: 1, tenantId: 1, agentId: 1, data: 1 }
+    ).lean<{ action: string; tenantId?: string; agentId?: string; data?: Record<string, unknown> } | null>();
     if (!task?.tenantId || !task?.agentId) return;
 
-    const { action, tenantId, agentId } = task;
+    const { action, tenantId, agentId, data } = task;
+    const haRequested = typeof data?.ha === "boolean" ? (data.ha as boolean) : undefined;
 
     const vmResult = (payload.result as { vm?: { guid?: string; name?: string } } | undefined)?.vm;
     const refId = vmResult?.guid || vmResult?.name;
 
     if ((action === "vm.create" || action === "vm.clone") && refId) {
+        const update: Record<string, unknown> = {
+            $setOnInsert: { tenantId, assignedAt: new Date() },
+        };
+        if (haRequested !== undefined) {
+            update.$set = { ha: haRequested };
+        }
         await TenantResource.updateOne(
             { kind: "vm", agentId, refId },
-            { $setOnInsert: { tenantId, assignedAt: new Date() } },
+            update,
             { upsert: true }
         );
         return;

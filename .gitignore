@@ -65,3 +65,12 @@ docker-compose.override.yml
 *.crt
 *.key
 *.pfx
+
+#archives
+*.zip
+*.tar.gz
+*.rar
+*.7z
+*.tar
+*.gz
+*.bz2       

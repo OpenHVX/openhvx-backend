@@ -37,6 +37,14 @@ export default ({ AUTH_URL }: RouterOptions) => {
     router.post("/register", onlyAdminHost, stripSpoofable, mkProxy(AUTH_URL, () => "/auth/admin/register"));
 
     router.post(
+        "/tenant/register",
+        onlyAdminHost,
+        stripSpoofable,
+        ensureBearer,
+        mkProxy(AUTH_URL, () => "/auth/tenant/register"),
+    );
+
+    router.post(
         "/pats",
         onlyAdminHost,
         stripSpoofable,
@@ -60,3 +68,4 @@ export default ({ AUTH_URL }: RouterOptions) => {
 
     return router;
 };
+
