@@ -3,9 +3,12 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const UserTenant = require('../models/user.tenant.model'); // discriminator 'tenant'
-const { signTenant, cfg } = require('../lib/jwt');
+const UserAdmin = require('../models/user.admin.model');
+const { signTenant, cfg, verifyAdmin, verifyTenant } = require('../lib/jwt');
 const { mintPat, verifyPatToken, listPatsForUser, revokePat } = require('../lib/pat');
 
+// Here "kind" refers to the actor type (admin vs tenant) tied to the DB discriminator,
+// not to be confused with auth scopes.
 function norm(s) { return (s ?? '').toString().trim().toLowerCase(); }
 function publicUser(u) {
     return {
@@ -51,6 +54,45 @@ async function resolveTenantAuth(token) {
     return null;
 }
 
+async function resolveRegisterActor(req) {
+    const token = bearerToken(req);
+    if (!token) return null;
+
+    try {
+        const decodedAdmin = verifyAdmin(token);
+        const admin = await UserAdmin.findById(decodedAdmin.sub).select('roles isActive').lean();
+        if (admin && admin.isActive !== false) {
+            return { kind: 'admin', roles: admin.roles || [], tenantId: null };
+        }
+    } catch {
+        /* ignore admin verification errors */
+    }
+
+    const patAdmin = await verifyPatToken({ token, kind: 'admin' }).catch(() => null);
+    if (patAdmin?.user) {
+        return { kind: 'admin', roles: patAdmin.user.roles || [], tenantId: null };
+    }
+
+    try {
+        const decodedTenant = verifyTenant(token);
+        const tenantUser = await UserTenant.findById(decodedTenant.sub)
+            .select('roles isActive tenantId')
+            .lean();
+        if (tenantUser && tenantUser.isActive !== false) {
+            return { kind: 'tenant', roles: tenantUser.roles || [], tenantId: tenantUser.tenantId || null };
+        }
+    } catch {
+        /* ignore tenant verification errors */
+    }
+
+    const patTenant = await verifyPatToken({ token, kind: 'tenant' }).catch(() => null);
+    if (patTenant?.user) {
+        return { kind: 'tenant', roles: patTenant.user.roles || [], tenantId: patTenant.user.tenantId || null };
+    }
+
+    return null;
+}
+
 /**
  * POST /auth/tenant/register
  * - Optional: protect with X-API-Key when enabled
@@ -58,15 +100,6 @@ async function resolveTenantAuth(token) {
  */
 exports.register = async (req, res) => {
     try {
-        // Apply a basic API-key guard if the option is set
-        const expectedKey = process.env.TENANT_REGISTER_APIKEY;
-        if (expectedKey) {
-            const got = req.get('x-api-key');
-            if (!got || got !== expectedKey) {
-                return res.status(401).json({ error: 'unauthorized (x-api-key)' });
-            }
-        }
-
         let { email, password, tenantId, roles = [], scopes = [], username = null } = req.body || {};
         email = norm(email);
         username = username ? norm(username) : null;
@@ -74,6 +107,33 @@ exports.register = async (req, res) => {
 
         if (!email || !password || !tenantId) {
             return res.status(400).json({ error: 'email, password, tenantId are required' });
+        }
+
+        // Authorization: allow via matching x-api-key OR via admin/tenant-admin bearer token
+        const expectedKey = process.env.TENANT_REGISTER_APIKEY;
+        const providedKey = req.get('x-api-key');
+        const hasApiKeyAccess = !!expectedKey && providedKey === expectedKey;
+
+        if (!hasApiKeyAccess) {
+            const actor = await resolveRegisterActor(req);
+            if (!actor) {
+                return res.status(expectedKey ? 401 : 403).json({ error: 'unauthorized' });
+            }
+
+            if (actor.kind === 'admin') {
+                // admin can create users for any tenant
+            } else if (actor.kind === 'tenant') {
+                const rolesArr = Array.isArray(actor.roles) ? actor.roles : [];
+                if (!rolesArr.includes('tenant-admin')) {
+                    return res.status(403).json({ error: 'forbidden: tenant-admin role required' });
+                }
+                const actorTenant = norm(actor.tenantId);
+                if (actorTenant && actorTenant !== tenantId) {
+                    return res.status(403).json({ error: 'forbidden: tenant mismatch' });
+                }
+            } else {
+                return res.status(403).json({ error: 'forbidden' });
+            }
         }
 
         // Block any attempt to escalate tenant tokens to admin

@@ -366,6 +366,7 @@ export const listResources: Handler = async (req, res) => {
                         agentId: link.agentId,
                         kind: "vm",
                         refId: link.refId,
+                        ha: link.ha ?? false,
                         _staleAgent: stale,
                     };
                     if (stale && vmOut.state !== "NotFound") vmOut.state = "Unknown";
@@ -378,6 +379,7 @@ export const listResources: Handler = async (req, res) => {
                         refId: link.refId,
                         name: link.name || "(unknown)",
                         state: "NotFound",
+                        ha: link.ha ?? false,
                         orphaned: true,
                         assignedAt: link.assignedAt,
                     });
@@ -398,6 +400,7 @@ export const listResources: Handler = async (req, res) => {
                         agentId: link.agentId,
                         kind: "switch",
                         refId: link.refId,
+                        ha: link.ha ?? false,
                         _staleAgent: !!staleByAgent.get(link.agentId),
                     });
                 } else if (showOrphans) {
@@ -408,6 +411,7 @@ export const listResources: Handler = async (req, res) => {
                         refId: link.refId,
                         name: link.refId,
                         state: "NotFound",
+                        ha: link.ha ?? false,
                         orphaned: true,
                         assignedAt: link.assignedAt,
                     });
@@ -435,14 +439,22 @@ export const claimResources: Handler = async (req, res) => {
             return send(res, ERR.validationPre([{ path: "body.refIds", message: "must contain at least one id" }]), req);
         }
 
-        const { kind, agentId, refIds } = vb.value;
-        const ops = refIds.map((refId) => ({
-            updateOne: {
-                filter: { kind, agentId, refId },
-                update: { $setOnInsert: { tenantId, assignedAt: new Date() } },
-                upsert: true,
-            },
-        }));
+        const { kind, agentId, refIds, ha } = vb.value;
+        const ops = refIds.map((refId) => {
+            const update: Record<string, unknown> = {
+                $setOnInsert: { tenantId, assignedAt: new Date() },
+            };
+            if (typeof ha === "boolean") {
+                update.$set = { ha };
+            }
+            return {
+                updateOne: {
+                    filter: { kind, agentId, refId },
+                    update,
+                    upsert: true,
+                },
+            };
+        });
 
         await TenantResource.bulkWrite(ops);
         return respondEnvelope(res, req, "Resources", { success: true });

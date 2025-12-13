@@ -9,6 +9,7 @@ export interface TenantResourceLink {
     assignedAt: Date;
     name?: string;
     guid?: string;
+    ha?: boolean;
 }
 
 export type TenantResourceDocument = HydratedDocument<TenantResourceLink>;
@@ -24,6 +25,7 @@ const schema = new Schema<TenantResourceLink>(
         assignedAt: { type: Date, default: () => new Date() },
         name: { type: String },
         guid: { type: String },
+        ha: { type: Boolean, default: false },
     },
     { timestamps: true }
 );

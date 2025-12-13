@@ -11,6 +11,8 @@ import type { ResourceKind } from "../../types/domain";
 
 type ClaimKind = Extract<ResourceKind, "vm" | "switch" | "disk">;
 
+const isBoolean = isEnum([true, false] as const);
+
 export interface ListResourcesQueryShape extends Record<string, unknown> {
     kind?: ClaimKind;
     agentId?: string;
@@ -21,6 +23,7 @@ export interface ClaimResourceBody extends Record<string, unknown> {
     kind: ClaimKind;
     agentId: string;
     refIds: string[];
+    ha?: boolean;
 }
 
 export interface UnclaimParamsShape extends Record<string, unknown> {
@@ -50,6 +53,7 @@ const ClaimBody = objectStrict<ClaimResourceBody>({
     kind: isEnum(RESOURCE_KIND_VALUES),
     agentId: isString,
     refIds: arrayOf(isString),
+    ha: optional(isBoolean),
 });
 
 const UnclaimParams = objectStrict<UnclaimParamsShape>({

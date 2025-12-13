@@ -254,7 +254,15 @@ export const adminTenantOverview: Handler = async (req, res) => {
         const tenantId = (req.query?.tenantId as string | undefined)?.trim();
         const filter = tenantId ? { tenantId } : {};
         const tenants = await Tenant.find(filter, { tenantId: 1, name: 1, quotas: 1 }).lean();
-        return respondEnvelope(res, req, "Quota", { success: true, data: tenants });
+
+        const tenantsWithTasks = await Promise.all(
+            tenants.map(async (tenant) => {
+                const tasks = await tasksCountsLast24h({ tenantId: tenant.tenantId });
+                return { ...tenant, tasks };
+            })
+        );
+
+        return respondEnvelope(res, req, "Quota", { success: true, data: tenantsWithTasks });
     } catch (error) {
         log.error("[metrics] adminTenantOverview", { error });
         return res.status(500).json({ error: "metrics failed" });

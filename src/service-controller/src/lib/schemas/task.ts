@@ -35,6 +35,7 @@ export interface VmCreatePayload extends Record<string, unknown> {
     dynamic_memory?: boolean;
     min_ram?: string;
     max_ram?: string;
+    ha?: boolean;
     network?: {
         vpcId?: string;
         subnetId?: string;
@@ -66,6 +67,7 @@ const VmCreateSchema = objectStrict<VmCreatePayload>({
     dynamic_memory: optional(isBoolean),
     min_ram: optional(isString),
     max_ram: optional(isString),
+    ha: optional(isBoolean),
     network: optional(
         objectStrict({
             vpcId: optional(isString),
@@ -99,6 +101,7 @@ const PRE = {
 
     "vm.clone": objectStrict({
         newName: optional(isString),
+        ha: optional(isBoolean),
     }),
 
     "net.tunnel.open": objectStrict({}),

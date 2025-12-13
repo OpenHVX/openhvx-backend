@@ -9,9 +9,15 @@ const resolveTenantFromToken = ({ required = true }: ResolveOptions = {}): Reque
     return (req: Request, res: Response, next: NextFunction) => {
         const user = req.user as (AuthenticatedUser & Record<string, unknown>) | undefined;
 
+        const normLower = (value?: string): string | undefined => {
+            if (!value) return undefined;
+            const s = value.trim();
+            return s ? s.toLowerCase() : undefined;
+        };
+
         const pickString = (key: string): string | undefined => {
             const value = user?.[key];
-            return typeof value === "string" && value.trim() ? value : undefined;
+            return typeof value === "string" && value.trim() ? normLower(value) : undefined;
         };
 
         const pickFirstFromArray = (key: string): string | undefined => {
@@ -19,14 +25,14 @@ const resolveTenantFromToken = ({ required = true }: ResolveOptions = {}): Reque
             if (Array.isArray(value) && value.length > 0) {
                 const first = value[0];
                 if (typeof first === "string" && first.trim()) {
-                    return first;
+                    return normLower(first);
                 }
             }
             return undefined;
         };
 
         const tenantId =
-            req.tenantId ??
+            normLower(typeof req.tenantId === "string" ? req.tenantId : undefined) ??
             pickString("tenantId") ??
             pickString("tid") ??
             pickString("defaultTenant") ??

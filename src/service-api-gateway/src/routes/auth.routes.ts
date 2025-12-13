@@ -56,6 +56,9 @@ const makeProxy = (authUrl: string, rewritePath: (path: string, req: Request) =>
                     proxyReq.setHeader("content-type", "application/json");
                     proxyReq.setHeader("content-length", Buffer.byteLength(bodyData));
                     proxyReq.write(bodyData);
+                    // If body-parser has already drained the incoming request, make sure the proxied request
+                    // is closed after we re-send the payload.
+                    proxyReq.end();
                 }
             },
             error: (_err, _req, res) => {

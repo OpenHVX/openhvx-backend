@@ -1,5 +1,5 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
-import { ensureHost, ensureApiKey, ensureBearer, mkProxy, stripSpoofable } from "../lib/_utils";
+import { ensureHost, ensureBearer, mkProxy, stripSpoofable } from "../lib/_utils";
 
 interface RouterOptions {
     AUTH_URL: string;
@@ -14,12 +14,22 @@ export default ({ AUTH_URL }: RouterOptions) => {
         next();
     };
 
+    const ensureApiKeyOrBearer = (req: Request, res: Response, next: NextFunction): void => {
+        const hasApiKey = !!req.headers["x-api-key"];
+        const authorization = req.headers.authorization ?? "";
+        const hasBearer = /^Bearer\s+\S+/.test(authorization);
+        if (!hasApiKey && !hasBearer) {
+            res.status(401).json({ error: "Missing x-api-key or Bearer token" });
+            return;
+        }
+        next();
+    };
+
     router.post(
         "/register",
         onlyTenantHost,
         stripSpoofable,
-        ensureApiKey,
-        stripAuthorization,
+        ensureApiKeyOrBearer,
         mkProxy(AUTH_URL, () => "/auth/tenant/register"),
     );
 

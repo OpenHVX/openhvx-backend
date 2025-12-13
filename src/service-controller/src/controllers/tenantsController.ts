@@ -28,8 +28,10 @@ import { respondEnvelope } from "../middlewares/addEnveloppe";
 const log = logger.child(["controller", "tenants"]);
 type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
 
+const normTenantId = (value: string) => value?.trim().toLowerCase();
+
 const getTenantObjectIdOr404 = async (tenantId: string, req: ControllerRequest, res: Response) => {
-    const tenant = await Tenant.findOne({ tenantId }, { _id: 1 }).lean();
+    const tenant = await Tenant.findOne({ tenantId: normTenantId(tenantId) }, { _id: 1 }).lean();
     if (!tenant) {
         send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
         return null;
@@ -70,7 +72,7 @@ export const getTenant: Handler = async (req, res) => {
         const pre = validateParams(req.params);
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
 
-        const { tenantId } = pre.value!;
+        const tenantId = normTenantId(pre.value!.tenantId);
         const tenant = await Tenant.findOne({ tenantId }).lean();
         if (!tenant) {
             return send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
@@ -86,7 +88,7 @@ export const updateTenant: Handler = async (req, res) => {
     try {
         const params = validateParams(req.params);
         if (!params.ok) return send(res, ERR.validationPre(params.errors), req);
-        const { tenantId } = params.value!;
+        const tenantId = normTenantId(params.value!.tenantId);
 
         const preBody = validateUpdate(req.body);
         if (!preBody.ok) return send(res, ERR.validationPre(preBody.errors), req);
@@ -121,7 +123,7 @@ export const removeTenant: Handler = async (req, res) => {
         const pre = validateParams(req.params);
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
 
-        const { tenantId } = pre.value!;
+        const tenantId = normTenantId(pre.value!.tenantId);
         const count = await TenantResource.countDocuments({ tenantId });
         if (count > 0) {
             return send(
@@ -172,7 +174,7 @@ export const patchQuotaLimits: Handler = async (req, res) => {
         const body = validatePatchLimits(req.body);
         if (!body.ok) return send(res, ERR.validationPre(body.errors), req);
 
-        const tId = params.value!.tenantId;
+        const tId = normTenantId(params.value!.tenantId);
         const _id = await getTenantObjectIdOr404(tId, req, res);
         if (!_id) return;
 
@@ -223,11 +225,14 @@ export const recalculateQuotas: Handler = async (req, res) => {
         const body = validateRecalcBody(req.body);
         if (!body.ok) return send(res, ERR.validationPre(body.errors), req);
 
-        if (body.value?.tenantId && body.value.tenantId !== params.value!.tenantId) {
+        const bodyTenantId = body.value?.tenantId ? normTenantId(body.value.tenantId) : undefined;
+        const paramTenantId = normTenantId(params.value!.tenantId);
+
+        if (bodyTenantId && bodyTenantId !== paramTenantId) {
             return send(res, ERR.validationPre([{ path: "tenantId", message: "mismatch with URL" }]), req);
         }
 
-        const _id = await getTenantObjectIdOr404(params.value!.tenantId, req, res);
+        const _id = await getTenantObjectIdOr404(paramTenantId, req, res);
         if (!_id) return;
 
         const data = await recalcUsedFromInventory({

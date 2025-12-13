@@ -47,6 +47,12 @@ const hostKind = (req: Request): HostKind => {
     return "unknown";
 };
 
+const normLower = (value?: string | null) => {
+    if (!value) return value ?? undefined;
+    const s = String(value).trim();
+    return s ? s.toLowerCase() : undefined;
+};
+
 export default function verifyViaAuth({ AUTH_URL }: VerifyOptions) {
     const cache = new Map<string, CacheEntry>();
     const SKEW_SECONDS = 10;
@@ -98,9 +104,10 @@ export default function verifyViaAuth({ AUTH_URL }: VerifyOptions) {
 
             const roles = asArray(data.roles);
             const scopes = asArray(data.scopes);
+            const tenantIdLc = kind === "tenant" ? normLower((data as { tenantId?: unknown }).tenantId as string) : undefined;
 
             if (kind === "tenant") {
-                if (!data.tenantId) {
+                if (!tenantIdLc) {
                     res.status(403).json({ error: "tenantId required" });
                     return;
                 }
@@ -119,14 +126,15 @@ export default function verifyViaAuth({ AUTH_URL }: VerifyOptions) {
                 roles,
                 scopes,
                 kind,
+                tenantId: tenantIdLc ?? (data as { tenantId?: string }).tenantId,
             };
 
             cache.set(cacheKey, { data: normalized, expTs: expiry - SKEW_SECONDS });
 
             req.user = normalized;
             req.isAdmin = kind === "admin";
-            if (kind === "tenant" && data.tenantId) {
-                req.tenantId = String(data.tenantId);
+            if (kind === "tenant" && tenantIdLc) {
+                req.tenantId = tenantIdLc;
             }
 
             next();

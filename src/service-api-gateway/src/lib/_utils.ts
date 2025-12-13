@@ -83,6 +83,9 @@ export const mkProxy = (authUrl: string, rewritePathFn?: RewritePath): RequestHa
                     proxyReq.setHeader("content-type", "application/json");
                     proxyReq.setHeader("content-length", Buffer.byteLength(body));
                     proxyReq.write(body);
+                    // When upstream middleware has already consumed the request body,
+                    // explicitly end the proxied request after re-sending the payload.
+                    proxyReq.end();
                 }
 
                 if (process.env.GW_DEBUG === "true") {

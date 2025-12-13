@@ -62,7 +62,6 @@ app.use(
         legacyHeaders: false,
     }),
 );
-app.use(express.json({ limit: "1mb" }));
 app.use(cors(corsOptions));
 
 app.locals.http = axios.create({ baseURL: CONTROLLER_URL, timeout: 10_000 });
@@ -81,6 +80,8 @@ app.get("/healthz", (_req: Request, res: Response) => res.json({ ok: true, servi
 
 app.use("/api/v1/tenant/auth", tenantAuthRoutes({ AUTH_URL }));
 app.use("/api/v1/admin/auth", adminAuthRoutes({ AUTH_URL }));
+
+app.use(express.json({ limit: "1mb" }));
 
 const verifyMiddleware = verifyViaAuth({ AUTH_URL });
 
