@@ -65,8 +65,8 @@ export async function reconcileTenantAgentVMs({ tenantId, agentId }: { tenantId:
     const presentKeys = await buildPresentKeySet(agentId);
     const links = await TenantResource.find(
         { tenantId, agentId, kind: "vm" },
-        { _id: 1, refId: 1 }
-    ).lean<Array<TenantResourceLink & { _id: string }>>();
+        { _id: 1, refId: 1, name: 1 }
+    ).lean<Array<TenantResourceLink & { _id: string; name?: string }>>();
 
     const toDeleteIds: string[] = [];
     const missing: string[] = [];

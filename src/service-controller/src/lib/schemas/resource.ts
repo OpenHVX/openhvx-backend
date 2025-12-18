@@ -9,7 +9,7 @@ import {
 import type { ValidationResult } from "../validate";
 import type { ResourceKind } from "../../types/domain";
 
-type ClaimKind = Extract<ResourceKind, "vm" | "switch" | "disk">;
+type ClaimKind = Extract<ResourceKind, "vm" | "switch" | "storage">;
 
 const isBoolean = isEnum([true, false] as const);
 
@@ -41,7 +41,7 @@ export interface UnassignedQueryShape extends Record<string, unknown> {
     limit?: string;
 }
 
-const RESOURCE_KIND_VALUES = ["vm", "switch", "disk"] as const;
+const RESOURCE_KIND_VALUES = ["vm", "switch", "storage"] as const;
 
 const ListResourcesQuery = objectStrict<ListResourcesQueryShape>({
     kind: optional(isEnum(RESOURCE_KIND_VALUES)),

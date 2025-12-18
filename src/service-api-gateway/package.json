@@ -19,6 +19,7 @@
         "http-proxy-middleware": "^3.0.5",
         "morgan": "^1.10.1",
         "node-fetch": "^3.3.2",
+        "swagger-jsdoc": "^6.2.8",
         "swagger-ui-express": "^5.0.1",
         "uuid": "^11.1.0",
         "yaml": "^2.8.1"
@@ -30,6 +31,8 @@
         "@types/http-proxy-middleware": "^0.19.3",
         "@types/morgan": "^1.9.10",
         "@types/node": "^24.9.2",
+        "@types/swagger-jsdoc": "^6.0.4",
+        "@types/swagger-ui-express": "^4.1.6",
         "@types/uuid": "^10.0.0",
         "nodemon": "^3.1.0",
         "ts-node": "^10.9.2",

@@ -86,6 +86,15 @@ services:
     labels:
       - traefik.enable=true
 
+      # Docs Swagger (admin-api)
+      - traefik.http.routers.apidocs.rule=Host(`admin-api.openhvx.local`) && PathPrefix(`/docs`)
+      - traefik.http.routers.apidocs.entrypoints=websecure
+      - traefik.http.routers.apidocs.tls=true
+      - traefik.http.routers.apidocs.middlewares=sec-headers@file,compress@file
+      - traefik.http.routers.apidocs.service=admin-svc 
+      - traefik.http.services.admin-svc.loadbalancer.server.port=8080
+      - traefik.docker.network=internal 
+
       # TENANT
       - traefik.http.routers.api.rule=Host(`api.openhvx.local`) && PathPrefix(`/api/v1/tenant`)
       - traefik.http.routers.api.entrypoints=websecure

@@ -25,7 +25,11 @@ export interface InventoryDisk {
     id?: string;
     path?: string | null;
     sizeBytes?: number | null;
+    diskNumber?: number | null;
     boot?: boolean;
+    iqn?: string;
+    storageRefId?: string;
+    storageId?: string;
     datastoreId?: string;
     vhd?: {
         path?: string | null;

@@ -41,6 +41,9 @@ export const ERR = {
     quotaExceeded: (message = "Quota exceeded", details?: unknown) =>
         make(409, "QUOTA_EXCEEDED", message, details),
 
+    resourceLocked: (kind: string, refId: string) =>
+        make(409, "RESOURCE_LOCKED", `${kind} '${refId}' is locked by another task`, { kind, refId }),
+
     validationPre: (details: unknown) =>
         make(422, "VALIDATION_ERROR", "Invalid request payload", { where: "pre", errors: details }),
 

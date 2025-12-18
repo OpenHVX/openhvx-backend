@@ -3,12 +3,11 @@ import Heartbeat from "../models/Heartbeat";
 import type { Heartbeat as HeartbeatDoc } from "../models/Heartbeat";
 import { validateElectionPayload } from "../lib/schemas/election";
 import type { ElectionRequirements } from "../types/domain";
-import { cpuScore, memScore, storageScore, Score } from "../lib/score";
+import { cpuScore, memScore, Score } from "../lib/score";
 
 interface AgentScore {
     mem: Awaited<ReturnType<typeof memScore>>;
     cpu: Awaited<ReturnType<typeof cpuScore>>;
-    storage: Awaited<ReturnType<typeof storageScore>>;
 }
 
 interface ScoredAgent extends HeartbeatDoc {
@@ -47,12 +46,11 @@ export async function election(requirements: ElectionRequirements): Promise<stri
             const scores = {
                 mem: await memScore(inv),
                 cpu: await cpuScore(inv),
-                storage: await storageScore(inv),
             };
             return {
                 ...agent,
                 scores,
-                globalScore: Score({ scores }, { cpu: 0.5, mem: 0.3, storage: 0.2 }),
+                globalScore: Score({ scores }, { cpu: 0.6, mem: 0.4 }),
             };
         })
     );

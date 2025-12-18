@@ -8,6 +8,7 @@ import Tenant from "../models/Tenant";
 import TenantResource, { type TenantResourceLink } from "../models/TenantResource";
 import QuotaHold from "../models/quota/hold";
 import InventoryFull from "../models/Inventory.full";
+import InventoryStorage from "../models/Inventory.storage";
 import type { QuotaDeltas, QuotaKey, QuotaLimits, Quotas } from "../types/domain";
 import { ERR } from "../lib/errors/http-errors";
 import logger from "../lib/logger";
@@ -414,6 +415,23 @@ interface InventoryNetwork {
     tenants?: string[];
 }
 
+const sizeMbFromStorageImage = (image: Record<string, unknown>) => {
+    const sizeMB =
+        (image.sizeMB as number | undefined) ??
+        (image.sizeMiB as number | undefined) ??
+        (image.sizeGB as number | undefined) ??
+        (image.sizeBytes as number | undefined) ??
+        (image.virtualSizeBytes as number | undefined) ??
+        (image.usedBytes as number | undefined);
+
+    if (sizeMB == null) return 0;
+    if (image.sizeGB !== undefined) return Math.max(0, (image.sizeGB as number) * 1024);
+    if (image.sizeBytes !== undefined) return Math.max(0, Math.round((image.sizeBytes as number) / 1024 / 1024));
+    if (image.virtualSizeBytes !== undefined) return Math.max(0, Math.round((image.virtualSizeBytes as number) / 1024 / 1024));
+    if (image.usedBytes !== undefined) return Math.max(0, Math.round((image.usedBytes as number) / 1024 / 1024));
+    return Number.isFinite(sizeMB) ? Math.max(0, (sizeMB as number) | 0) : 0;
+};
+
 // Recompute usage by looking at TenantResource links and the latest inventories stored per agent:
 // 1) load VM/switch links for the tenant
 // 2) fetch inventories for the involved agents
@@ -426,13 +444,20 @@ export async function recalcUsedFromInventory({
 }) {
     if (!tenantId) throw ERR.validationPre([{ path: "tenantId", message: "required" }]);
 
+    let tenantKey: string | null = typeof tenantId === "string" ? tenantId : null;
+    if (!tenantKey) {
+        const tenantDoc = await Tenant.findById(tenantId, { tenantId: 1 }).lean<{ tenantId?: string } | null>();
+        tenantKey = tenantDoc?.tenantId || null;
+    }
+    if (!tenantKey) throw ERR.notFound("Tenant not found");
     const links = await TenantResource.find(
-        { tenantId, kind: { $in: ["vm", "switch"] } },
+        { tenantId: tenantKey, kind: { $in: ["vm", "switch", "storage"] } },
         { kind: 1, agentId: 1, refId: 1, name: 1 }
     ).lean<Array<TenantResourceLink & { _id: Types.ObjectId; name?: string }>>();
 
     const vmLinks = links.filter((l) => l.kind === "vm");
     const switchLinks = links.filter((l) => l.kind === "switch");
+    const storageLinks = links.filter((l) => l.kind === "storage");
 
     const agentIds = Array.from(new Set(links.map((l) => String(l.agentId))));
     const inventories = agentIds.length
@@ -442,16 +467,37 @@ export async function recalcUsedFromInventory({
           ).lean<Array<{ agentId: string; inventory?: { vms?: InventoryVm[]; networks?: InventoryNetwork[] } }>>()
         : [];
 
+    const storageDocs = storageLinks.length
+        ? await InventoryStorage.find(
+              { storageId: { $in: storageLinks.map((l) => String(l.agentId)) } },
+              { storageId: 1, inventory: 1 }
+          ).lean<
+              Array<{
+                  storageId: string;
+                  inventory?: { images?: Array<Record<string, unknown>>; volumes?: Array<Record<string, unknown>> };
+              }>
+          >()
+        : [];
+
     const invByAgent = new Map<string, { vms?: InventoryVm[]; networks?: InventoryNetwork[] }>();
     for (const id of agentIds) invByAgent.set(id, {});
     for (const doc of inventories) {
         invByAgent.set(String(doc.agentId), (doc.inventory as { vms?: InventoryVm[]; networks?: InventoryNetwork[] }) || {});
     }
 
+    const storageByAgent = new Map<string, { images?: Array<Record<string, unknown>>; volumes?: Array<Record<string, unknown>> }>();
+    for (const doc of storageDocs) {
+        storageByAgent.set(
+            String(doc.storageId),
+            (doc.inventory as { images?: Array<Record<string, unknown>>; volumes?: Array<Record<string, unknown>> }) || {}
+        );
+    }
+
     const arr = <T = unknown>(value: unknown): T[] =>
         Array.isArray(value) ? (value as T[]) : [];
     const norm = (value: string | number | undefined | null) =>
         value == null ? "" : String(value).toLowerCase();
+    const looksLikeIqn = (value?: string | number | null) => /^iqn\./i.test(String(value || "").trim());
 
     const vmIdxByAgent = new Map<string, Map<string, InventoryVm>>();
     for (const [agentId, inv] of invByAgent.entries()) {
@@ -485,14 +531,16 @@ export async function recalcUsedFromInventory({
 
     let cpu = 0;
     let memoryMB = 0;
-    let storageMB = 0;
+    let storageMBFromStorage = 0;
     let vmCount = 0;
     let networkCount = 0;
 
     let missingVms = 0;
     let missingNets = 0;
+    let missingStorage = 0;
     const missingVmIds: string[] = [];
     const missingNetIds: string[] = [];
+    const missingStorageIds: string[] = [];
 
     for (const link of vmLinks) {
         const idx = vmIdxByAgent.get(String(link.agentId)) || new Map<string, InventoryVm>();
@@ -543,7 +591,6 @@ export async function recalcUsedFromInventory({
 
         cpu += Math.max(0, vcpu | 0);
         memoryMB += Math.max(0, mem | 0);
-        storageMB += Math.max(0, vmStorageMB | 0);
         vmCount += 1;
     }
 
@@ -551,7 +598,7 @@ export async function recalcUsedFromInventory({
         const idx = netIdxByAgent.get(String(link.agentId)) || new Map<string, InventoryNetwork>();
         const wanted = [link.refId, (link as { name?: string }).name]
             .filter(Boolean)
-            .map(norm);
+            .map((v) => norm(v as string | number | null | undefined));
         const found = wanted.some((key) => idx.has(key));
         if (found) networkCount += 1;
         else {
@@ -559,6 +606,43 @@ export async function recalcUsedFromInventory({
             missingNetIds.push(String(link._id));
         }
     }
+
+    for (const link of storageLinks) {
+        const storageInv = storageByAgent.get(String(link.agentId)) || {};
+        const volumes = storageInv.volumes || [];
+        const images = storageInv.images || [];
+        const wanted = [link.refId, (link as { name?: string }).name].filter(Boolean).map(norm);
+        let match = volumes.find((vol) => {
+            const keys = [vol.refId, vol.name]
+                .filter(Boolean)
+                .map((v) => norm(v as string | number | null | undefined));
+            return keys.some((k) => wanted.includes(k));
+        });
+        if (!match && looksLikeIqn(link.refId)) {
+            const refNorm = norm(link.refId);
+            match = volumes.find((vol) => norm(vol.iqn as string | number | null | undefined) === refNorm);
+        }
+        if (match) {
+            storageMBFromStorage += sizeMbFromStorageImage(match);
+            continue;
+        }
+
+        const refNorm = norm(link.refId);
+        const imgMatch = images.find((img) => {
+            const keys = [img.refId, img.id, img.name]
+                .filter(Boolean)
+                .map((v) => norm(v as string | number | null | undefined));
+            return keys.includes(refNorm);
+        });
+        if (!imgMatch) {
+            missingStorage++;
+            missingStorageIds.push(String(link._id));
+            continue;
+        }
+        storageMBFromStorage += sizeMbFromStorageImage(imgMatch);
+    }
+
+    const storageMB = storageMBFromStorage;
 
     const used = { cpu, memoryMB, storageMB, vmCount, networkCount };
     const $set: Record<string, number> = {};
@@ -573,12 +657,14 @@ export async function recalcUsedFromInventory({
 
     if (missingVmIds.length) await TenantResource.deleteMany({ _id: { $in: missingVmIds } });
     if (missingNetIds.length) await TenantResource.deleteMany({ _id: { $in: missingNetIds } });
+    if (missingStorageIds.length) await TenantResource.deleteMany({ _id: { $in: missingStorageIds } });
 
     log.info("recalc used from inventory", {
-        tenantId: tid(tenantId),
+        tenantId: tenantKey,
         used,
         missingVms,
         missingNetworks: missingNets,
+        missingStorage,
     });
     return hydrateWithDefaults(tenant.quotas);
 }
@@ -633,6 +719,39 @@ export function deltasFromVmSpec(vmSpec: InventoryVm = {}) {
 }
 
 export function computeDeltas(action: string, payload: unknown) {
+    const storageSizeFromPayload = (p: unknown) => {
+        const candidate =
+            (p as Record<string, unknown>)?.sizeMB ??
+            (p as Record<string, unknown>)?.sizeMiB ??
+            (p as Record<string, unknown>)?.sizeGB ??
+            (p as Record<string, unknown>)?.sizeBytes;
+        if (typeof candidate !== "number" || !Number.isFinite(candidate)) return 0;
+        if ((p as Record<string, unknown>)?.sizeGB !== undefined) return Math.max(0, candidate * 1024);
+        if ((p as Record<string, unknown>)?.sizeBytes !== undefined) return Math.max(0, Math.round(candidate / 1024 / 1024));
+        return Math.max(0, candidate | 0);
+    };
+
+    if (action === "disk.create" || action === "storage.create") {
+        const storageMB = storageSizeFromPayload(payload);
+        return {
+            cpu: 0,
+            memoryMB: 0,
+            storageMB,
+            vmCount: 0,
+            networkCount: 0,
+        };
+    }
+    if (action === "disk.delete" || action === "storage.delete") {
+        const storageMB = storageSizeFromPayload(payload);
+        if (!storageMB) return null;
+        return {
+            cpu: 0,
+            memoryMB: 0,
+            storageMB: -storageMB,
+            vmCount: 0,
+            networkCount: 0,
+        };
+    }
     if (action === "vm.create") return deltasFromVmSpec(payload as InventoryVm);
     return null;
 }

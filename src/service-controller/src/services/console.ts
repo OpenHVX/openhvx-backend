@@ -116,9 +116,6 @@ async function loadVmOrThrow({ refId, tenantId, agentId }: VmQuery): Promise<Non
     const byRef = await findVm({ ...base, refId });
     if (byRef) return byRef;
 
-    const byGuid = await findVm({ ...base, guid: refId });
-    if (byGuid) return byGuid;
-
     throw new Error("vm not found");
 }
 
