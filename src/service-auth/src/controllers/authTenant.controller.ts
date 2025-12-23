@@ -33,6 +33,11 @@ function expFromPat(pat) {
     return Math.floor(Date.now() / 1000) + 300; // short-lived cache for non-expiring PATs
 }
 
+function resolveRegisterMode(req) {
+    const m = String(req.query?.mode || '').toLowerCase();
+    return ['once', 'reset', 'upsert'].includes(m) ? m : 'once'; // default: once
+}
+
 async function resolveTenantAuth(token) {
     if (!token) return null;
     try {
@@ -95,6 +100,7 @@ async function resolveRegisterActor(req) {
 
 /**
  * POST /auth/tenant/register
+ * query: ?mode=once|reset|upsert (default: once)
  * - Optional: protect with X-API-Key when enabled
  *   ENV: TENANT_REGISTER_APIKEY (required when defined)
  */
@@ -107,6 +113,9 @@ exports.register = async (req, res) => {
 
         if (!email || !password || !tenantId) {
             return res.status(400).json({ error: 'email, password, tenantId are required' });
+        }
+        if (password.length < 12) {
+            return res.status(400).json({ error: 'WeakPassword', minLength: 12 });
         }
 
         // Authorization: allow via matching x-api-key OR via admin/tenant-admin bearer token
@@ -144,6 +153,35 @@ exports.register = async (req, res) => {
             return res.status(400).json({ error: 'platform.admin not allowed for tenant users' });
         }
 
+        const mode = resolveRegisterMode(req);
+        const existing = await UserTenant.findOne({ email });
+        if (existing) {
+            if (existing.tenantId && existing.tenantId !== tenantId) {
+                return res.status(409).json({ error: 'tenant mismatch for existing user' });
+            }
+            if (mode === 'once') {
+                return res.status(409).json({ error: 'user already exists (email or username)' });
+            }
+            const passwordHash = await bcrypt.hash(password, 12);
+            const updated = await UserTenant.findOneAndUpdate(
+                { email },
+                {
+                    $set: {
+                        kind: 'tenant',
+                        email,
+                        username,
+                        passwordHash,
+                        tenantId,
+                        isActive: true,
+                        roles: Array.isArray(roles) ? roles : [],
+                        scopes: Array.isArray(scopes) ? scopes : [],
+                    },
+                },
+                { new: true, upsert: mode === 'upsert' }
+            );
+            return res.status(200).json({ ok: true, updated: true, mode, user: publicUser(updated) });
+        }
+
         const passwordHash = await bcrypt.hash(password, 12); // cost 12 (tune if needed)
         const user = await UserTenant.create({
             kind: 'tenant',
@@ -156,7 +194,7 @@ exports.register = async (req, res) => {
             isActive: true,
         });
 
-        return res.status(201).json({ user: publicUser(user) });
+        return res.status(201).json({ ok: true, created: true, user: publicUser(user) });
     } catch (e) {
         if (e?.code === 11000) return res.status(409).json({ error: 'user already exists (email or username)' });
         return res.status(500).json({ error: e.message });

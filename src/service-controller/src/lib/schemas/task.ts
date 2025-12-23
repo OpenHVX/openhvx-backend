@@ -14,7 +14,10 @@ const isBoolean = isEnum([true, false] as const);
 const isStringArray = arrayOf(isString);
 
 export interface CloudInitNetwork {
-    mode?: "dhcp";
+    mode?: "dhcp" | "static";
+    address?: string;
+    gateway?: string;
+    nameservers?: string[];
 }
 
 export interface CloudInitConfig extends Record<string, unknown> {
@@ -56,7 +59,10 @@ const CloudInitSchema = objectStrict<CloudInitConfig>({
     serialReboot: optional(isBoolean),
     network: optional(
         objectStrict({
-            mode: optional(isEnum(["dhcp"] as const)),
+            mode: optional(isEnum(["dhcp", "static"] as const)),
+            address: optional(isString),
+            gateway: optional(isString),
+            nameservers: optional(arrayOf(isString)),
         })
     ),
 });

@@ -26,6 +26,7 @@ import {
 } from "../types/resources";
 import logger from "../lib/logger";
 import { respondEnvelope } from "../middlewares/addEnveloppe";
+import Heartbeat from "../models/Heartbeat";
 
 const log = logger.child(["controller", "resources"]);
 type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
@@ -48,6 +49,58 @@ const getTenantId = (req: ControllerRequest) => {
 const arr = <T = unknown>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
 const normPath = (input?: string | null) =>
     typeof input === "string" ? input.replace(/\//g, "\\").toLowerCase() : input ?? undefined;
+
+const normalizeIpList = (value?: unknown): string[] => {
+    const seen = new Set<string>();
+    const visit = (v: unknown) => {
+        if (!v) return;
+        if (typeof v === "string") {
+            const trimmed = v.trim();
+            if (trimmed) seen.add(trimmed);
+            return;
+        }
+        if (Array.isArray(v)) {
+            for (const item of v) visit(item);
+            return;
+        }
+        if (typeof v === "object") {
+            const addr = (v as { address?: unknown }).address;
+            if (addr) visit(addr);
+            for (const val of Object.values(v as Record<string, unknown>)) visit(val);
+        }
+    };
+    visit(value);
+    return Array.from(seen);
+};
+
+const normalizeNicIpAddresses = (nic?: InventoryNetworkAdapter | null): InventoryNetworkAdapter | null => {
+    if (!nic || typeof nic !== "object") return null;
+    const ipAddresses = normalizeIpList((nic as { ipAddresses?: unknown }).ipAddresses);
+    return { ...nic, ipAddresses };
+};
+
+const normalizeVmIpAddresses = (vm?: InventoryVm | null): InventoryVm => {
+    if (!vm || typeof vm !== "object") return {} as InventoryVm;
+    const vmLevelIps = normalizeIpList((vm as { ipAddresses?: unknown }).ipAddresses);
+    const nicsRaw = Array.isArray(vm.nics) ? vm.nics : undefined;
+    const networkAdaptersRaw = Array.isArray(vm.networkAdapters) ? vm.networkAdapters : undefined;
+    const nics = nicsRaw ? nicsRaw.map(normalizeNicIpAddresses).filter(Boolean) : undefined;
+    const networkAdapters = networkAdaptersRaw
+        ? networkAdaptersRaw.map(normalizeNicIpAddresses).filter(Boolean)
+        : undefined;
+    const nicIps = [
+        ...(nics || []).flatMap((n) => normalizeIpList((n as { ipAddresses?: unknown }).ipAddresses)),
+        ...(networkAdapters || []).flatMap((n) => normalizeIpList((n as { ipAddresses?: unknown }).ipAddresses)),
+    ];
+    const ipAddresses = Array.from(new Set<string>([...vmLevelIps, ...nicIps]));
+
+    return {
+        ...vm,
+        ipAddresses,
+        ...(nicsRaw ? { nics: nics as InventoryNetworkAdapter[] } : {}),
+        ...(networkAdaptersRaw ? { networkAdapters: networkAdapters as InventoryNetworkAdapter[] } : {}),
+    };
+};
 
 // Pull the canonical inventory root; if missing, work with an empty object.
 const root = (doc?: InventoryDoc | null): InventoryRoot =>
@@ -87,11 +140,8 @@ const getTs = (doc?: InventoryDoc | null) => {
 const lcase = (value?: string | number | null) => (value == null ? "" : String(value).toLowerCase());
 const looksLikeIqn = (value?: string | null) => /^iqn\./i.test(String(value || "").trim());
 
-const STALE_MS = Number(
-    process.env.AGENT_STALE_MS ||
-        process.env.RESOURCE_STATE_STALE_MS ||
-        3 * 60 * 1000
-);
+// Single staleness threshold driven by heartbeat age.
+const STALE_MS = Number(process.env.AGENT_STALE_MS || 3 * 60 * 1000);
 
 const agentLastTs = (fullDoc?: InventoryDoc | null, lightDoc?: InventoryDoc | null) => {
     const t1 = getTs(fullDoc) ?? -Infinity;
@@ -102,6 +152,11 @@ const agentLastTs = (fullDoc?: InventoryDoc | null, lightDoc?: InventoryDoc | nu
 const isStale = (fullDoc?: InventoryDoc | null, lightDoc?: InventoryDoc | null, now = Date.now()) => {
     const last = agentLastTs(fullDoc, lightDoc);
     return !Number.isFinite(last) || now - last > STALE_MS;
+};
+
+const isHeartbeatStale = (hb?: { lastSeen?: Date | string } | null, now = Date.now()) => {
+    const ts = hb?.lastSeen ? new Date(hb.lastSeen).getTime() : NaN;
+    return !Number.isFinite(ts) || now - ts > STALE_MS;
 };
 
 const stripDiskIqn = (disk: InventoryDisk) => {
@@ -250,26 +305,29 @@ const pickFromInv = (
         for (const vm of arr<InventoryVm>(inv.vms)) {
             const refId = vmKey(vm);
             if (!refId) continue;
-            const vmSafe = sanitizeVmDisks(vm);
+            const vmSafe = normalizeVmIpAddresses(sanitizeVmDisks(vm));
+            const ipAddresses = Array.isArray(vmSafe.ipAddresses) ? vmSafe.ipAddresses : [];
+            const vmWithIp = { ...vmSafe, ipAddresses };
             out.push({
                 kind: "vm",
                 agentId,
                 refId: String(refId),
                 data: {
-                    name: vmSafe?.name ?? null,
-                    guid: vmSafe?.id ?? null,
-                    state: vmSafe?.state ?? vmSafe?.powerState ?? null,
-                    cpu: (vmSafe?.cpu as { vcpus?: number | null })?.vcpus ?? null,
-                    ramMB: vmSafe?.memoryMb ?? null,
+                    name: vmWithIp?.name ?? null,
+                    guid: vmWithIp?.id ?? null,
+                    state: vmWithIp?.state ?? vmWithIp?.powerState ?? null,
+                    cpu: (vmWithIp?.cpu as { vcpus?: number | null })?.vcpus ?? null,
+                    ramMB: vmWithIp?.memoryMb ?? null,
                     switches: [
-                        ...arr<InventoryNetworkAdapter>(vmSafe?.nics as InventoryNetworkAdapter[] | undefined)
+                        ...arr<InventoryNetworkAdapter>(vmWithIp?.nics as InventoryNetworkAdapter[] | undefined)
                             .map((n) => n?.networkId || n?.switch)
                             .filter(Boolean),
-                        ...arr<InventoryNetworkAdapter>(vmSafe?.networkAdapters)
+                        ...arr<InventoryNetworkAdapter>(vmWithIp?.networkAdapters)
                             .map((n) => n?.switch || n?.networkId)
                             .filter(Boolean),
                     ],
-                    raw: vmSafe,
+                    ...(ipAddresses.length ? { ipAddresses } : {}),
+                    raw: vmWithIp,
                 },
             });
         }
@@ -320,7 +378,7 @@ export const listResources: Handler = async (req, res) => {
         const storageAgentIds = Array.from(
             new Set(links.filter((l) => l.kind === "storage").map((l) => String(l.agentId)))
         );
-        const [fullDocs, lightDocs, storageDocs] = await Promise.all([
+        const [fullDocs, lightDocs, storageDocs, heartbeatDocs] = await Promise.all([
             InventoryFull.find(
                 { agentId: { $in: agentIds } },
                 { agentId: 1, inventory: 1, ts: 1 }
@@ -335,11 +393,18 @@ export const listResources: Handler = async (req, res) => {
                       { storageId: 1, inventory: 1, ts: 1 }
                   ).lean<Array<{ storageId: string; inventory?: Record<string, unknown> }>>()
                 : Promise.resolve([]),
+            agentIds.length
+                ? Heartbeat.find(
+                      { agentId: { $in: agentIds } },
+                      { agentId: 1, lastSeen: 1 }
+                  ).lean<Array<{ agentId: string; lastSeen?: Date | string }>>()
+                : Promise.resolve([]),
         ]);
 
         const fullBy = new Map(fullDocs.map((doc) => [doc.agentId, doc]));
         const lightBy = new Map(lightDocs.map((doc) => [doc.agentId, doc]));
         const storageBy = new Map(storageDocs.map((doc) => [doc.storageId, doc]));
+        const hbBy = new Map(heartbeatDocs.map((hb) => [hb.agentId, hb]));
 
         const allowByAgent = new Map<string, Set<string>>();
         for (const link of links) {
@@ -350,9 +415,13 @@ export const listResources: Handler = async (req, res) => {
             allowByAgent.set(link.agentId, set);
         }
 
+        const now = Date.now();
         const staleByAgent = new Map<string, boolean>();
         for (const id of agentIds) {
-            staleByAgent.set(id, isStale(fullBy.get(id), lightBy.get(id)));
+            const hbDoc = hbBy.get(id);
+            const hbStale = isHeartbeatStale(hbDoc, now);
+            // If no heartbeat, consider the agent stale.
+            staleByAgent.set(id, hbDoc ? hbStale : true);
         }
 
         const vmIdxByAgent = new Map<string, Map<string, InventoryVm>>();
@@ -434,11 +503,13 @@ export const listResources: Handler = async (req, res) => {
                             });
                         }
                     }
-                    const vmSafe = sanitizeVmDisks(vm);
+                    const vmSafe = normalizeVmIpAddresses(sanitizeVmDisks(vm));
+                    const ipAddresses = Array.isArray(vmSafe.ipAddresses) ? vmSafe.ipAddresses : [];
+                    const vmWithIp = { ...vmSafe, ipAddresses };
                     const attachedKey = `${link.agentId}|${link.refId}`;
                     const attachedDisks = attachedDisksByVm.get(attachedKey);
                     const vmOut = {
-                        ...vmSafe,
+                        ...vmWithIp,
                         tenantId: ensuredTenantId,
                         agentId: link.agentId,
                         kind: "vm",
@@ -447,7 +518,7 @@ export const listResources: Handler = async (req, res) => {
                         ...(attachedDisks ? { attachedDisks } : {}),
                         _staleAgent: stale,
                     };
-                    if (stale && vmOut.state !== "NotFound") vmOut.state = "Unknown";
+                    if (stale) vmOut.powerState = "Unknown";
                     out.push(vmOut);
                 } else if (showOrphans) {
                     out.push({
@@ -474,6 +545,7 @@ export const listResources: Handler = async (req, res) => {
                 if (!vol && looksLikeIqn(refRaw)) {
                     vol = volumes.find((v) => String(v.iqn || "").toLowerCase() === ref);
                 }
+                const stale = !!staleByAgent.get(link.agentId);
                 const attachedTask =
                     link.attachedVmRefId || link.attachedVmAgentId || link.attachedVmName || link.attachedAt
                         ? {
@@ -522,9 +594,9 @@ export const listResources: Handler = async (req, res) => {
                             ? { usedBytes, usedMB: Math.round(usedBytes / 1024 / 1024) }
                             : {}),
                         ha: link.ha ?? false,
-                        state,
+                        state: stale ? "Unknown" : state,
                         ...(attached ? { attachedTo: attached } : {}),
-                        _staleAgent: !!staleByAgent.get(link.agentId),
+                        _staleAgent: stale,
                     });
                 } else if (showOrphans) {
                     const safeRefId = looksLikeIqn(refRaw) ? (link.name || "(unknown)") : link.refId;
@@ -678,6 +750,17 @@ export const listUnassignedResources: Handler = async (req, res) => {
               }).lean<Array<{ storageId: string; inventory?: StorageInventoryV1; ts?: Date | string }>>()
             : [];
 
+        const heartbeatAgentIds = new Set<string>();
+        for (const doc of invs) heartbeatAgentIds.add(doc.agentId);
+        for (const doc of storageInvs) heartbeatAgentIds.add(doc.storageId);
+        const heartbeatDocs = heartbeatAgentIds.size
+            ? await Heartbeat.find(
+                  { agentId: { $in: Array.from(heartbeatAgentIds) } },
+                  { agentId: 1, lastSeen: 1 }
+              ).lean<Array<{ agentId: string; lastSeen?: Date | string }>>()
+            : [];
+        const hbBy = new Map(heartbeatDocs.map((hb) => [hb.agentId, hb]));
+
         const cand: ReturnType<typeof pickFromInv> = [];
         for (const doc of invs) cand.push(...pickFromInv(doc, { kind, agentId: doc.agentId }));
         if (!kind || kind === "storage") {
@@ -756,13 +839,13 @@ export const listUnassignedResources: Handler = async (req, res) => {
             if (out.length >= limit) break;
         }
 
-        const staleAgents = new Set(
-            invs.filter((doc) => isStale(doc, undefined)).map((doc) => doc.agentId)
-        );
         const now = Date.now();
-        for (const doc of storageInvs) {
-            const ts = doc?.ts ? new Date(doc.ts).getTime() : NaN;
-            if (Number.isFinite(ts) && now - ts > STALE_MS) staleAgents.add(doc.storageId);
+        const staleAgents = new Set<string>();
+        for (const [id, hb] of hbBy.entries()) {
+            if (isHeartbeatStale(hb, now)) staleAgents.add(id);
+        }
+        for (const id of heartbeatAgentIds) {
+            if (!hbBy.has(id)) staleAgents.add(id);
         }
 
         return respondEnvelope(res, req, "Resources", {
@@ -781,10 +864,14 @@ export const listUnassignedResources: Handler = async (req, res) => {
                     cpu: data.cpu,
                     ramMB: data.ramMB,
                     switches: data.switches,
+                    ipAddresses: data.ipAddresses,
                     raw: data,
                     _staleAgent: staleAgent,
                 };
-                if (base.kind === "vm" && staleAgent && base.state !== "NotFound") {
+                if (base.kind === "vm" && staleAgent) {
+                    base.powerState = "Unknown";
+                }
+                if (base.kind === "storage" && staleAgent && base.state !== "NotFound") {
                     base.state = "Unknown";
                 }
                 return base;

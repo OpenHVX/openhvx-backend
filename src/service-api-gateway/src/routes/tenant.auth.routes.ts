@@ -43,6 +43,10 @@ export default ({ AUTH_URL }: RouterOptions) => {
      *         name: x-api-key
      *         schema: { type: string }
      *         required: false
+     *       - in: query
+     *         name: mode
+     *         description: once (default) | reset | upsert
+     *         schema: { type: string }
      *     security:
      *       - bearerAuth: []
      *     responses:

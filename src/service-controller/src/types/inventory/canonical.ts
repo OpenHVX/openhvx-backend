@@ -104,7 +104,7 @@ export interface CanonicalVm {
   };
 
   memoryMb: number;
-
+  ipAddresses?: string[];
   disks: CanonicalVmDisk[];
   nics: CanonicalVmNic[];
 

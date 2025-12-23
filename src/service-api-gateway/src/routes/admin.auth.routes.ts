@@ -107,6 +107,11 @@ export default ({ AUTH_URL }: RouterOptions) => {
      *   post:
      *     summary: Create a tenant via admin auth
      *     tags: [Admin Auth]
+     *     parameters:
+     *       - in: query
+     *         name: mode
+     *         description: once (default) | reset | upsert
+     *         schema: { type: string }
      *     security:
      *       - bearerAuth: []
      *     responses:
