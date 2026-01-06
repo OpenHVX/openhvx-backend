@@ -1,3 +1,6 @@
+// Schema validation library home made
+
+
 type ValidatorFn<T> = ((value: unknown, path?: string) => T) & { __optional?: boolean };
 
 export type Validator<T> = ValidatorFn<T>;

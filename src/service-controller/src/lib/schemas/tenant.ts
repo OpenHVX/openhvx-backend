@@ -1,3 +1,5 @@
+// Schema and validation for tenant-related payloads
+
 import {
     isEnum,
     isString,

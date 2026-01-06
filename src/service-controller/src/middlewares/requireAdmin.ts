@@ -1,3 +1,5 @@
+// Not used currently, but could be useful for routes that must be admin-only
+
 import type { NextFunction, Response } from "express";
 import type { ControllerRequest } from "../types/express";
 

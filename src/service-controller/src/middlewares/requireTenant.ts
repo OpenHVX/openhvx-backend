@@ -1,3 +1,5 @@
+// Middleware to require tenant id from request context
+
 import type { NextFunction, Response } from "express";
 import type { ControllerRequest } from "../types/express";
 

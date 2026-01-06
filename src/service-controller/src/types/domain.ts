@@ -1,4 +1,4 @@
-export type ResourceKind = "vm" | "switch" | "disk" | "nic" | "other";
+export type ResourceKind = "vm" | "switch" | "storage" | "disk" | "nic" | "other";
 
 export type QuotaKey = "cpu" | "memoryMB" | "storageMB" | "vmCount" | "networkCount";
 

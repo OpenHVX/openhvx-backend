@@ -33,6 +33,12 @@ const requireTenantInJWT = (req: Request, res: Response, next: NextFunction): vo
 export default ({ CONTROLLER_URL }: RouterOptions) => {
     const router = Router();
 
+    const normLower = (value?: string | null) => {
+        if (!value) return "";
+        const s = value.trim();
+        return s ? s.toLowerCase() : "";
+    };
+
     const baseProxy = createProxyMiddleware<Request, Response>({
         target: CONTROLLER_URL,
         changeOrigin: true,
@@ -41,7 +47,7 @@ export default ({ CONTROLLER_URL }: RouterOptions) => {
         pathRewrite: (path) => `/api/v1/tenant${path}`,
         on: {
             proxyReq: (proxyReq, req) => {
-                const tenantId = req.tenantId ?? req.user?.tenantId ?? "";
+                const tenantId = normLower(req.tenantId ?? req.user?.tenantId ?? "");
 
                 proxyReq.setHeader("x-request-id", req.id ?? "");
                 proxyReq.setHeader("x-user-id", req.user?.sub ?? "");
@@ -77,6 +83,41 @@ export default ({ CONTROLLER_URL }: RouterOptions) => {
     const readRoles = ["tenant-user-r", "tenant-user-rw", "tenant-admin"];
     const writeRoles = ["tenant-user-rw", "tenant-admin"];
 
+    /**
+     * @openapi
+     * tags:
+     *   - name: Tenant Tasks
+     *   - name: Tenant Resources
+     *   - name: Tenant Metrics
+     *   - name: Tenant Images
+     */
+
+    /**
+     * @openapi
+     * /api/v1/tenant/tasks:
+     *   post:
+     *     summary: Enqueue a task for the current tenant
+     *     tags: [Tenant Tasks]
+     *     security:
+     *       - bearerAuth: []
+     *     requestBody:
+     *       required: true
+     *       content:
+     *         application/json:
+     *           schema:
+     *             type: object
+     *             properties:
+     *               action: { type: string }
+     *               target:
+     *                 type: object
+     *                 properties:
+     *                   kind: { type: string }
+     *                   refId: { type: string }
+     *                   agentId: { type: string }
+     *               data: { type: object }
+     *     responses:
+     *       200: { description: Task enqueued }
+     */
     router.post(
         "/tasks",
         requireTenantInJWT,
@@ -85,12 +126,60 @@ export default ({ CONTROLLER_URL }: RouterOptions) => {
         baseProxy,
     );
     router.get("/tasks/:taskId", requireTenantInJWT, ensureAnyRole(readRoles), baseProxy);
+
+    /**
+     * @openapi
+     * /api/v1/tenant/resources:
+     *   get:
+     *     summary: List resources assigned to the current tenant
+     *     tags: [Tenant Resources]
+     *     responses:
+     *       200: { description: OK }
+     */
     router.get("/resources", requireTenantInJWT, ensureAnyRole(readRoles), baseProxy);
+
+    /**
+     * @openapi
+     * /api/v1/tenant/images:
+     *   get:
+     *     summary: Image catalog for the tenant
+     *     tags: [Tenant Images]
+     *     parameters:
+     *       - in: query
+     *         name: q
+     *         schema: { type: string }
+     *     responses:
+     *       200: { description: OK }
+     */
     router.get("/images", requireTenantInJWT, ensureAnyRole(readRoles), baseProxy);
 
+    /**
+     * @openapi
+     * /api/v1/tenant/metrics/overview:
+     *   get:
+     *     summary: Overview of tenant tasks and resources
+     *     tags: [Tenant Metrics]
+     *     responses:
+     *       200: { description: OK }
+     */
     router.get("/metrics/overview", requireTenantInJWT, ensureAnyRole(readRoles), baseProxy);
 
+    /**
+     * @openapi
+     * /api/v1/tenant/images/{imageId}:
+     *   get:
+     *     summary: Get image details
+     *     tags: [Tenant Images]
+     */
     router.get("/images/:imageId", requireTenantInJWT, ensureAnyRole(readRoles), baseProxy);
+
+    /**
+     * @openapi
+     * /api/v1/tenant/images/{imageId}/resolve:
+     *   get:
+     *     summary: Resolve an image alias
+     *     tags: [Tenant Images]
+     */
     router.get("/images/:imageId/resolve", requireTenantInJWT, ensureAnyRole(readRoles), baseProxy);
 
     return router;

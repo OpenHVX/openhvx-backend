@@ -1,4 +1,6 @@
-//models/Inventory.full.ts
+// src/service-controller/src/models/Inventory.full.ts
+// Mongoose model for full inventory snapshots
+
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import type { InventorySnapshot } from "./types";
 

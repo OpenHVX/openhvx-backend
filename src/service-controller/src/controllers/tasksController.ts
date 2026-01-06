@@ -9,6 +9,7 @@ import { publishTask, type PublishTaskPayload } from "../services/amqp";
 import Task from "../models/Task";
 import Heartbeat from "../models/Heartbeat";
 import TenantResource from "../models/TenantResource";
+import InventoryFull from "../models/Inventory.full";
 import { enrich } from "../lib/enrich";
 import { election } from "../services/election";
 import { isKnownAction, preValidate } from "../lib/schemas/task";
@@ -20,11 +21,14 @@ import {
     getTenantObjectIdOrThrow,
     holdQuota,
 } from "../services/quota";
+import { acquireResourceLock, releaseLocksForTask, isHttpErrorPayload } from "../services/resourceLocks";
 import type { ControllerRequest } from "../types/express";
 import { respondEnvelope } from "../middlewares/addEnveloppe";
 
 type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
 const log = logger.child(["controller", "tasks"]);
+
+const STORAGE_CONTROLLER_ROUTE = process.env.STORAGE_CONTROLLER_AGENT_ID || process.env.STORAGE_CONTROLLER_ROUTE;
 
 const requiredCapability = (action: string) => {
     const map: Record<string, string> = {
@@ -35,6 +39,10 @@ const requiredCapability = (action: string) => {
         "vm.clone": "vm.clone",
         "console.serial.open": "console",
         "net.tunnel.open": "console",
+        "disk.create": "storage",
+        "disk.delete": "storage",
+        "storage.create": "storage",
+        "storage.delete": "storage",
         echo: "echo",
     };
     if (map[action]) return map[action];
@@ -46,6 +54,7 @@ const requiredCapability = (action: string) => {
 const actionRequiresRefId = (action: string) => {
     if (/^console\.serial\.open$/i.test(action)) return true;
     if (/^net\.tunnel\.open$/i.test(action)) return true;
+    if (/^(disk|storage)\.(delete|attach|detach|resize)$/i.test(action)) return true;
     return /^vm\.(delete|power|start|stop|restart|resize|attach|detach|snapshot|revert|rename|clone)$/i.test(action);
 };
 
@@ -72,11 +81,18 @@ const getTenantIdFromReq = (req: ControllerRequest): string | null => {
 };
 
 const getTenantIdFromJWT = (req: ControllerRequest) => req?.tenant?.tenantId || req?.tenantId || null;
+const normalizeTenantId = (id: string | null | undefined) =>
+    typeof id === "string" ? id.trim().toLowerCase() || null : null;
 
 export const enqueueTask: Handler = async (req, res) => {
     let action: string | undefined;
     let agentId: string | undefined;
     let tenantId: string | null | undefined;
+    let taskId: string | undefined;
+    let targetSnapshot: Record<string, unknown> | null = null;
+    let dataSnapshot: Record<string, unknown> | null = null;
+    let hasResourceLock = false;
+    let storageAgentIdForDisk: string | null = null;
     try {
         // Parse + validate request ------------------------------------------------
         const admin = !!req.isAdmin;
@@ -87,6 +103,10 @@ export const enqueueTask: Handler = async (req, res) => {
 
         const target = (body.target && typeof body.target === "object" ? body.target : null) as Record<string, unknown> | null;
         if (!target?.kind) return send(res, ERR.missingTargetKind(), req);
+        const targetKind = String(target.kind).toLowerCase();
+        const knownKinds = new Set(["vm", "storage", "network"]);
+        if (!knownKinds.has(targetKind)) return send(res, ERR.missingTargetKind(), req);
+        targetSnapshot = target as Record<string, unknown>;
 
         if (!isKnownAction(action)) return send(res, ERR.unknownAction(action), req);
 
@@ -98,14 +118,24 @@ export const enqueueTask: Handler = async (req, res) => {
         const pre = preValidate(action, body.data || {});
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
         const userData = pre.value as Record<string, unknown>;
+        dataSnapshot = userData;
 
-        tenantId = admin ? ((body.tenantId as string) || getTenantIdFromReq(req)) : getTenantIdFromJWT(req);
+        tenantId = normalizeTenantId(
+            admin ? ((body.tenantId as string) || getTenantIdFromReq(req)) : getTenantIdFromJWT(req)
+        );
         if (!tenantId) {
             return send(res, admin ? ERR.tenantIdRequiredForAdmin() : ERR.tenantContextMissing(), req);
         }
 
         // Resolve target agent ---------------------------------------------------
-        if (action === "vm.create" && !target.agentId) {
+        // Storage controller is a singleton for now; default to its route if caller did not specify.
+        if (targetKind === "storage" && !target.agentId && STORAGE_CONTROLLER_ROUTE) {
+            target.agentId = STORAGE_CONTROLLER_ROUTE;
+            body.target = { ...target };
+        }
+
+        // Compute: elect a fresh agent with required capability when none is provided.
+        if (targetKind === "vm" && action === "vm.create" && !target.agentId) {
             const freshness = Number(process.env.AGENT_FRESHNESS_SEC || 60);
             const needCap = requiredCapability(action);
             const agentIdSelected = await election({ freshness, capabilities: [needCap] });
@@ -117,8 +147,8 @@ export const enqueueTask: Handler = async (req, res) => {
         if (!agentId && needsRefId) {
             // Auto-pick agentId from TenantResource when there is a single match for this refId/kind.
             const linkQuery: Record<string, unknown> = {
+                kind: targetKind,
                 refId: target.refId,
-                kind: target.kind,
             };
             if (tenantId) linkQuery.tenantId = tenantId;
             const links = await TenantResource.find(linkQuery, { agentId: 1 })
@@ -131,7 +161,7 @@ export const enqueueTask: Handler = async (req, res) => {
                 log.debug("auto-selected agentId from TenantResource", {
                     tenantId,
                     refId: target.refId,
-                    kind: target.kind,
+                    kind: targetKind,
                     agentId,
                 });
             }
@@ -140,9 +170,10 @@ export const enqueueTask: Handler = async (req, res) => {
         if (!agentId) return send(res, ERR.missingAgentId(), req);
 
         if (!admin && needsRefId) {
+            // Tenants can only act on resources they own (link exists for tenant/kind/agent/refId).
             const link = await TenantResource.findOne({
                 tenantId,
-                kind: target.kind,
+                kind: targetKind,
                 agentId,
                 refId: target.refId,
             }).lean();
@@ -155,9 +186,84 @@ export const enqueueTask: Handler = async (req, res) => {
         const hb = await Heartbeat.findOne({ agentId }).lean();
         if (!hb) return send(res, ERR.agentNotFound(agentId), req);
 
+        // Capability gate: agent must declare support for the requested action prefix.
         const caps = Array.isArray(hb.capabilities) ? hb.capabilities : [];
         if (!caps.includes(needCap)) {
             return send(res, ERR.capabilityUnsupported(needCap, caps, action, agentId), req);
+        }
+
+        taskId = randomUUID();
+
+        if (action === "vm.create") {
+            // Enforce disk ownership + exclusivity before enqueue:
+            const diskId = typeof userData.diskId === "string" ? userData.diskId : "";
+            if (!diskId) {
+                return send(res, ERR.validationPre([{ path: "data.diskId", message: "diskId is required" }]), req);
+            }
+
+            const storageLink = await TenantResource.findOne({
+                tenantId,
+                kind: "storage",
+                $or: [{ refId: diskId }, { name: diskId }],
+            }).lean();
+            if (!storageLink) {
+                return send(
+                    res,
+                    ERR.validationPre([{ path: "data.diskId", message: "storage disk not found or not assigned to tenant" }]),
+                    req
+                );
+            }
+            if (storageLink.attachedVmRefId || storageLink.attachedVmAgentId) {
+                const vmHint = storageLink.attachedVmName || storageLink.attachedVmRefId;
+                return send(
+                    res,
+                    ERR.validationPre([
+                        {
+                            path: "data.diskId",
+                            message: vmHint
+                                ? `disk already attached to vm ${vmHint}`
+                                : "disk already attached to a vm",
+                        },
+                    ]),
+                    req
+                );
+            }
+            storageAgentIdForDisk = storageLink.agentId || null;
+
+            // A disk can be attached to only one VM (checked from latest inventory snapshot).
+            const inv = await InventoryFull.findOne({ agentId }, { inventory: 1 }).lean<{
+                inventory?: { vms?: Array<{ disks?: Array<{ storageRefId?: string; storageId?: string }> }> };
+            }>();
+            const vms = (inv?.inventory?.vms || []) as Array<{ disks?: Array<{ storageRefId?: string; storageId?: string }> }>;
+            const inUse = vms.some((vm) =>
+                (vm.disks || []).some((disk) => {
+                    const ids = [disk.storageRefId, disk.storageId].filter(Boolean).map((v) => String(v));
+                    return ids.includes(diskId);
+                })
+            );
+            if (inUse) {
+                return send(res, ERR.validationPre([{ path: "data.diskId", message: "disk already attached to a VM" }]), req);
+            }
+
+            const lockTtl = ttlForAction(action);
+            // Hard lock the disk so concurrent vm.create on the same diskId fail immediately.
+            try {
+                await acquireResourceLock({
+                    resourceKind: "storage",
+                    refId: diskId,
+                    taskId,
+                    tenantId: tenantId || undefined,
+                    agentId,
+                    action,
+                    ttlMs: lockTtl,
+                });
+                hasResourceLock = true;
+            } catch (error) {
+                if (isHttpErrorPayload(error)) {
+                    return send(res, error, req);
+                }
+                throw error;
+            }
         }
 
         const staleMs = Number(process.env.AGENT_STALE_MS || 120000);
@@ -168,7 +274,8 @@ export const enqueueTask: Handler = async (req, res) => {
         const data: Record<string, unknown> = { ...userData };
         if (needsRefId && !data.id && target.refId) data.id = target.refId;
         type AgentPayload = Record<string, unknown> & { _console?: unknown };
-        let dataForAgent: AgentPayload = { ...data, target };
+        let dataForTask: AgentPayload = { ...data, target };
+        let dataForAgent: AgentPayload = dataForTask;
 
         let consoleMeta: Record<string, unknown> | undefined;
         const enr = await enrich(action, {
@@ -179,14 +286,16 @@ export const enqueueTask: Handler = async (req, res) => {
                 refId: (target.refId as string) || undefined,
                 tenantId,
                 agentId,
+                storageAgentId: storageAgentIdForDisk || undefined,
             },
         });
 
         if (enr.ok && enr.data) {
-            dataForAgent = enr.data as AgentPayload;
-            if (dataForAgent._console) {
-                consoleMeta = dataForAgent._console as Record<string, unknown>;
-                delete dataForAgent._console;
+            dataForTask = enr.data as AgentPayload;
+            dataForAgent = dataForTask;
+            if (dataForTask._console) {
+                consoleMeta = dataForTask._console as Record<string, unknown>;
+                delete dataForTask._console;
             }
         } else {
             const isUnsupported =
@@ -194,18 +303,60 @@ export const enqueueTask: Handler = async (req, res) => {
             if (!isUnsupported) return send(res, ERR.enrichFailed(enr.error || "unknown"), req);
         }
 
-        const taskId = randomUUID();
+        if (action === "vm.create") {
+            if (!dataForTask.storageId && storageAgentIdForDisk) {
+                dataForTask.storageId = storageAgentIdForDisk;
+            }
+            const iqn = typeof dataForTask.iqn === "string" ? dataForTask.iqn : "";
+            if (!iqn) {
+                return send(
+                    res,
+                    ERR.validationPre([
+                        { path: "data.diskId", message: "storage disk IQN not found for provided diskId" },
+                    ]),
+                    req
+                );
+            }
+            const portalCandidate = dataForTask.portal;
+            const portal =
+                portalCandidate && typeof portalCandidate === "object"
+                    ? {
+                          ...(typeof (portalCandidate as Record<string, unknown>).host === "string"
+                              ? { host: (portalCandidate as Record<string, unknown>).host as string }
+                              : {}),
+                          ...(typeof (portalCandidate as Record<string, unknown>).ip === "string"
+                              ? { ip: (portalCandidate as Record<string, unknown>).ip as string }
+                              : {}),
+                      }
+                    : undefined;
+            delete dataForTask.iqn;
+            delete dataForTask.portal;
+            dataForAgent = { ...dataForTask, iqn, ...(portal ? { portal } : {}) };
+        }
+
         let hasQuotaHold = false;
 
-        const deltas = computeDeltas(action, dataForAgent);
+        const deltas = computeDeltas(action, dataForTask);
         if (deltas) {
-            const tenantObjectId = await getTenantObjectIdOrThrow(tenantId);
+            // Hold tenant quota before enqueue to avoid overcommit; released/consumed via task results.
             try {
+                const tenantObjectId = await getTenantObjectIdOrThrow(tenantId);
                 await holdQuota(tenantObjectId, deltas, taskId, { ttlMs: ttlForAction(action) });
                 hasQuotaHold = true;
             } catch (error) {
                 const err = error as HttpErrorPayload | undefined;
-                if (err?.code === "QUOTA_EXCEEDED" || err?.status === 409) {
+                if (err?.code === "QUOTA_EXCEEDED" || err?.status === 409 || err?.status === 404) {
+                    // Quota failure after we locked the disk: release the lock to avoid leaving it blocked.
+                    if (hasResourceLock && taskId) {
+                        try {
+                            await releaseLocksForTask(taskId);
+                        } catch (releaseError) {
+                            log.warn("failed to release resource lock after quota error", {
+                                taskId,
+                                error: (releaseError as Error)?.message || releaseError,
+                            });
+                        }
+                    }
                     return send(res, err, req);
                 }
                 throw error;
@@ -217,19 +368,20 @@ export const enqueueTask: Handler = async (req, res) => {
             tenantId,
             agentId,
             action,
-            data: dataForAgent,
+            data: dataForTask,
             correlationId: taskId,
             status: "queued",
             queuedAt: new Date(),
             hasQuotaHold,
         });
 
+        // Persist, publish to agent queue, update status for tracking.
         const payload: PublishTaskPayload = {
             taskId: doc.taskId,
             tenantId: doc.tenantId,
             agentId: doc.agentId!,
             action: doc.action,
-            data: doc.data,
+            data: dataForAgent,
             correlationId: doc.correlationId || undefined,
         };
         await publishTask(payload);
@@ -246,6 +398,17 @@ export const enqueueTask: Handler = async (req, res) => {
 
         return respondEnvelope(res.status(202), req, "Tasks", resp);
     } catch (error) {
+        // Any failure during enqueue: release held resource locks to keep resources usable.
+        if (hasResourceLock && taskId) {
+            try {
+                await releaseLocksForTask(taskId);
+            } catch (releaseError) {
+                log.warn("failed to release resource lock after enqueue error", {
+                    taskId,
+                    error: (releaseError as Error)?.message || releaseError,
+                });
+            }
+        }
         const err = error as Error;
         log.error("enqueueTask error", {
             error: err?.message || err,
@@ -253,6 +416,9 @@ export const enqueueTask: Handler = async (req, res) => {
             action,
             agentId,
             tenantId,
+            admin: !!req.isAdmin,
+            target: targetSnapshot,
+            dataKeys: dataSnapshot ? Object.keys(dataSnapshot) : null,
         });
         return send(res, ERR.internal(), req);
     }

@@ -16,7 +16,7 @@ export interface InventoryNetworkAdapter {
     networkId?: string;
     macAddress?: string;
     primary?: boolean;
-    ipAddresses?: string[];
+    ipAddresses?: Array<string | InventoryIpAddress>;
     switch?: string;
     [key: string]: unknown;
 }
@@ -25,7 +25,11 @@ export interface InventoryDisk {
     id?: string;
     path?: string | null;
     sizeBytes?: number | null;
+    diskNumber?: number | null;
     boot?: boolean;
+    iqn?: string;
+    storageRefId?: string;
+    storageId?: string;
     datastoreId?: string;
     vhd?: {
         path?: string | null;
@@ -41,6 +45,12 @@ export interface InventoryDisk {
     };
     [key: string]: unknown;
 }
+export interface InventoryIpAddress {
+    address?: string;
+    type?: "ipv4" | "ipv6";
+    primary?: boolean;
+    [key: string]: unknown;
+}
 
 export interface InventoryVm {
     id?: string;
@@ -53,6 +63,7 @@ export interface InventoryVm {
     disks?: InventoryDisk[];
     nics?: InventoryNetworkAdapter[];
     networkAdapters?: InventoryNetworkAdapter[];
+    ipAddresses?: Array<string | InventoryIpAddress>;
     tags?: string[];
     [key: string]: unknown;
 }

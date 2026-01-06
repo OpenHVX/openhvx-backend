@@ -1,3 +1,5 @@
+// Middleware to load tenant information based on tenant ID from request headers
+
 import type { NextFunction, Response } from "express";
 import Tenant from "../models/Tenant";
 import type { ControllerRequest } from "../types/express";

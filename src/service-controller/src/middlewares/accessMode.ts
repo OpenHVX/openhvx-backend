@@ -1,3 +1,5 @@
+// access Mode middlewares to set request context for tenant or admin operations
+
 import type { NextFunction, Response } from "express";
 import type { ControllerRequest } from "../types/express";
 

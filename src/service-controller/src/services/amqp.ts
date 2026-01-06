@@ -1,3 +1,6 @@
+// src/service-controller/src/services/amqp.ts
+// AMQP service for task publishing and telemetry consumption
+
 import {
     connect as connectAmqp,
     type Channel,
@@ -10,12 +13,15 @@ import {
 import type { Model } from "mongoose";
 import InventoryFull from "../models/Inventory.full";
 import InventoryLight from "../models/Inventory.light";
+import InventoryStorage from "../models/Inventory.storage";
 import TenantResource from "../models/TenantResource";
 import type { TaskRecord } from "../models/Task";
 import type { Heartbeat } from "../models/Heartbeat";
 import * as quota from "../services/quota";
 import { getTenantObjectIdOrThrow } from "../services/quota";
 import logger from "../lib/logger";
+import Tenant from "../models/Tenant";
+import { releaseLocksForTask } from "./resourceLocks";
 
 const log = logger.child("amqp");
 const logPub = log.child("publish");
@@ -70,6 +76,40 @@ const toInventoryPayload = (env: Record<string, unknown>) => {
     };
 };
 
+const toStorageInventoryPayload = (env: Record<string, unknown>) => {
+    const candidate =
+        (env?.inventory && typeof env.inventory === "object" ? env.inventory : env) ||
+        {};
+
+    const storageId =
+        (env.storageId as string | undefined) ||
+        (candidate as Record<string, unknown>).storageId ||
+        (candidate as Record<string, unknown>).clusterId ||
+        undefined;
+
+    const tsRawCandidate =
+        (env.ts as unknown) ||
+        (candidate as Record<string, unknown>).collectedAt ||
+        (candidate as Record<string, unknown>).ts ||
+        undefined;
+
+    const tsRaw =
+        typeof tsRawCandidate === "string" ||
+        typeof tsRawCandidate === "number" ||
+        tsRawCandidate instanceof Date
+            ? tsRawCandidate
+            : undefined;
+
+    const parsedTs = tsRaw ? new Date(tsRaw) : new Date();
+    const ts = Number.isFinite(parsedTs.getTime()) ? parsedTs : new Date();
+
+    return {
+        storageId,
+        ts,
+        inventory: candidate as Record<string, unknown>,
+    };
+};
+
 export async function connect(): Promise<Channel> {
     if (ch) return ch;
 
@@ -86,9 +126,11 @@ export async function connect(): Promise<Channel> {
         arguments: { "x-message-ttl": 120_000, "x-max-length": 2000 },
     });
     await ch.assertQueue("agent.inventories", { durable: true });
+    await ch.assertQueue("storage.inventories", { durable: true });
 
     await ch.bindQueue("agent.heartbeats", TELE_EX, "heartbeat.*");
     await ch.bindQueue("agent.inventories", TELE_EX, "inventory.*");
+    await ch.bindQueue("storage.inventories", TELE_EX, "inventory.storage.*");
 
     ch.on("error", (error) => log.error("channel error", { error }));
     connection.on("close", () => log.error("connection closed"));
@@ -166,6 +208,12 @@ export async function startTelemetryConsumers({ Heartbeat }: { Heartbeat: Model<
         try {
             const headers = msg.properties?.headers || {};
             const env = JSON.parse(msg.content.toString()) as Record<string, unknown>;
+            const looksLikeStorage = env?.storageId || String(env?.kind || "").toLowerCase() === "storage";
+            if (looksLikeStorage) {
+                channel.ack(msg);
+                logInv.debug("inventory(light/full) skipped for storage payload", { storageId: env?.storageId });
+                return;
+            }
             const { agentId, ts, inventory } = toInventoryPayload(env);
             if (!agentId) throw new Error("missing agentId");
 
@@ -191,8 +239,32 @@ export async function startTelemetryConsumers({ Heartbeat }: { Heartbeat: Model<
         }
     };
 
+    const handleStorageInventory = async (msg: ConsumeMessage | null) => {
+        if (!msg) return;
+        try {
+            const env = JSON.parse(msg.content.toString()) as Record<string, unknown>;
+            const { storageId, ts, inventory } = toStorageInventoryPayload(env);
+            if (!storageId) throw new Error("missing storageId");
+
+            const doc = {
+                storageId,
+                ts,
+                inventory,
+                raw: env,
+            };
+
+            await InventoryStorage.findOneAndUpdate({ storageId }, { $set: doc }, { upsert: true });
+            channel.ack(msg);
+            logInv.debug("inventory(storage) stored", { storageId });
+        } catch (error) {
+            channel.nack(msg, false, false);
+            logInv.error("storage inventory error", { error });
+        }
+    };
+
     await channel.consume("agent.heartbeats", handleHeartbeat, { noAck: false });
     await channel.consume("agent.inventories", handleInventory, { noAck: false });
+    await channel.consume("storage.inventories", handleStorageInventory, { noAck: false });
     logTel.info("telemetry consumers started");
 }
 
@@ -214,29 +286,128 @@ async function onTaskSucceededUpsertTenantLink(TaskModel: TaskModelInput, payloa
     ).lean<{ action: string; tenantId?: string; agentId?: string; data?: Record<string, unknown> } | null>();
     if (!task?.tenantId || !task?.agentId) return;
 
-    const { action, tenantId, agentId, data } = task;
+    const normTenantId =
+        typeof task.tenantId === "string" ? task.tenantId.trim().toLowerCase() : task.tenantId;
+    const { action, agentId, data } = task;
     const haRequested = typeof data?.ha === "boolean" ? (data.ha as boolean) : undefined;
 
     const vmResult = (payload.result as { vm?: { guid?: string; name?: string } } | undefined)?.vm;
-    const refId = vmResult?.guid || vmResult?.name;
+    const vmRefId = vmResult?.guid || vmResult?.name || (typeof data?.refId === "string" ? data.refId : undefined);
 
-    if ((action === "vm.create" || action === "vm.clone") && refId) {
+    if ((action === "vm.create" || action === "vm.clone") && vmRefId) {
+        // Link tenant to VM inventory entry.
+        const set: Record<string, unknown> = {};
+        if (haRequested !== undefined) set.ha = haRequested;
+        if (vmResult?.name) set.name = vmResult.name;
+
         const update: Record<string, unknown> = {
-            $setOnInsert: { tenantId, assignedAt: new Date() },
+            $setOnInsert: { tenantId: normTenantId, assignedAt: new Date() },
+            $set: set,
         };
-        if (haRequested !== undefined) {
-            update.$set = { ha: haRequested };
-        }
         await TenantResource.updateOne(
-            { kind: "vm", agentId, refId },
+            { kind: "vm", agentId, refId: vmRefId },
             update,
             { upsert: true }
+        );
+
+        if (action === "vm.create") {
+            const diskId = typeof data?.diskId === "string" ? data.diskId : "";
+            if (diskId) {
+                const diskQuery: Record<string, unknown> = {
+                    tenantId: normTenantId,
+                    kind: "storage",
+                    $or: [{ refId: diskId }, { name: diskId }],
+                };
+                if (typeof data?.storageId === "string" && data.storageId) {
+                    diskQuery.agentId = data.storageId;
+                }
+                const diskUpdate: Record<string, unknown> = {
+                    attachedVmRefId: vmRefId,
+                    attachedVmAgentId: agentId,
+                    attachedVmName: vmResult?.name || (typeof data?.name === "string" ? data.name : undefined),
+                    attachedAt: new Date(),
+                };
+                const res = await TenantResource.updateOne(diskQuery, { $set: diskUpdate });
+                if (!res.matchedCount) {
+                    logRes.warn("disk attach link skipped (disk not found)", {
+                        taskId: payload.taskId,
+                        tenantId: normTenantId,
+                        agentId,
+                        vmRefId,
+                        diskId,
+                        storageId: data?.storageId,
+                    });
+                }
+            }
+        }
+
+        return;
+    }
+
+    if (action === "vm.delete" && vmRefId) {
+        await TenantResource.deleteOne({
+            kind: "vm",
+            agentId,
+            refId: vmRefId,
+        });
+        await TenantResource.updateMany(
+            { kind: "storage", attachedVmAgentId: agentId, attachedVmRefId: vmRefId },
+            { $unset: { attachedVmRefId: 1, attachedVmAgentId: 1, attachedVmName: 1, attachedAt: 1 } }
         );
         return;
     }
 
-    if (action === "vm.delete" && refId) {
-        await TenantResource.deleteOne({ kind: "vm", agentId, refId });
+    const looksLikeIqn = (value?: string | null) => /^iqn\./i.test(String(value || "").trim());
+
+    if (action === "disk.create" || action === "storage.create") {
+        const diskResult = (payload.result as { disk?: { refId?: string; id?: string; name?: string } } | undefined)?.disk;
+        const diskRef =
+            diskResult?.id ||
+            diskResult?.name ||
+            (!looksLikeIqn(diskResult?.refId) ? diskResult?.refId : undefined);
+        if (!diskRef) {
+            logRes.warn("tenant resource upsert skipped (no disk ref)", {
+                taskId: payload.taskId,
+                tenantId: normTenantId,
+                agentId,
+                action,
+                result: diskResult,
+            });
+            return;
+        }
+
+        const set: Record<string, unknown> = {};
+        if (diskResult?.name) set.name = diskResult.name;
+        const res = await TenantResource.updateOne(
+            { kind: "storage", agentId, refId: diskRef },
+            {
+                $setOnInsert: { tenantId: normTenantId, assignedAt: new Date() },
+                ...(Object.keys(set).length ? { $set: set } : {}),
+            },
+            { upsert: true }
+        );
+        logRes.info("tenant resource upsert (storage create)", {
+            taskId: payload.taskId,
+            tenantId: normTenantId,
+            agentId,
+            action,
+            diskRef,
+            result: diskResult,
+            upserted: res.upsertedCount ?? 0,
+            matched: res.matchedCount ?? 0,
+        });
+        return;
+    }
+
+    if (action === "disk.delete" || action === "storage.delete") {
+        const diskResult = (payload.result as { disk?: { refId?: string; id?: string; name?: string } } | undefined)?.disk;
+        const diskRef =
+            diskResult?.id ||
+            diskResult?.name ||
+            (!looksLikeIqn(diskResult?.refId) ? diskResult?.refId : undefined);
+        const ref = diskRef || (data?.refId as string | undefined);
+        if (!ref) return;
+        await TenantResource.deleteOne({ kind: "storage", agentId, refId: ref });
         return;
     }
 
@@ -246,7 +417,7 @@ async function onTaskSucceededUpsertTenantLink(TaskModel: TaskModelInput, payloa
         if (!switchRef) return;
         await TenantResource.updateOne(
             { kind: "switch", agentId, refId: switchRef },
-            { $setOnInsert: { tenantId, assignedAt: new Date() } },
+            { $setOnInsert: { tenantId: normTenantId, assignedAt: new Date() } },
             { upsert: true }
         );
     }
@@ -268,6 +439,13 @@ export async function startResultsToMongo(TaskModel: TaskModelInput, { queueName
             try {
                 const payload = JSON.parse(msg.content.toString()) as TaskResultPayload;
                 const rk = msg.fields.routingKey;
+
+                logRes.info("task result received", {
+                    taskId: payload.taskId,
+                    ok: !!payload.ok,
+                    agentId: payload.agentId,
+                    rk,
+                });
 
                 const existing = await TaskModel.findOne(
                     { taskId: payload.taskId },
@@ -355,6 +533,15 @@ export async function startResultsToMongo(TaskModel: TaskModelInput, { queueName
                     } catch (error) {
                         logRes.error("quota hold resolution error", { taskId: payload.taskId, error });
                     }
+                }
+
+                try {
+                    await releaseLocksForTask(payload.taskId);
+                } catch (error) {
+                    logRes.warn("resource lock release failed after result", {
+                        taskId: payload.taskId,
+                        error,
+                    });
                 }
 
                 channel.ack(msg);

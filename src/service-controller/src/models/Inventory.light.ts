@@ -1,3 +1,6 @@
+// src/service-controller/src/models/Inventory.light.ts
+// Mongoose model for light inventory snapshots
+
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import type { InventorySnapshot } from "./types";
 import InventoryFull from "./Inventory.full"

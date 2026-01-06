@@ -1,3 +1,4 @@
+// Simple scoring functions for agent capacity based on inventory snapshots used by election service
 interface InventoryVm {
     state?: string | null;
     powerState?: string | null;

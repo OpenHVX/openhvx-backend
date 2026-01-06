@@ -1,3 +1,6 @@
+// src/service-controller/src/models/Task.ts
+// Mongoose model for task records
+
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import type { TaskStatus } from "../types/domain";
 

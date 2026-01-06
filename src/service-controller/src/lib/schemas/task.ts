@@ -1,3 +1,5 @@
+//  Schema and validation for task-related payloads
+
 import {
     arrayOf,
     isEnum,
@@ -5,14 +7,19 @@ import {
     isString,
     objectStrict,
     optional,
+    recordOf,
     validate,
 } from "../validate";
 import type { ValidationResult, Validator } from "../validate";
 
 const isBoolean = isEnum([true, false] as const);
+const isStringArray = arrayOf(isString);
 
 export interface CloudInitNetwork {
-    mode?: "dhcp";
+    mode?: "dhcp" | "static";
+    address?: string;
+    gateway?: string;
+    nameservers?: string[];
 }
 
 export interface CloudInitConfig extends Record<string, unknown> {
@@ -28,6 +35,7 @@ export interface CloudInitConfig extends Record<string, unknown> {
 
 export interface VmCreatePayload extends Record<string, unknown> {
     name: string;
+    diskId: string;
     imageId?: string;
     cpu?: number;
     generation?: number;
@@ -53,14 +61,18 @@ const CloudInitSchema = objectStrict<CloudInitConfig>({
     serialReboot: optional(isBoolean),
     network: optional(
         objectStrict({
-            mode: optional(isEnum(["dhcp"] as const)),
+            mode: optional(isEnum(["dhcp", "static"] as const)),
+            address: optional(isString),
+            gateway: optional(isString),
+            nameservers: optional(arrayOf(isString)),
         })
     ),
 });
 
 const VmCreateSchema = objectStrict<VmCreatePayload>({
     name: isString,
-    imageId: optional(isString),
+    diskId: isString,
+    storageId: optional(isString),
     cpu: optional(isInteger),
     generation: optional(isInteger),
     ram: optional(isString),
@@ -77,8 +89,22 @@ const VmCreateSchema = objectStrict<VmCreatePayload>({
     cloudInit: optional(CloudInitSchema),
 });
 
+const DiskCreateSchema = objectStrict({
+    name: isString,
+    imageId: isString,
+    sizeMB: isInteger,
+});
+
+const DiskDeleteSchema = objectStrict({
+    refId: isString,
+});
+
 const PRE = {
     "vm.create": VmCreateSchema,
+    "disk.create": DiskCreateSchema,
+    "disk.delete": DiskDeleteSchema,
+    "storage.create": DiskCreateSchema,
+    "storage.delete": DiskDeleteSchema,
 
     "console.serial.open": objectStrict({
         readOnly: optional(isBoolean),

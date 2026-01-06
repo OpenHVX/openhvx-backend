@@ -1,3 +1,5 @@
+// Middleware to ensure the user has admin privileges
+
 import type { NextFunction, Response } from "express";
 import type { ControllerRequest } from "../types/express";
 

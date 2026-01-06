@@ -1,5 +1,5 @@
 import type { Response } from "express";
-import { cacheInfo, getById, list, resolvePath, reloadNow } from "../services/images";
+import { cacheInfo, getById, list, resolveImageRef, reloadNow } from "../services/images";
 import type { ControllerRequest } from "../types/express";
 import logger from "../lib/logger";
 import { respondEnvelope } from "../middlewares/addEnveloppe";
@@ -11,9 +11,6 @@ export const listImages: Handler = async (req, res) => {
     try {
         const data = await list({
             q: req.query.q as string | undefined,
-            gen: req.query.gen as string | undefined,
-            os: req.query.os as string | undefined,
-            arch: req.query.arch as string | undefined,
         });
         return respondEnvelope(res, req, "Images", { success: true, count: data.length, data });
     } catch (error) {
@@ -35,7 +32,7 @@ export const getImage: Handler = async (req, res) => {
 
 export const resolveImage: Handler = async (req, res) => {
     try {
-        const result = await resolvePath(req.params.imageId);
+        const result = await resolveImageRef(req.params.imageId);
         if (!result) return res.status(404).json({ error: "Unknown imageId" });
         return respondEnvelope(res, req, "Images", { success: true, data: result });
     } catch (error) {

@@ -104,7 +104,7 @@ export interface CanonicalVm {
   };
 
   memoryMb: number;
-
+  ipAddresses?: string[];
   disks: CanonicalVmDisk[];
   nics: CanonicalVmNic[];
 
@@ -126,8 +126,15 @@ export interface CanonicalVmDisk {
   id: string;                       // identifiant du disque (path, GUID, etc.)
   path: string;                     // "D:\\HVX\\CLIENT1\\vm01\\disk0.vhdx"
   sizeBytes: number;
+  diskNumber?: number;
   boot?: boolean;
-
+  iqn?: string;                     // iSCSI IQN — utilisé comme refId pour le lien storage/disk
+  /**
+   * Identifier of the backing storage object (ex: Ceph image refId).
+   * Use this to detect whether a storage disk is already attached to a VM.
+   */
+  storageRefId?: string;
+  storageId?: string;              // optional alias
   /**
    * Référence à CanonicalDatastore.id.
    * Exemple :

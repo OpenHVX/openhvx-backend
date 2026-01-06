@@ -1,3 +1,6 @@
+// src/service-controller/src/routes/tenant.routes.ts
+// Routes for tenant operations
+
 import { Router } from "express";
 import { asTenantMode } from "../middlewares/accessMode";
 import requireTenant from "../middlewares/requireTenant";

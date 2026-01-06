@@ -1,10 +1,12 @@
 import type { Response } from "express";
 import Heartbeat from "../models/Heartbeat";
 import Inventory from "../models/Inventory.full";
+import InventoryStorage from "../models/Inventory.storage";
 import Task from "../models/Task";
 import Tenant from "../models/Tenant";
 import TenantResource from "../models/TenantResource";
 import type { ControllerRequest } from "../types/express";
+import { getTenantQuotas } from "../services/quota";
 import logger from "../lib/logger";
 import { respondEnvelope } from "../middlewares/addEnveloppe";
 
@@ -23,48 +25,51 @@ const latestInventoriesByAgent = async () => {
     return map;
 };
 
-const pickRootDatastore = (
-    ds: Array<{
-        kind?: string;
-        path?: string;
-        totalBytes?: number;
-        freeBytes?: number;
-        sizeBytes?: number;
-        free?: number;
-        drive?: string;
-    }> = []
-) => {
-    if (!Array.isArray(ds) || ds.length === 0) {
-        return { totalBytes: 0, freeBytes: 0, item: null as unknown };
-    }
-    const root = ds.find(
-        (d) =>
-            String(d?.kind || "").toLowerCase() === "root" ||
-            /[\\\/]openhvx[\\\/]?$/i.test(String(d?.path || ""))
-    );
-    if (root) {
-        return {
-            totalBytes: Number(root.totalBytes ?? root.sizeBytes ?? 0),
-            freeBytes: Number(root.freeBytes ?? root.free ?? 0),
-            item: root,
-        };
-    }
-    const byDrive = new Map<string, { totalBytes: number; freeBytes: number; item: unknown }>();
-    for (const d of ds) {
-        const drive = String(d?.drive || "").toUpperCase();
-        if (!drive) continue;
-        const current = byDrive.get(drive);
-        const total = Number(d.totalBytes ?? d.sizeBytes ?? 0);
-        const free = Number(d.freeBytes ?? d.free ?? 0);
-        if (!current || total > current.totalBytes) byDrive.set(drive, { totalBytes: total, freeBytes: free, item: d });
-    }
+const storageTotals = async () => {
+    const docs = await InventoryStorage.find({}, { storageId: 1, inventory: 1 }).lean<
+        Array<{ storageId: string; inventory?: Record<string, any> }>
+    >();
+
     let totalBytes = 0;
+    let usedBytes = 0;
     let freeBytes = 0;
-    for (const value of byDrive.values()) {
-        totalBytes += value.totalBytes;
-        freeBytes += value.freeBytes;
+    const byStorage: Array<Record<string, unknown>> = [];
+
+    for (const doc of docs) {
+        const inv = (doc?.inventory as Record<string, any>) || {};
+        const capacity = inv.capacity || {};
+
+        let storageTotal = 0;
+        let storageUsed = 0;
+        let storageFree = 0;
+
+        // Use capacity block from storage.inventory.v1
+        const capTotal = Number(capacity.totalBytes ?? 0);
+        const capUsed = Number(capacity.usedBytes ?? 0);
+        const capAvail = Number(capacity.availBytes ?? 0);
+
+        storageTotal = Math.max(0, capTotal);
+        if (capUsed > 0) storageUsed = capUsed;
+        else if (capTotal > 0 && capAvail >= 0) storageUsed = Math.max(0, capTotal - capAvail);
+
+        storageFree = capAvail > 0 ? capAvail : Math.max(0, storageTotal - storageUsed);
+
+        if (!storageFree && storageTotal && storageUsed >= 0) storageFree = Math.max(0, storageTotal - storageUsed);
+
+        totalBytes += storageTotal;
+        usedBytes += storageUsed;
+        freeBytes += storageFree;
+
+        byStorage.push({
+            storageId: doc.storageId,
+            totalBytes: storageTotal,
+            usedBytes: storageUsed,
+            freeBytes: storageFree,
+            capacity: capacity || undefined,
+        });
     }
-    return { totalBytes, freeBytes, item: null };
+
+    return { totalBytes, usedBytes, freeBytes, byStorage };
 };
 
 const tasksCountsLast24h = async (filter: Record<string, unknown> = {}) => {
@@ -81,9 +86,10 @@ const tasksCountsLast24h = async (filter: Record<string, unknown> = {}) => {
 export const adminOverview: Handler = async (req, res) => {
     try {
         const now = Date.now();
-        const [hbs, invMap] = await Promise.all([
+        const [hbs, invMap, storage] = await Promise.all([
             Heartbeat.find({}, "agentId version lastSeen").lean(),
             latestInventoriesByAgent(),
+            storageTotals(),
         ]);
         const agents = { total: hbs.length, online: 0, offline: 0 };
         for (const hb of hbs) {
@@ -130,13 +136,28 @@ export const adminOverview: Handler = async (req, res) => {
                 vmStates[state] = (vmStates[state] || 0) + 1;
             }
 
-            const ds = (doc?.inventory as Record<string, any>)?.datastores || [];
-            const root = pickRootDatastore(ds);
-            dsTotalBytes += root.totalBytes;
-            dsFreeBytes += root.freeBytes;
         }
 
-        const tasks = await tasksCountsLast24h();
+        const [tasks, latestTasks] = await Promise.all([
+            tasksCountsLast24h(),
+            Task.find(
+                {},
+                {
+                    _id: 0,
+                    taskId: 1,
+                    tenantId: 1,
+                    agentId: 1,
+                    action: 1,
+                    status: 1,
+                    queuedAt: 1,
+                    finishedAt: 1,
+                    error: 1,
+                }
+            )
+                .sort({ queuedAt: -1 })
+                .limit(30)
+                .lean(),
+        ]);
 
         return respondEnvelope(res, req, "Quota", {
             success: true,
@@ -144,8 +165,8 @@ export const adminOverview: Handler = async (req, res) => {
             tenants,
             vms: { total: vmsTotal, byState: vmStates },
             compute: { cpuCores, memMB },
-            datastores: { totalBytes: dsTotalBytes, freeBytes: dsFreeBytes },
-            tasks: { last24h: tasks },
+            storage: storage,
+            tasks: { last24h: tasks, latest: latestTasks },
             ts: new Date().toISOString(),
         });
     } catch (error) {
@@ -156,30 +177,13 @@ export const adminOverview: Handler = async (req, res) => {
 
 export const adminDatastores: Handler = async (req, res) => {
     try {
-        const invMap = await latestInventoriesByAgent();
-        const byAgent: Array<Record<string, unknown>> = [];
-        let totalBytes = 0;
-        let freeBytes = 0;
-
-        for (const [agentId, doc] of invMap.entries()) {
-            const ds = (doc?.inventory as Record<string, any>)?.datastores || [];
-            const root = pickRootDatastore(ds);
-            totalBytes += root.totalBytes;
-            freeBytes += root.freeBytes;
-            byAgent.push({
-                agentId,
-                totalBytes: root.totalBytes,
-                freeBytes: root.freeBytes,
-                root: root.item,
-                all: ds,
-            });
-        }
-
+        const storage = await storageTotals();
         return respondEnvelope(res, req, "Quota", {
             success: true,
-            totalBytes,
-            freeBytes,
-            byAgent,
+            totalBytes: storage.totalBytes,
+            usedBytes: storage.usedBytes,
+            freeBytes: storage.freeBytes,
+            byStorage: storage.byStorage,
             ts: new Date().toISOString(),
         });
     } catch (error) {
@@ -274,9 +278,13 @@ export const tenantOverview: Handler = async (req, res) => {
         const tenantId = req.tenantId;
         if (!tenantId) return res.status(400).json({ error: "Missing tenant context" });
 
-        const [tasksSummary, resourceCount] = await Promise.all([
+        const tenantDoc = await Tenant.findOne({ tenantId }, { _id: 1 }).lean();
+        if (!tenantDoc?._id) return res.status(404).json({ error: "Tenant not found" });
+
+        const [tasksSummary, resourceCount, quotas] = await Promise.all([
             tasksCountsLast24h({ tenantId }),
             TenantResource.countDocuments({ tenantId }),
+            getTenantQuotas(tenantDoc._id),
         ]);
 
         return respondEnvelope(res, req, "Quota", {
@@ -284,6 +292,7 @@ export const tenantOverview: Handler = async (req, res) => {
             data: {
                 tasks: tasksSummary,
                 resources: resourceCount,
+                quotas,
             },
         });
     } catch (error) {

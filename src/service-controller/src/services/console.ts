@@ -1,3 +1,6 @@
+// src/service-controller/src/services/console.ts
+// Service for planning console tunnels (serial and net)
+
 import jwt from "jsonwebtoken";
 import { randomUUID } from "node:crypto";
 import { isValidObjectId, Types } from "mongoose";
@@ -115,9 +118,6 @@ async function loadVmOrThrow({ refId, tenantId, agentId }: VmQuery): Promise<Non
 
     const byRef = await findVm({ ...base, refId });
     if (byRef) return byRef;
-
-    const byGuid = await findVm({ ...base, guid: refId });
-    if (byGuid) return byGuid;
 
     throw new Error("vm not found");
 }

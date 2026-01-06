@@ -16,7 +16,7 @@ RUN npm install --omit=dev
 
 COPY --from=builder /app/dist ./dist
 COPY policies ./policies
-COPY openapi.yaml ./openapi.yaml
+
 
 EXPOSE 8080
 CMD ["node", "dist/app.js"]
