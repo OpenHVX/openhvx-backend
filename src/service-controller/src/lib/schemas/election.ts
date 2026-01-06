@@ -1,3 +1,5 @@
+// Schema and validation for election payloads
+
 import { arrayOf, isInteger, isString, objectStrict, validate } from "../validate";
 import type { ValidationResult } from "../validate";
 import type { ElectionRequirements } from "../../types/domain";

@@ -1,3 +1,6 @@
+// src/service-controller/src/models/TenantResource.ts
+// Mongoose model for tenant resource links (mostly VMs and their components)
+
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import type { ResourceKind } from "../types/domain";
 

@@ -1,3 +1,6 @@
+// src/service-controller/src/services/images.ts
+// Service for listing and resolving images from storage inventory (ceph telemetry)
+
 import type { PipelineStage } from "mongoose";
 import InventoryStorage from "../models/Inventory.storage";
 import type { StorageInventoryPayload, StorageInventoryV1 } from "../types/inventory/storage";

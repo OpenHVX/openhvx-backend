@@ -1,3 +1,6 @@
+// src/service-controller/src/models/Tenant.ts
+// Mongoose model for tenant records
+
 import { Schema, model, type HydratedDocument, type Model, type Document } from "mongoose";
 import { quota } from "../lib/defaults";
 import type { QuotaItem, QuotaKey } from "../types/domain";

@@ -1,8 +1,11 @@
+// src/service-controller/src/services/quota.ts
+
 // Quota service:
 // - keeps tenant quota limits and usage sane
 // - offers holds/reservations to make async tasks safer
 // - recomputes usage from the latest stored inventory + TenantResource links
 // This file tries to be resilient to partial/heterogeneous inventories.
+
 import type { Types } from "mongoose";
 import Tenant from "../models/Tenant";
 import TenantResource, { type TenantResourceLink } from "../models/TenantResource";

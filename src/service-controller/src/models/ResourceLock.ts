@@ -1,3 +1,5 @@
+// src/service-controller/src/models/ResourceLock.ts
+
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 
 // Generic lock document to serialize access to shared resources (disks, VMs, network...).

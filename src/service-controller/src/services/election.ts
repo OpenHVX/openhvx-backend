@@ -1,3 +1,6 @@
+// src/service-controller/src/services/election.ts
+// Service for agent election based on inventory scores and heartbeat freshness
+
 import Inventory from "../models/Inventory.full";
 import Heartbeat from "../models/Heartbeat";
 import type { Heartbeat as HeartbeatDoc } from "../models/Heartbeat";

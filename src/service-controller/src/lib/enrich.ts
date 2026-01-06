@@ -1,3 +1,5 @@
+// Enrich and augment operation payloads before processing (pushing to agents, etc)
+
 import { resolveImageRef } from "../services/images";
 import { planNetTunnelOpen, planSerialOpen, type TunnelPlan } from "../services/console";
 import InventoryStorage from "../models/Inventory.storage";

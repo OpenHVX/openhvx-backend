@@ -1,4 +1,6 @@
-//src/service-controller/src/services/amqp.ts
+// src/service-controller/src/services/amqp.ts
+// AMQP service for task publishing and telemetry consumption
+
 import {
     connect as connectAmqp,
     type Channel,

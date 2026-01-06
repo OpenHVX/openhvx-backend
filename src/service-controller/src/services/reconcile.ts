@@ -1,3 +1,5 @@
+// src/service-controller/src/services/reconcile.ts
+
 // Not used today, but kept for possible future use.
 // Reconcile service:
 // - compares TenantResource VM links with the latest inventories (full + light) per agent

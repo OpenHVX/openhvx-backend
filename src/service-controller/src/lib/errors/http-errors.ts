@@ -1,3 +1,4 @@
+// Standarization of erros, for the whole controller, to add in other services later
 import type { Response } from "express";
 import type { ControllerRequest } from "../../types/express";
 import { envelope, scopeForReq } from "../../middlewares/addEnveloppe";

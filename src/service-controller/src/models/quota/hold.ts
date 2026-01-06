@@ -1,3 +1,6 @@
+// src/service-controller/src/models/quota/hold.ts
+// Mongoose model for quota hold records
+
 import { Schema, model, Types, type HydratedDocument, type Model } from "mongoose";
 import type { QuotaDeltas } from "../../types/domain";
 

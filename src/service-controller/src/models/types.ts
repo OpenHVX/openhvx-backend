@@ -1,4 +1,6 @@
-//models/types.ts
+// src/service-controller/src/models/types.ts
+
+
 import type { CanonicalInventory } from "../types/inventory/canonical";
 
 export interface InventorySnapshot {

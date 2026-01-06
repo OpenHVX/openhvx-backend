@@ -1,3 +1,6 @@
+// src/service-controller/src/models/Heartbeat.ts
+// Mongoose model for agent heartbeat records
+
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 
 export interface Heartbeat {

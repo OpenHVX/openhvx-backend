@@ -1,5 +1,5 @@
 /**
- * Tiny structured logger with namespaces.
+ * Tiny structured logger with namespaces, standardized for all services. 
  *
  * Env:
  *  - LOG_ENABLED=0            -> disable logs (default: enabled)

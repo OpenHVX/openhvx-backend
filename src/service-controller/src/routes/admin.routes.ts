@@ -1,3 +1,6 @@
+// src/service-controller/src/routes/admin.routes.ts
+// Routes for admin operations
+
 import { Router } from "express";
 import { asAdminMode } from "../middlewares/accessMode";
 import {

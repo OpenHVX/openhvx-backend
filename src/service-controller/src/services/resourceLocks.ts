@@ -1,3 +1,6 @@
+// src/service-controller/src/services/resourceLocks.ts
+// Service for acquiring and releasing resource locks
+
 import ResourceLock, { type ResourceKind } from "../models/ResourceLock";
 import { ERR, type HttpErrorPayload } from "../lib/errors/http-errors";
 import logger from "../lib/logger";

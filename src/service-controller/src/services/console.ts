@@ -1,3 +1,6 @@
+// src/service-controller/src/services/console.ts
+// Service for planning console tunnels (serial and net)
+
 import jwt from "jsonwebtoken";
 import { randomUUID } from "node:crypto";
 import { isValidObjectId, Types } from "mongoose";

@@ -1,3 +1,6 @@
+// src/service-controller/src/models/Inventory.storage.ts
+// Mongoose model for storage inventory snapshots
+
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import type { StorageInventoryPayload } from "../types/inventory/storage";
 

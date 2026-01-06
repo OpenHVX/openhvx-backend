@@ -1,3 +1,5 @@
+// Schema and validation for resource-related payloads
+
 import {
     arrayOf,
     isEnum,
