@@ -355,6 +355,179 @@ const pickFromInv = (
     return out;
 };
 
+const buildAllowByAgent = (links: TenantResourceLink[]) => {
+    const allowByAgent = new Map<string, Set<string>>();
+    for (const link of links) {
+        if (link.kind !== "vm") continue;
+        const set = allowByAgent.get(link.agentId) || new Set<string>();
+        if (link.refId) set.add(link.refId.toLowerCase());
+        if (link.name) set.add(link.name.toLowerCase());
+        allowByAgent.set(link.agentId, set);
+    }
+    return allowByAgent;
+};
+
+const buildStaleByAgent = (
+    agentIds: string[],
+    hbBy: Map<string, { lastSeen?: Date | string }>,
+    now: number
+) => {
+    const staleByAgent = new Map<string, boolean>();
+    for (const id of agentIds) {
+        const hbDoc = hbBy.get(id);
+        const hbStale = isHeartbeatStale(hbDoc, now);
+        // If no heartbeat, consider the agent stale.
+        staleByAgent.set(id, hbDoc ? hbStale : true);
+    }
+    return staleByAgent;
+};
+
+const buildVmIndexByAgent = (
+    agentIds: string[],
+    fullBy: Map<string, InventoryDoc>,
+    lightBy: Map<string, InventoryDoc>,
+    allowByAgent: Map<string, Set<string>>
+) => {
+    const vmIdxByAgent = new Map<string, Map<string, InventoryVm>>();
+    for (const id of agentIds) {
+        const merged = combineAgent(
+            fullBy.get(id) || null,
+            lightBy.get(id) || null,
+            allowByAgent.get(id) || null
+        );
+        const idx = new Map<string, InventoryVm>();
+        for (const vm of merged) {
+            const keys = [vm.id, (vm as { uuid?: string }).uuid, (vm as { _id?: string })._id, vm.name]
+                .filter(Boolean)
+                .map(String);
+            keys.forEach((key) => idx.set(key, vm));
+        }
+        vmIdxByAgent.set(id, idx);
+    }
+    return vmIdxByAgent;
+};
+
+const buildAttachedDisksByVm = (links: TenantResourceLink[]) => {
+    const attachedDisksByVm = new Map<
+        string,
+        Array<{ refId?: string; agentId?: string; name?: string; attachedAt?: Date }>
+    >();
+    for (const link of links) {
+        if (link.kind !== "storage") continue;
+        if (!link.attachedVmRefId || !link.attachedVmAgentId) continue;
+        const key = `${link.attachedVmAgentId}|${link.attachedVmRefId}`;
+        const safeRefId = looksLikeIqn(link.refId) ? (link.name || link.refId) : link.refId;
+        const list = attachedDisksByVm.get(key) || [];
+        list.push({
+            refId: safeRefId,
+            agentId: link.agentId,
+            name: link.name,
+            attachedAt: link.attachedAt,
+        });
+        attachedDisksByVm.set(key, list);
+    }
+    return attachedDisksByVm;
+};
+
+const findVmForLink = (idx: Map<string, InventoryVm>, link: TenantResourceLink) => {
+    let vm = idx.get(String(link.refId));
+    if (!vm && link.name) {
+        vm = idx.get(String(link.name));
+        if (!vm) {
+            const wanted = link.name.toLowerCase();
+            for (const candidate of idx.values()) {
+                if ((candidate?.name || "").toLowerCase() === wanted) {
+                    vm = candidate;
+                    break;
+                }
+            }
+        }
+    }
+    if (!vm && /^[a-z0-9._-]+$/i.test(String(link.refId))) {
+        const wanted = String(link.refId).toLowerCase();
+        for (const candidate of idx.values()) {
+            if ((candidate?.name || "").toLowerCase() === wanted) {
+                vm = candidate;
+                break;
+            }
+        }
+    }
+    return vm;
+};
+
+const recordVmIqnLinks = (
+    vm: InventoryVm,
+    link: TenantResourceLink,
+    iqnToTenantVm: Map<string, { refId: string; agentId: string; name?: string }>
+) => {
+    for (const disk of Array.isArray(vm?.disks) ? vm.disks : []) {
+        const iqn = typeof disk?.iqn === "string" ? disk.iqn.trim() : "";
+        if (!iqn) continue;
+        const key = iqn.toLowerCase();
+        if (!iqnToTenantVm.has(key)) {
+            iqnToTenantVm.set(key, {
+                refId: link.refId,
+                agentId: link.agentId,
+                name: (vm as { name?: string }).name || link.name || link.refId,
+            });
+        }
+    }
+};
+
+const buildVmOutput = (
+    link: TenantResourceLink,
+    ensuredTenantId: string,
+    vm: InventoryVm,
+    stale: boolean,
+    attachedDisks?: Array<{ refId?: string; agentId?: string; name?: string; attachedAt?: Date }>
+) => {
+    const vmSafe = normalizeVmIpAddresses(sanitizeVmDisks(vm));
+    const ipAddresses = Array.isArray(vmSafe.ipAddresses) ? vmSafe.ipAddresses : [];
+    const vmWithIp = { ...vmSafe, ipAddresses };
+    const vmOut = {
+        ...vmWithIp,
+        tenantId: ensuredTenantId,
+        agentId: link.agentId,
+        kind: "vm",
+        refId: link.refId,
+        ha: link.ha ?? false,
+        ...(attachedDisks ? { attachedDisks } : {}),
+        _staleAgent: stale,
+    };
+    if (stale) vmOut.powerState = "Unknown";
+    return vmOut;
+};
+
+const buildStorageOutput = (
+    link: TenantResourceLink,
+    ensuredTenantId: string,
+    vol: Record<string, unknown>,
+    stale: boolean,
+    state: string,
+    attached?: { refId?: string; agentId?: string; name?: string; attachedAt?: Date }
+) => {
+    const volSafe = stripIqnField(vol);
+    const safeRefId = String(vol.refId || link.name || link.refId || "");
+    const usedBytes =
+        typeof vol?.usedBytes === "number" && Number.isFinite(vol.usedBytes)
+            ? Math.max(0, vol.usedBytes)
+            : undefined;
+    return {
+        ...volSafe,
+        tenantId: ensuredTenantId,
+        agentId: link.agentId,
+        kind: "storage",
+        refId: safeRefId,
+        name: link.name || vol.refId,
+        sizeMB: sizeMbFromStorageImage(vol),
+        ...(usedBytes !== undefined ? { usedBytes, usedMB: Math.round(usedBytes / 1024 / 1024) } : {}),
+        ha: link.ha ?? false,
+        state: stale ? "Unknown" : state,
+        ...(attached ? { attachedTo: attached } : {}),
+        _staleAgent: stale,
+    };
+};
+
 export const listResources: Handler = async (req, res) => {
     try {
         const tenantId = getTenantId(req);
@@ -406,59 +579,12 @@ export const listResources: Handler = async (req, res) => {
         const storageBy = new Map(storageDocs.map((doc) => [doc.storageId, doc]));
         const hbBy = new Map(heartbeatDocs.map((hb) => [hb.agentId, hb]));
 
-        const allowByAgent = new Map<string, Set<string>>();
-        for (const link of links) {
-            if (link.kind !== "vm") continue;
-            const set = allowByAgent.get(link.agentId) || new Set<string>();
-            if (link.refId) set.add(link.refId.toLowerCase());
-            if (link.name) set.add(link.name.toLowerCase());
-            allowByAgent.set(link.agentId, set);
-        }
+        const allowByAgent = buildAllowByAgent(links);
 
         const now = Date.now();
-        const staleByAgent = new Map<string, boolean>();
-        for (const id of agentIds) {
-            const hbDoc = hbBy.get(id);
-            const hbStale = isHeartbeatStale(hbDoc, now);
-            // If no heartbeat, consider the agent stale.
-            staleByAgent.set(id, hbDoc ? hbStale : true);
-        }
-
-        const vmIdxByAgent = new Map<string, Map<string, InventoryVm>>();
-        for (const id of agentIds) {
-            const merged = combineAgent(
-                fullBy.get(id) || null,
-                lightBy.get(id) || null,
-                allowByAgent.get(id) || null
-            );
-            const idx = new Map<string, InventoryVm>();
-            for (const vm of merged) {
-                const keys = [vm.id, (vm as { uuid?: string }).uuid, (vm as { _id?: string })._id, vm.name]
-                    .filter(Boolean)
-                    .map(String);
-                keys.forEach((key) => idx.set(key, vm));
-            }
-            vmIdxByAgent.set(id, idx);
-        }
-
-        const attachedDisksByVm = new Map<
-            string,
-            Array<{ refId?: string; agentId?: string; name?: string; attachedAt?: Date }>
-        >();
-        for (const link of links) {
-            if (link.kind !== "storage") continue;
-            if (!link.attachedVmRefId || !link.attachedVmAgentId) continue;
-            const key = `${link.attachedVmAgentId}|${link.attachedVmRefId}`;
-            const safeRefId = looksLikeIqn(link.refId) ? (link.name || link.refId) : link.refId;
-            const list = attachedDisksByVm.get(key) || [];
-            list.push({
-                refId: safeRefId,
-                agentId: link.agentId,
-                name: link.name,
-                attachedAt: link.attachedAt,
-            });
-            attachedDisksByVm.set(key, list);
-        }
+        const staleByAgent = buildStaleByAgent(agentIds, hbBy, now);
+        const vmIdxByAgent = buildVmIndexByAgent(agentIds, fullBy, lightBy, allowByAgent);
+        const attachedDisksByVm = buildAttachedDisksByVm(links);
 
         const iqnToTenantVm = new Map<string, { refId: string; agentId: string; name?: string }>();
 
@@ -466,60 +592,14 @@ export const listResources: Handler = async (req, res) => {
         for (const link of links) {
             if (link.kind === "vm") {
                 const idx = vmIdxByAgent.get(link.agentId) || new Map<string, InventoryVm>();
-                let vm = idx.get(String(link.refId));
-                if (!vm && link.name) {
-                    vm = idx.get(String(link.name));
-                    if (!vm) {
-                        const wanted = link.name.toLowerCase();
-                        for (const candidate of idx.values()) {
-                            if ((candidate?.name || "").toLowerCase() === wanted) {
-                                vm = candidate;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (!vm && /^[a-z0-9._-]+$/i.test(String(link.refId))) {
-                    const wanted = String(link.refId).toLowerCase();
-                    for (const candidate of idx.values()) {
-                        if ((candidate?.name || "").toLowerCase() === wanted) {
-                            vm = candidate;
-                            break;
-                        }
-                    }
-                }
+                const vm = findVmForLink(idx, link);
 
                 if (vm) {
                     const stale = !!staleByAgent.get(link.agentId);
-                    for (const disk of Array.isArray(vm?.disks) ? vm.disks : []) {
-                        const iqn = typeof disk?.iqn === "string" ? disk.iqn.trim() : "";
-                        if (!iqn) continue;
-                        const key = iqn.toLowerCase();
-                        if (!iqnToTenantVm.has(key)) {
-                            iqnToTenantVm.set(key, {
-                                refId: link.refId,
-                                agentId: link.agentId,
-                                name: (vm as { name?: string }).name || link.name || link.refId,
-                            });
-                        }
-                    }
-                    const vmSafe = normalizeVmIpAddresses(sanitizeVmDisks(vm));
-                    const ipAddresses = Array.isArray(vmSafe.ipAddresses) ? vmSafe.ipAddresses : [];
-                    const vmWithIp = { ...vmSafe, ipAddresses };
                     const attachedKey = `${link.agentId}|${link.refId}`;
                     const attachedDisks = attachedDisksByVm.get(attachedKey);
-                    const vmOut = {
-                        ...vmWithIp,
-                        tenantId: ensuredTenantId,
-                        agentId: link.agentId,
-                        kind: "vm",
-                        refId: link.refId,
-                        ha: link.ha ?? false,
-                        ...(attachedDisks ? { attachedDisks } : {}),
-                        _staleAgent: stale,
-                    };
-                    if (stale) vmOut.powerState = "Unknown";
-                    out.push(vmOut);
+                    recordVmIqnLinks(vm, link, iqnToTenantVm);
+                    out.push(buildVmOutput(link, ensuredTenantId, vm, stale, attachedDisks));
                 } else if (showOrphans) {
                     out.push({
                         tenantId: ensuredTenantId,
@@ -576,28 +656,16 @@ export const listResources: Handler = async (req, res) => {
                         : undefined);
 
                 if (vol) {
-                    const volSafe = stripIqnField(vol as Record<string, unknown>);
-                    const safeRefId = String(vol.refId || link.name || link.refId || "");
-                    const usedBytes =
-                        typeof vol?.usedBytes === "number" && Number.isFinite(vol.usedBytes)
-                            ? Math.max(0, vol.usedBytes)
-                            : undefined;
-                    out.push({
-                        ...volSafe,
-                        tenantId: ensuredTenantId,
-                        agentId: link.agentId,
-                        kind: "storage",
-                        refId: safeRefId,
-                        name: link.name || vol.refId,
-                        sizeMB: sizeMbFromStorageImage(vol),
-                        ...(usedBytes !== undefined
-                            ? { usedBytes, usedMB: Math.round(usedBytes / 1024 / 1024) }
-                            : {}),
-                        ha: link.ha ?? false,
-                        state: stale ? "Unknown" : state,
-                        ...(attached ? { attachedTo: attached } : {}),
-                        _staleAgent: stale,
-                    });
+                    out.push(
+                        buildStorageOutput(
+                            link,
+                            ensuredTenantId,
+                            vol as Record<string, unknown>,
+                            stale,
+                            state,
+                            attached
+                        )
+                    );
                 } else if (showOrphans) {
                     const safeRefId = looksLikeIqn(refRaw) ? (link.name || "(unknown)") : link.refId;
                     out.push({
