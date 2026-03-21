@@ -13,7 +13,7 @@ logs
 *.log.*
 *.out
 *.err
-!**/middleware/req.log.ts
+!**/middlewares/req.log.ts
 # Runtime data
 pids
 *.pid
