@@ -17,13 +17,15 @@ export type InventoryStorageModel = Model<InventoryStorageSnapshot>;
 
 const inventoryStorageSchema = new Schema<InventoryStorageSnapshot>(
     {
-        storageId: { type: String, index: true },
+        storageId: { type: String, required: true },
         ts: { type: Date, index: true },
         inventory: { type: Object },
         raw: { type: Object },
     },
     { minimize: false }
 );
+
+inventoryStorageSchema.index({ storageId: 1 }, { unique: true });
 
 const InventoryStorage = model<InventoryStorageSnapshot>("InventoryStorage", inventoryStorageSchema);
 

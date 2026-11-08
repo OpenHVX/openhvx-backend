@@ -1,10 +1,14 @@
+import { saveSnapshot } from "./operations/snapshots";
+import { applyTaskResult, InvalidResult } from "./operations/results";
+import "dotenv/config";
 // src/service-controller/src/services/amqp.ts
 // AMQP service for task publishing and telemetry consumption
 
 import {
     connect as connectAmqp,
     type Channel,
-    type Connection,
+    type ChannelModel as Connection,
+    type ConfirmChannel,
     type ConsumeMessage,
     type Options,
 } from "amqplib";
@@ -14,30 +18,166 @@ import type { Model } from "mongoose";
 import InventoryFull from "../models/Inventory.full";
 import InventoryLight from "../models/Inventory.light";
 import InventoryStorage from "../models/Inventory.storage";
-import TenantResource from "../models/TenantResource";
 import type { TaskRecord } from "../models/Task";
 import type { Heartbeat } from "../models/Heartbeat";
-import * as quota from "../services/quota";
-import { getTenantObjectIdOrThrow } from "../services/quota";
 import logger from "../lib/logger";
-import Tenant from "../models/Tenant";
-import { releaseLocksForTask } from "./resourceLocks";
+import { parseTaskResult, type TaskResultPayload } from "../lib/schemas/task-result";
 
 const log = logger.child("amqp");
 const logPub = log.child("publish");
 const logTel = log.child("telemetry");
 const logInv = log.child(["telemetry", "inventory"]);
 const logRes = log.child("results");
+// A channel can close between commit and ack. The broker owns redelivery;
+// attempting a second nack on a closed channel must not crash the process.
+const settleDelivery = (channel: Channel, msg: ConsumeMessage, requeue?: boolean) => {
+    try {
+        if (requeue === undefined) channel.ack(msg);
+        else channel.nack(msg, false, requeue);
+    } catch { log.warn("Delivery channel closed before settlement; awaiting broker redelivery"); }
+};
+
 
 const RMQ_URL = process.env.RMQ_URL || "amqp://guest:guest@localhost:5672/";
+if (process.env.NODE_ENV === "production") {
+    const url = new URL(RMQ_URL);
+    if (!process.env.RMQ_URL || url.username === "guest" || ["guest", "change-me-rabbitmq"].includes(decodeURIComponent(url.password))) throw new Error("Production requires explicit RabbitMQ credentials");
+}
+const queueType = process.env.AMQP_QUEUE_TYPE || "classic";
+if (!["classic", "quorum"].includes(queueType)) throw new Error("AMQP_QUEUE_TYPE must be classic or quorum");
+const queueArguments = () => ({ "x-queue-type": queueType });
 const JOBS_EX = process.env.JOBS_EXCHANGE || "jobs";
 const TELE_EX = process.env.TELEMETRY_EXCHANGE || "agent.telemetry";
 const RES_EX = process.env.RESULTS_EXCHANGE || "results";
+const CONNECT_RETRY_BASE_MS = 1_000;
+const CONNECT_RETRY_MAX_MS = 30_000;
+const DEFAULT_CONNECT_MAX_ATTEMPTS = Number(process.env.AMQP_CONNECT_MAX_ATTEMPTS || 6);
 
+let stopping = false;
+let initialized = false;
 let conn: Connection | null = null;
-let ch: Channel | null = null;
+let ch: ConfirmChannel | null = null;
+let connectPromise: Promise<ConfirmChannel> | null = null;
+const assertedQueues = new Set<string>();
+const consumerRegistrations = new Map<string, (channel: ConfirmChannel) => Promise<void>>();
 
-const isLightInventory = (headers: Options.MessagePropertyHeaders, env: Record<string, unknown>) => {
+export const amqpHealth = () => ({
+    ready: Boolean(conn && ch && initialized),
+    connecting: Boolean(connectPromise),
+    consumers: consumerRegistrations.size,
+});
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const resetConnectionState = ({
+    connection,
+    channel,
+    reason,
+    error,
+}: {
+    connection?: Connection | null;
+    channel?: Channel | null;
+    reason: string;
+    error?: unknown;
+}) => {
+    if (connection && conn && connection !== conn) return;
+    if (channel && ch && channel !== ch) return;
+    if (ch || conn) {
+        log.warn("connection state reset", {
+            reason,
+            error: error instanceof Error ? error.message : error,
+        });
+    }
+    const previous = conn;
+    initialized = false;
+    ch = null;
+    conn = null;
+    if (previous) void previous.close().catch(() => undefined);
+    assertedQueues.clear();
+};
+
+const redactAmqpUrl = (url: string) => {
+    try {
+        const parsed = new URL(url);
+        if (parsed.username) parsed.username = "***";
+        if (parsed.password) parsed.password = "***";
+        return parsed.toString();
+    } catch {
+        return "<invalid-amqp-url>";
+    }
+};
+
+const scheduleReconnect = (reason: string) => {
+    if (stopping || !consumerRegistrations.size) return;
+    if (ch || connectPromise) return;
+    void connect({ reason, maxAttempts: Number.POSITIVE_INFINITY }).catch((error) => {
+        log.error("background reconnect failed", { reason, error });
+    });
+};
+
+const wireConnectionLifecycle = (connection: Connection, channel: ConfirmChannel) => {
+    channel.on("error", (error) => {
+        log.error("channel error", { error });
+        resetConnectionState({ connection, channel, reason: "channel error", error });
+        scheduleReconnect("channel error");
+    });
+    channel.on("close", () => {
+        log.error("channel closed");
+        resetConnectionState({ connection, channel, reason: "channel close" });
+        scheduleReconnect("channel close");
+    });
+    connection.on("error", (error) => {
+        log.error("connection error", { error });
+        resetConnectionState({ connection, channel, reason: "connection error", error });
+        scheduleReconnect("connection error");
+    });
+    connection.on("close", () => {
+        log.error("connection closed");
+        resetConnectionState({ connection, channel, reason: "connection close" });
+        scheduleReconnect("connection close");
+    });
+};
+
+const registerConsumer = async (key: string, setup: (channel: ConfirmChannel) => Promise<void>) => {
+    if (consumerRegistrations.has(key)) return;
+    const hadLiveChannel = Boolean(ch && initialized);
+    consumerRegistrations.set(key, setup);
+    if (hadLiveChannel && ch) {
+        initialized = false;
+        await setup(ch);
+        initialized = true;
+        log.info("consumer registered", { key });
+        return;
+    }
+    await connect({ reason: `register:${key}`, maxAttempts: Number.POSITIVE_INFINITY });
+};
+
+const initializeChannel = async (channel: ConfirmChannel) => {
+    await channel.assertExchange(JOBS_EX, "direct", { durable: true });
+    await channel.assertExchange(TELE_EX, "topic", { durable: true });
+    await channel.assertExchange(RES_EX, "topic", { durable: true });
+
+    await channel.assertQueue("telemetry.invalid.v2", { durable: true, arguments: queueArguments() });
+    await channel.assertQueue("agent.heartbeats.v2", {
+        durable: true,
+        arguments: { ...queueArguments(), "x-dead-letter-exchange": "", "x-dead-letter-routing-key": "telemetry.invalid.v2", "x-message-ttl": 120_000, "x-max-length": 2000 },
+    });
+    await channel.assertQueue("agent.inventories.v2", { durable: true, arguments: { ...queueArguments(), "x-dead-letter-exchange": "", "x-dead-letter-routing-key": "telemetry.invalid.v2" } });
+    await channel.assertQueue("storage.inventories.v2", { durable: true, arguments: { ...queueArguments(), "x-dead-letter-exchange": "", "x-dead-letter-routing-key": "telemetry.invalid.v2" } });
+
+    await channel.bindQueue("agent.heartbeats.v2", TELE_EX, "heartbeat.*");
+    await channel.bindQueue("agent.inventories.v2", TELE_EX, "inventory.*");
+    await channel.bindQueue("storage.inventories.v2", TELE_EX, "inventory.storage.*");
+
+    await channel.prefetch(50);
+
+    for (const [key, setup] of consumerRegistrations.entries()) {
+        await setup(channel);
+        log.info("consumer re-registered", { key });
+    }
+};
+
+const isLightInventory = (headers: Record<string, unknown>, env: Record<string, unknown>) => {
     const mode = headers?.["x-merge-mode"] || env?.mergeMode;
     const source = headers?.["x-source"] || env?.source;
     return mode === "patch-nondestructive" || source === "inventory.refresh.light";
@@ -110,38 +250,56 @@ const toStorageInventoryPayload = (env: Record<string, unknown>) => {
     };
 };
 
-export async function connect(): Promise<Channel> {
-    if (ch) return ch;
+export async function connect({
+    reason = "demand",
+    maxAttempts = DEFAULT_CONNECT_MAX_ATTEMPTS,
+}: {
+    reason?: string;
+    maxAttempts?: number;
+} = {}): Promise<ConfirmChannel> {
+    if (ch && initialized) return ch;
+    if (connectPromise) return connectPromise;
 
-    const connection = await connectAmqp(RMQ_URL);
-    conn = connection;
-    ch = await connection.createChannel();
+    connectPromise = (async () => {
+        let attempt = 0;
+        while (!stopping && (attempt < maxAttempts || !Number.isFinite(maxAttempts))) {
+            attempt += 1;
+            try {
+                log.info("connecting", { url: redactAmqpUrl(RMQ_URL), reason, attempt });
+                const connection = await connectAmqp(RMQ_URL, { timeout: 10000 });
+                const channel = await connection.createConfirmChannel();
+                conn = connection;
+                ch = channel;
+                assertedQueues.clear();
+                wireConnectionLifecycle(connection, channel);
+                await initializeChannel(channel);
+                initialized = true;
+                log.info("connected", { url: redactAmqpUrl(RMQ_URL), reason, attempt });
+                return channel;
+            } catch (error) {
+                resetConnectionState({ reason: "connect failure", error });
+                const delayMs = Math.min(CONNECT_RETRY_BASE_MS * 2 ** (attempt - 1), CONNECT_RETRY_MAX_MS);
+                log.warn("connect attempt failed", { reason, attempt, delayMs, error });
+                if (attempt >= maxAttempts && Number.isFinite(maxAttempts)) throw error;
+                await sleep(delayMs);
+            }
+        }
+        throw new Error("AMQP connect exhausted retries");
+    })();
 
-    await ch.assertExchange(JOBS_EX, "direct", { durable: true });
-    await ch.assertExchange(TELE_EX, "topic", { durable: true });
-    await ch.assertExchange(RES_EX, "topic", { durable: true });
-
-    await ch.assertQueue("agent.heartbeats", {
-        durable: true,
-        arguments: { "x-message-ttl": 120_000, "x-max-length": 2000 },
-    });
-    await ch.assertQueue("agent.inventories", { durable: true });
-    await ch.assertQueue("storage.inventories", { durable: true });
-
-    await ch.bindQueue("agent.heartbeats", TELE_EX, "heartbeat.*");
-    await ch.bindQueue("agent.inventories", TELE_EX, "inventory.*");
-    await ch.bindQueue("storage.inventories", TELE_EX, "inventory.storage.*");
-
-    ch.on("error", (error) => log.error("channel error", { error }));
-    connection.on("close", () => log.error("connection closed"));
-
-    await ch.prefetch(50);
-    log.info("connected", { url: RMQ_URL });
-    return ch;
+    try {
+        return await connectPromise;
+    } finally {
+        connectPromise = null;
+    }
 }
 
 export interface PublishTaskPayload {
     taskId: string;
+    eventId?: string;
+    contractVersion?: number;
+    commandBody?: string;
+    commandFingerprint?: string;
     tenantId?: string;
     agentId: string;
     action: string;
@@ -153,19 +311,37 @@ export async function publishTask(payload: PublishTaskPayload) {
     if (!payload?.agentId || !payload?.action) {
         throw new Error("agentId and action are required");
     }
-    const channel = await connect();
+    await connect({ reason: "publishTask" });
+    const channel = await conn!.createConfirmChannel();
+    let returned = false;
+    channel.on("return", () => { returned = true; });
+    // Avoid an unhandled EventEmitter error if RabbitMQ closes this channel.
+    channel.on("error", () => undefined);
+    try {
 
     const queueName = `agent.${payload.agentId}.tasks`;
-    await channel.assertQueue(queueName, { durable: true });
-    await channel.bindQueue(queueName, JOBS_EX, payload.agentId);
+    {
+        await channel.assertQueue(queueName, { durable: true, arguments: queueArguments() });
+        await channel.bindQueue(queueName, JOBS_EX, payload.agentId);
+
+    }
 
     const props: Options.Publish = {
+        mandatory: true,
+        messageId: payload.eventId || payload.taskId,
         contentType: "application/json",
         deliveryMode: 2,
         correlationId: payload.correlationId || payload.taskId,
     };
 
-    channel.publish(JOBS_EX, payload.agentId, Buffer.from(JSON.stringify(payload)), props);
+    channel.publish(JOBS_EX, payload.agentId, Buffer.from(JSON.stringify({ ...payload, operationId: payload.taskId })), props);
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+        await Promise.race([channel.waitForConfirms(), new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error("Publisher confirm timed out")), 20000);
+        })]);
+    } finally { if (timeout) clearTimeout(timeout); }
+    if (returned) throw new Error("Unroutable task publication");
     logPub.info("task published", {
         agentId: payload.agentId,
         action: payload.action,
@@ -173,44 +349,43 @@ export async function publishTask(payload: PublishTaskPayload) {
         correlationId: props.correlationId,
         queue: queueName,
     });
+    } finally { await channel.close().catch(() => undefined); }
 }
 
 export async function startTelemetryConsumers({ Heartbeat }: { Heartbeat: Model<Heartbeat> }) {
-    const channel = await connect();
-
-    const handleHeartbeat = async (msg: ConsumeMessage | null) => {
+    const handleHeartbeat = async (channel: Channel, msg: ConsumeMessage | null) => {
         if (!msg) return;
         try {
             const hb = JSON.parse(msg.content.toString()) as Record<string, unknown> & { agentId?: string; ts?: string };
             if (!hb.agentId) throw new Error("missing agentId");
-            await Heartbeat.findOneAndUpdate(
+            await saveSnapshot(Heartbeat,
                 { agentId: hb.agentId },
                 {
                     agentId: hb.agentId,
-                    version: hb.version,
+                    version: hb.version || "",
                     capabilities: Array.isArray(hb.capabilities) ? hb.capabilities : [],
                     host: hb.host ?? null,
                     lastSeen: hb.ts ? new Date(hb.ts) : new Date(),
                     raw: hb,
                 },
-                { upsert: true, new: true, setDefaultsOnInsert: true }
+                "lastSeen"
             );
-            channel.ack(msg);
+            settleDelivery(channel, msg);
             logTel.debug("heartbeat", { agentId: hb.agentId, caps: hb.capabilities || [] });
         } catch (error) {
-            channel.nack(msg, false, false);
+            settleDelivery(channel, msg, !(error instanceof SyntaxError || (error instanceof Error && error.message.startsWith("missing "))));
             logTel.error("heartbeat error", { error });
         }
     };
 
-    const handleInventory = async (msg: ConsumeMessage | null) => {
+    const handleInventory = async (channel: Channel, msg: ConsumeMessage | null) => {
         if (!msg) return;
         try {
             const headers = msg.properties?.headers || {};
             const env = JSON.parse(msg.content.toString()) as Record<string, unknown>;
             const looksLikeStorage = env?.storageId || String(env?.kind || "").toLowerCase() === "storage";
             if (looksLikeStorage) {
-                channel.ack(msg);
+                settleDelivery(channel, msg);
                 logInv.debug("inventory(light/full) skipped for storage payload", { storageId: env?.storageId });
                 return;
             }
@@ -225,21 +400,21 @@ export async function startTelemetryConsumers({ Heartbeat }: { Heartbeat: Model<
             };
 
             if (isLightInventory(headers, env)) {
-                await InventoryLight.findOneAndUpdate({ agentId }, { $set: doc }, { upsert: true });
+                await saveSnapshot(InventoryLight, { agentId }, doc);
                 logInv.debug("inventory(light) stored", { agentId });
             } else {
-                await InventoryFull.findOneAndUpdate({ agentId }, { $set: doc }, { upsert: true });
+                await saveSnapshot(InventoryFull, { agentId }, doc);
                 logInv.debug("inventory(full) stored", { agentId });
             }
 
-            channel.ack(msg);
+            settleDelivery(channel, msg);
         } catch (error) {
-            channel.nack(msg, false, false);
+            settleDelivery(channel, msg, !(error instanceof SyntaxError || (error instanceof Error && error.message.startsWith("missing "))));
             logInv.error("inventory error", { error });
         }
     };
 
-    const handleStorageInventory = async (msg: ConsumeMessage | null) => {
+    const handleStorageInventory = async (channel: Channel, msg: ConsumeMessage | null) => {
         if (!msg) return;
         try {
             const env = JSON.parse(msg.content.toString()) as Record<string, unknown>;
@@ -253,303 +428,77 @@ export async function startTelemetryConsumers({ Heartbeat }: { Heartbeat: Model<
                 raw: env,
             };
 
-            await InventoryStorage.findOneAndUpdate({ storageId }, { $set: doc }, { upsert: true });
-            channel.ack(msg);
+            await saveSnapshot(InventoryStorage, { storageId }, doc);
+            settleDelivery(channel, msg);
             logInv.debug("inventory(storage) stored", { storageId });
         } catch (error) {
-            channel.nack(msg, false, false);
+            settleDelivery(channel, msg, !(error instanceof SyntaxError || (error instanceof Error && error.message.startsWith("missing "))));
             logInv.error("storage inventory error", { error });
         }
     };
 
-    await channel.consume("agent.heartbeats", handleHeartbeat, { noAck: false });
-    await channel.consume("agent.inventories", handleInventory, { noAck: false });
-    await channel.consume("storage.inventories", handleStorageInventory, { noAck: false });
-    logTel.info("telemetry consumers started");
+    await registerConsumer("telemetry", async (channel) => {
+        await channel.consume("agent.heartbeats.v2", (msg) => handleHeartbeat(channel, msg), { noAck: false });
+        await channel.consume("agent.inventories.v2", (msg) => handleInventory(channel, msg), { noAck: false });
+        await channel.consume("storage.inventories.v2", (msg) => handleStorageInventory(channel, msg), { noAck: false });
+        logTel.info("telemetry consumers started");
+    });
 }
 
-type TaskModelInput = Model<TaskRecord>;
+export async function startResultsToMongo(TaskModel: Model<TaskRecord>, { queueName }: { queueName?: string } = {}) {
+    const queue = queueName || "results.controller.v2";
+    await registerConsumer(`results:${queue}`, async (channel) => {
+        const dlq = `${queue}.invalid`;
+        await channel.assertQueue(dlq, { durable: true, arguments: queueArguments() });
+        // A versioned queue avoids changing arguments of the existing queue.
+        await channel.assertQueue(queue, { durable: true, arguments: { ...queueArguments(), "x-dead-letter-exchange": "", "x-dead-letter-routing-key": dlq } });
+        await channel.bindQueue(queue, RES_EX, "task.#");
 
-interface TaskResultPayload {
-    taskId: string;
-    agentId?: string;
-    ok?: boolean;
-    result?: Record<string, unknown>;
-    error?: string;
-    finishedAt?: string;
-}
+        logRes.info("results consumer started", { queue });
 
-async function onTaskSucceededUpsertTenantLink(TaskModel: TaskModelInput, payload: TaskResultPayload) {
-    const task = await TaskModel.findOne(
-        { taskId: payload.taskId },
-        { action: 1, tenantId: 1, agentId: 1, data: 1 }
-    ).lean<{ action: string; tenantId?: string; agentId?: string; data?: Record<string, unknown> } | null>();
-    if (!task?.tenantId || !task?.agentId) return;
+        await channel.consume(
+            queue,
+            async (msg) => {
+                if (!msg) return;
 
-    const normTenantId =
-        typeof task.tenantId === "string" ? task.tenantId.trim().toLowerCase() : task.tenantId;
-    const { action, agentId, data } = task;
-    const haRequested = typeof data?.ha === "boolean" ? (data.ha as boolean) : undefined;
-
-    const vmResult = (payload.result as { vm?: { guid?: string; name?: string } } | undefined)?.vm;
-    const vmRefId = vmResult?.guid || vmResult?.name || (typeof data?.refId === "string" ? data.refId : undefined);
-
-    if ((action === "vm.create" || action === "vm.clone") && vmRefId) {
-        // Link tenant to VM inventory entry.
-        const set: Record<string, unknown> = {};
-        if (haRequested !== undefined) set.ha = haRequested;
-        if (vmResult?.name) set.name = vmResult.name;
-
-        const update: Record<string, unknown> = {
-            $setOnInsert: { tenantId: normTenantId, assignedAt: new Date() },
-            $set: set,
-        };
-        await TenantResource.updateOne(
-            { kind: "vm", agentId, refId: vmRefId },
-            update,
-            { upsert: true }
-        );
-
-        if (action === "vm.create") {
-            const diskId = typeof data?.diskId === "string" ? data.diskId : "";
-            if (diskId) {
-                const diskQuery: Record<string, unknown> = {
-                    tenantId: normTenantId,
-                    kind: "storage",
-                    $or: [{ refId: diskId }, { name: diskId }],
-                };
-                if (typeof data?.storageId === "string" && data.storageId) {
-                    diskQuery.agentId = data.storageId;
-                }
-                const diskUpdate: Record<string, unknown> = {
-                    attachedVmRefId: vmRefId,
-                    attachedVmAgentId: agentId,
-                    attachedVmName: vmResult?.name || (typeof data?.name === "string" ? data.name : undefined),
-                    attachedAt: new Date(),
-                };
-                const res = await TenantResource.updateOne(diskQuery, { $set: diskUpdate });
-                if (!res.matchedCount) {
-                    logRes.warn("disk attach link skipped (disk not found)", {
-                        taskId: payload.taskId,
-                        tenantId: normTenantId,
-                        agentId,
-                        vmRefId,
-                        diskId,
-                        storageId: data?.storageId,
-                    });
-                }
-            }
-        }
-
-        return;
-    }
-
-    if (action === "vm.delete" && vmRefId) {
-        await TenantResource.deleteOne({
-            kind: "vm",
-            agentId,
-            refId: vmRefId,
-        });
-        await TenantResource.updateMany(
-            { kind: "storage", attachedVmAgentId: agentId, attachedVmRefId: vmRefId },
-            { $unset: { attachedVmRefId: 1, attachedVmAgentId: 1, attachedVmName: 1, attachedAt: 1 } }
-        );
-        return;
-    }
-
-    const looksLikeIqn = (value?: string | null) => /^iqn\./i.test(String(value || "").trim());
-
-    if (action === "disk.create" || action === "storage.create") {
-        const diskResult = (payload.result as { disk?: { refId?: string; id?: string; name?: string } } | undefined)?.disk;
-        const diskRef =
-            diskResult?.id ||
-            diskResult?.name ||
-            (!looksLikeIqn(diskResult?.refId) ? diskResult?.refId : undefined);
-        if (!diskRef) {
-            logRes.warn("tenant resource upsert skipped (no disk ref)", {
-                taskId: payload.taskId,
-                tenantId: normTenantId,
-                agentId,
-                action,
-                result: diskResult,
-            });
-            return;
-        }
-
-        const set: Record<string, unknown> = {};
-        if (diskResult?.name) set.name = diskResult.name;
-        const res = await TenantResource.updateOne(
-            { kind: "storage", agentId, refId: diskRef },
-            {
-                $setOnInsert: { tenantId: normTenantId, assignedAt: new Date() },
-                ...(Object.keys(set).length ? { $set: set } : {}),
-            },
-            { upsert: true }
-        );
-        logRes.info("tenant resource upsert (storage create)", {
-            taskId: payload.taskId,
-            tenantId: normTenantId,
-            agentId,
-            action,
-            diskRef,
-            result: diskResult,
-            upserted: res.upsertedCount ?? 0,
-            matched: res.matchedCount ?? 0,
-        });
-        return;
-    }
-
-    if (action === "disk.delete" || action === "storage.delete") {
-        const diskResult = (payload.result as { disk?: { refId?: string; id?: string; name?: string } } | undefined)?.disk;
-        const diskRef =
-            diskResult?.id ||
-            diskResult?.name ||
-            (!looksLikeIqn(diskResult?.refId) ? diskResult?.refId : undefined);
-        const ref = diskRef || (data?.refId as string | undefined);
-        if (!ref) return;
-        await TenantResource.deleteOne({ kind: "storage", agentId, refId: ref });
-        return;
-    }
-
-    if (action === "switch.create") {
-        const sw = (payload.result as { switch?: { name?: string } } | undefined)?.switch;
-        const switchRef = sw?.name;
-        if (!switchRef) return;
-        await TenantResource.updateOne(
-            { kind: "switch", agentId, refId: switchRef },
-            { $setOnInsert: { tenantId: normTenantId, assignedAt: new Date() } },
-            { upsert: true }
-        );
-    }
-}
-
-export async function startResultsToMongo(TaskModel: TaskModelInput, { queueName }: { queueName?: string } = {}) {
-    const channel = await connect();
-    const queue = queueName || "results.controller";
-
-    await channel.assertQueue(queue, { durable: true });
-    await channel.bindQueue(queue, RES_EX, "task.#");
-
-    logRes.info("results consumer started", { queue });
-
-    await channel.consume(
-        queue,
-        async (msg) => {
-            if (!msg) return;
-            try {
-                const payload = JSON.parse(msg.content.toString()) as TaskResultPayload;
-                const rk = msg.fields.routingKey;
-
-                logRes.info("task result received", {
-                    taskId: payload.taskId,
-                    ok: !!payload.ok,
-                    agentId: payload.agentId,
-                    rk,
-                });
-
-                const existing = await TaskModel.findOne(
-                    { taskId: payload.taskId },
-                    { hasQuotaHold: 1, action: 1, tenantId: 1, agentId: 1 }
-                ).lean<{ hasQuotaHold?: boolean; action?: string; agentId?: string; tenantId?: string } | null>();
-
-                const update = {
-                    $set: {
-                        status: payload.ok ? "done" : "error",
-                        finishedAt: payload.finishedAt ? new Date(payload.finishedAt) : new Date(),
-                        result: payload.result ?? null,
-                        error: payload.error ?? null,
-                        agentId: payload.agentId || existing?.agentId || undefined,
-                        routingKey: rk,
-                    },
-                    $setOnInsert: {
-                        taskId: payload.taskId,
-                        queuedAt: new Date(),
-                        action: existing?.action || "unknown",
-                        data: {},
-                        hasQuotaHold: existing?.hasQuotaHold || false,
-                    },
-                };
-
-                await TaskModel.updateOne({ taskId: payload.taskId }, update, { upsert: true });
-                logRes.debug("task result stored", {
-                    taskId: payload.taskId,
-                    ok: !!payload.ok,
-                    rk,
-                    hadHold: !!existing?.hasQuotaHold,
-                });
-
-                if (payload.ok) {
-                    try {
-                        await onTaskSucceededUpsertTenantLink(TaskModel, payload);
-                    } catch (error) {
-                        logRes.warn("tenant link upsert failed", { taskId: payload.taskId, error });
-                    }
-                }
-
-                // For non-create actions, recompute tenant quota usage from the latest inventory.
-                if (payload.ok && existing?.tenantId && existing?.agentId) {
-                    const action = existing.action || "";
-                    const isCreate = /\.create$/i.test(action);
-                    if (!isCreate) {
-                        try {
-                            const inv = await InventoryFull.findOne(
-                                { agentId: existing.agentId },
-                                { inventory: 1 }
-                            ).lean();
-                            if (inv?.inventory) {
-                                const tenantObjectId = await getTenantObjectIdOrThrow(
-                                    existing.tenantId as string
-                                );
-                                await quota.recalcUsedFromInventory({
-                                    tenantId: tenantObjectId,
-                                });
-                                logRes.info("quota recalculated from inventory", {
-                                    taskId: payload.taskId,
-                                    tenantId: existing.tenantId,
-                                    agentId: existing.agentId,
-                                    action,
-                                });
-                            }
-                        } catch (error) {
-                            logRes.warn("quota recalc failed after task", {
-                                taskId: payload.taskId,
-                                tenantId: existing.tenantId,
-                                agentId: existing.agentId,
-                                error,
-                            });
-                        }
-                    }
-                }
-
-                if (existing?.hasQuotaHold) {
-                    try {
-                        if (payload.ok) {
-                            await quota.consumeHold(payload.taskId);
-                            logRes.info("quota hold consumed", { taskId: payload.taskId });
-                        } else {
-                            await quota.releaseHold(payload.taskId);
-                            logRes.info("quota hold released", { taskId: payload.taskId });
-                        }
-                    } catch (error) {
-                        logRes.error("quota hold resolution error", { taskId: payload.taskId, error });
-                    }
+                let payload: TaskResultPayload;
+                try {
+                    const parsed = parseTaskResult(JSON.parse(msg.content.toString()));
+                    if (!parsed) throw new Error("invalid task result payload");
+                    payload = parsed;
+                } catch (error) {
+                    logRes.error("results->mongo parse error (dead-lettered)", { error });
+                    settleDelivery(channel, msg, false);
+                    return;
                 }
 
                 try {
-                    await releaseLocksForTask(payload.taskId);
-                } catch (error) {
-                    logRes.warn("resource lock release failed after result", {
-                        taskId: payload.taskId,
-                        error,
-                    });
-                }
+                    const rk = msg.fields.routingKey;
 
-                channel.ack(msg);
-            } catch (error) {
-                logRes.error("results->mongo error", { error });
-                channel.nack(msg, false, false);
-            }
-        },
-        { noAck: false }
-    );
+                    logRes.info("task result received", {
+                        taskId: payload.taskId,
+                        ok: !!payload.ok,
+                        agentId: payload.agentId,
+                        rk,
+                    });
+
+                    await applyTaskResult(TaskModel, payload, rk);
+
+                    settleDelivery(channel, msg);
+                } catch (error) {
+                    logRes.error("results->mongo transient error (requeued)", { error, taskId: payload.taskId });
+                    settleDelivery(channel, msg, !(error instanceof InvalidResult));
+                }
+            },
+            { noAck: false }
+        );
+    });
+}
+
+export async function closeAmqp() {
+    stopping = true;
+    consumerRegistrations.clear();
+    const connection = conn;
+    ch = null; conn = null;
+    await connection?.close();
 }

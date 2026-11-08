@@ -3,7 +3,7 @@
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 
 // Generic lock document to serialize access to shared resources (disks, VMs, network...).
-// One doc per (resourceKind, refId); TTL is enforced via expiresAt to avoid permanent deadlocks.
+// One doc per (resourceKind, refId); expiresAt identifies reconciliation candidates.
 
 export type ResourceKind = "storage" | "vm" | "network" | string;
 
@@ -36,8 +36,7 @@ const ResourceLockSchema = new Schema<ResourceLockRecord>(
 
 // One active lock per resource (disk, vm, network...)
 ResourceLockSchema.index({ resourceKind: 1, refId: 1 }, { unique: true });
-// Auto-expire stale locks if a task never reports back.
-ResourceLockSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+// Expiration requires reconciliation; never permit a second external effect by TTL deletion.
 
 const ResourceLock = model<ResourceLockRecord>("ResourceLock", ResourceLockSchema);
 

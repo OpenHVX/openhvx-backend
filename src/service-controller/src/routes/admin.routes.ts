@@ -55,6 +55,7 @@ router.get("/tasks/:taskId", getTask);
 
 router.get("/tenants/:tenantId/resources", listResources);
 router.post("/tenants/:tenantId/resources", claimResources);
+router.post("/tenants/:tenantId/resources/claim", claimResources);
 router.delete("/tenants/:tenantId/resources/:resourceId", unclaimResource);
 
 router.get("/agents", getAgents);

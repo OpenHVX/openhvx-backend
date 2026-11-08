@@ -1,0 +1,61 @@
+name: Backend checks
+on:
+  push:
+  pull_request:
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        env:
+          RABBITMQ_DEFAULT_USER: integration
+          RABBITMQ_DEFAULT_PASS: integration-only-password
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      AGENT_SOURCE_DIR: ${{ github.workspace }}/.ci/openhvx-agent/src
+      AMQP_INTEGRATION_URL: amqp://integration:integration-only-password@127.0.0.1:5672/
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out compatible agent protocol implementation
+        uses: actions/checkout@v4
+        with:
+          repository: OpenHVX/openhvx-agent
+          ref: a4ffd9232abcce973be38a0c774e08932b90a1fa
+          path: .ci/openhvx-agent
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .ci/openhvx-agent/src/go.mod
+          cache-dependency-path: .ci/openhvx-agent/src/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src/*/package-lock.json
+      - name: Install, compile and audit services
+        run: |
+          for service in src/service-auth src/service-api-gateway src/service-controller src/service-ws-broker; do
+            npm ci --prefix "$service"
+            npm run lint --prefix "$service"
+            npm run build --prefix "$service"
+            npm audit --omit=dev --audit-level=low --prefix "$service"
+          done
+      - run: npm test --prefix src/service-controller
+      - run: npm run test:integration --prefix src/service-controller
+      - name: Validate local Compose configurations
+        env:
+          INTERNAL_API_SECRET: configuration-validation-only-not-a-runtime-secret
+        run: |
+          for service in auth gateway controller ws; do
+            if [ ! -f ".env.$service" ]; then
+              cp ".env.$service.example" ".env.$service"
+            fi
+          done
+          docker compose -f compose.yaml config --quiet
+          docker compose -f compose.yaml -f compose.podman.yaml config --quiet
+      - run: git diff --check

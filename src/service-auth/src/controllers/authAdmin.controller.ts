@@ -62,6 +62,7 @@ async function resolveAdminAuth(token) {
     if (!token) return null;
     try {
         const decoded = jwt.verify(token, cfg.admin.secret, {
+            algorithms: ["HS256"],
             issuer: cfg.admin.iss,
             audience: cfg.admin.aud,
         });
@@ -244,8 +245,8 @@ exports.register = async (req, res) => {
             }
             // reset/upsert → make sure kind=admin and refresh the password hash
             const passwordHash = await bcrypt.hash(password, 12);
-            const updated = await UserAdmin.findOneAndUpdate(
-                { email: em },
+            const updated = await User.findOneAndUpdate(
+                { _id: existing._id },
                 {
                     $set: {
                         kind: 'admin',
@@ -256,9 +257,19 @@ exports.register = async (req, res) => {
                         roles: ['global-admin'],
                         scopes: ['platform.admin'],
                     },
+                    $unset: {
+                        tenantId: 1,
+                    },
                 },
-                { new: true, upsert: mode === 'upsert' }
+                {
+                    new: true,
+                    runValidators: true,
+                    overwriteDiscriminatorKey: true,
+                }
             ).select('email username roles scopes createdAt updatedAt');
+            if (!updated) {
+                return res.status(404).json({ error: 'NotFound', id: String(existing._id) });
+            }
             if (DEBUG) console.info(`[auth][${rid}] register: promoted/reset id=${updated?._id}`);
             return res.status(200).json({ ok: true, promoted: true, user: publicUser(updated) });
         }

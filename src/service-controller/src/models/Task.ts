@@ -6,6 +6,11 @@ import type { TaskStatus } from "../types/domain";
 
 export interface TaskRecord {
     taskId: string;
+    contractVersion?: number;
+    commandFingerprint?: string;
+    outcome?: "applied" | "not_applied" | "unknown";
+    lastAgentSequence?: number;
+    lastResultFingerprint?: string;
     tenantId?: string;
     agentId?: string;
     action: string;
@@ -29,11 +34,16 @@ export type TaskModel = Model<TaskRecord>;
 const taskSchema = new Schema<TaskRecord>(
     {
         taskId: { type: String, required: true, unique: true, index: true },
+        contractVersion: Number,
+        commandFingerprint: String,
+        outcome: { type: String, enum: ["applied", "not_applied", "unknown"] },
+        lastAgentSequence: Number,
+        lastResultFingerprint: String,
         tenantId: { type: String, index: true },
         agentId: { type: String, index: true },
         action: { type: String, required: true },
         data: { type: Object, default: {} },
-        status: { type: String, enum: ["queued", "sent", "done", "error"], default: "queued", index: true },
+        status: { type: String, enum: ["queued", "sent", "reconciling", "done", "error"], default: "queued", index: true },
         correlationId: { type: String },
         queuedAt: { type: Date, default: () => new Date() },
         publishedAt: { type: Date },

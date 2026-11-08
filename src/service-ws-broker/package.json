@@ -11,7 +11,9 @@
     },
     "dependencies": {
         "dotenv": "^16.4.5",
+        "http-proxy-middleware": "^3.0.10",
         "jsonwebtoken": "^9.0.2",
+        "mongoose": "^8.24.8",
         "ws": "^8.18.0"
     },
     "devDependencies": {

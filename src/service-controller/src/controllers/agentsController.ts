@@ -5,8 +5,9 @@ import type { ControllerRequest } from "../types/express";
 import type { InventoryDisk, InventoryRoot, InventoryVm } from "../types/resources";
 import logger from "../lib/logger";
 import { respondEnvelope, scopeForReq } from "../middlewares/addEnveloppe";
+import { AGENT_STALE_MS } from "../lib/config/agents";
 
-const ONLINE_THRESHOLD_MS = parseInt(process.env.AGENT_ONLINE_THRESHOLD_MS || "90000", 10);
+const ONLINE_THRESHOLD_MS = AGENT_STALE_MS;
 
 type ControllerHandler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
 const log = logger.child(["controller", "agents"]);

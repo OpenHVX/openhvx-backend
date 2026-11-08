@@ -9,8 +9,9 @@ import type { ControllerRequest } from "../types/express";
 import { getTenantQuotas } from "../services/quota";
 import logger from "../lib/logger";
 import { respondEnvelope } from "../middlewares/addEnveloppe";
+import { AGENT_STALE_MS } from "../lib/config/agents";
 
-const ONLINE_THRESHOLD_MS = Number(process.env.AGENT_STALE_MS || 120000);
+const ONLINE_THRESHOLD_MS = AGENT_STALE_MS;
 
 const log = logger.child(["controller", "metrics"]);
 type Handler = (req: ControllerRequest, res: Response) => Promise<Response | void>;
@@ -75,12 +76,14 @@ const storageTotals = async () => {
 const tasksCountsLast24h = async (filter: Record<string, unknown> = {}) => {
     const since = new Date(Date.now() - 24 * 3600 * 1000);
     const base = { queuedAt: { $gte: since }, ...filter };
-    const [queued, done, error] = await Promise.all([
+    const [queued, sent, reconciling, done, error] = await Promise.all([
         Task.countDocuments({ ...base, status: "queued" }),
+        Task.countDocuments({ ...base, status: "sent" }),
+        Task.countDocuments({ ...base, status: "reconciling" }),
         Task.countDocuments({ ...base, status: "done" }),
         Task.countDocuments({ ...base, status: "error" }),
     ]);
-    return { queued, done, error, since };
+    return { queued, sent, reconciling, done, error, since };
 };
 
 export const adminOverview: Handler = async (req, res) => {

@@ -1,3 +1,4 @@
+import { signControllerRequest } from "../lib/controllerIdentity";
 import { Router, type NextFunction, type Request, type Response } from "express";
 import type { ServerResponse } from "http";
 import { createProxyMiddleware } from "http-proxy-middleware";
@@ -49,6 +50,7 @@ export default ({ CONTROLLER_URL }: RouterOptions) => {
             proxyReq: (proxyReq, req) => {
                 const tenantId = normLower(req.tenantId ?? req.user?.tenantId ?? "");
 
+                signControllerRequest(proxyReq, req, "tenant", tenantId);
                 proxyReq.setHeader("x-request-id", req.id ?? "");
                 proxyReq.setHeader("x-user-id", req.user?.sub ?? "");
                 proxyReq.setHeader("x-roles", (req.user?.roles ?? []).join(","));
@@ -116,7 +118,7 @@ export default ({ CONTROLLER_URL }: RouterOptions) => {
      *                   agentId: { type: string }
      *               data: { type: object }
      *     responses:
-     *       200: { description: Task enqueued }
+     *       202: { description: Task accepted durably; Idempotency-Key required }
      */
     router.post(
         "/tasks",

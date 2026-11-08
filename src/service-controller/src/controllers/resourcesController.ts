@@ -1,3 +1,7 @@
+import { releaseResourceOwnership, claimResourceOwnership } from "../services/operations/ownership";
+import { isHttpErrorPayload } from "../services/resourceLocks";
+// service-controller/src/controllers/resourcesController.ts
+
 import type { Response } from "express";
 import { ERR, send } from "../lib/errors/http-errors";
 import {
@@ -26,6 +30,7 @@ import {
 } from "../types/resources";
 import logger from "../lib/logger";
 import { respondEnvelope } from "../middlewares/addEnveloppe";
+import { AGENT_STALE_MS } from "../lib/config/agents";
 import Heartbeat from "../models/Heartbeat";
 
 const log = logger.child(["controller", "resources"]);
@@ -50,26 +55,30 @@ const arr = <T = unknown>(value: unknown): T[] => (Array.isArray(value) ? (value
 const normPath = (input?: string | null) =>
     typeof input === "string" ? input.replace(/\//g, "\\").toLowerCase() : input ?? undefined;
 
-const normalizeIpList = (value?: unknown): string[] => {
+const normalizeIpList = (value?: unknown, maxDepth = 5): string[] => {
     const seen = new Set<string>();
-    const visit = (v: unknown) => {
-        if (!v) return;
+    const visitedObjects = new WeakSet<object>();
+    const visit = (v: unknown, depth: number) => {
+        if (!v || depth <= 0) return;
         if (typeof v === "string") {
             const trimmed = v.trim();
             if (trimmed) seen.add(trimmed);
             return;
         }
         if (Array.isArray(v)) {
-            for (const item of v) visit(item);
+            for (const item of v) visit(item, depth - 1);
             return;
         }
         if (typeof v === "object") {
+            const obj = v as Record<string, unknown>;
+            if (visitedObjects.has(obj)) return;
+            visitedObjects.add(obj);
             const addr = (v as { address?: unknown }).address;
-            if (addr) visit(addr);
-            for (const val of Object.values(v as Record<string, unknown>)) visit(val);
+            if (addr) visit(addr, depth - 1);
+            for (const val of Object.values(obj)) visit(val, depth - 1);
         }
     };
-    visit(value);
+    visit(value, maxDepth);
     return Array.from(seen);
 };
 
@@ -141,7 +150,7 @@ const lcase = (value?: string | number | null) => (value == null ? "" : String(v
 const looksLikeIqn = (value?: string | null) => /^iqn\./i.test(String(value || "").trim());
 
 // Single staleness threshold driven by heartbeat age.
-const STALE_MS = Number(process.env.AGENT_STALE_MS || 3 * 60 * 1000);
+const STALE_MS = AGENT_STALE_MS;
 
 const agentLastTs = (fullDoc?: InventoryDoc | null, lightDoc?: InventoryDoc | null) => {
     const t1 = getTs(fullDoc) ?? -Infinity;
@@ -443,15 +452,6 @@ const findVmForLink = (idx: Map<string, InventoryVm>, link: TenantResourceLink) 
             }
         }
     }
-    if (!vm && /^[a-z0-9._-]+$/i.test(String(link.refId))) {
-        const wanted = String(link.refId).toLowerCase();
-        for (const candidate of idx.values()) {
-            if ((candidate?.name || "").toLowerCase() === wanted) {
-                vm = candidate;
-                break;
-            }
-        }
-    }
     return vm;
 };
 
@@ -537,15 +537,26 @@ export const listResources: Handler = async (req, res) => {
         const vq = validateListQuery(req.query || {});
         if (!vq.ok) return send(res, ERR.validationPre(vq.errors), req);
 
-        const { kind, agentId, includeOrphans } = vq.value!;
+        const { kind, agentId, includeOrphans, limit: limitRaw, offset: offsetRaw } = vq.value!;
         const showOrphans = String(includeOrphans).toLowerCase() === "true";
+        const limit = Math.min(Math.max(parseInt(limitRaw || "100", 10) || 100, 1), 500);
+        const offset = Math.max(parseInt(offsetRaw || "0", 10) || 0, 0);
 
         const query: Record<string, string> = { tenantId: ensuredTenantId };
         if (kind) query.kind = kind;
         if (agentId) query.agentId = agentId;
 
         const links = await TenantResource.find(query).lean<TenantResourceLink[]>();
-        if (!links.length) return respondEnvelope(res, req, "Resources", { success: true, data: [] });
+        if (!links.length) {
+            return respondEnvelope(res, req, "Resources", {
+                success: true,
+                count: 0,
+                total: 0,
+                limit,
+                offset,
+                data: [],
+            });
+        }
 
         const agentIds = Array.from(new Set(links.map((link) => String(link.agentId))));
         const storageAgentIds = Array.from(
@@ -589,7 +600,10 @@ export const listResources: Handler = async (req, res) => {
         const iqnToTenantVm = new Map<string, { refId: string; agentId: string; name?: string }>();
 
         const out: Array<Record<string, unknown>> = [];
-        for (const link of links) {
+        const vmLinks = links.filter((link) => link.kind === "vm");
+        const otherLinks = links.filter((link) => link.kind !== "vm");
+
+        for (const link of vmLinks) {
             if (link.kind === "vm") {
                 const idx = vmIdxByAgent.get(link.agentId) || new Map<string, InventoryVm>();
                 const vm = findVmForLink(idx, link);
@@ -613,9 +627,10 @@ export const listResources: Handler = async (req, res) => {
                         assignedAt: link.assignedAt,
                     });
                 }
-                continue;
             }
+        }
 
+        for (const link of otherLinks) {
             if (link.kind === "storage") {
                 const inv = storageBy.get(link.agentId)?.inventory as StorageInventoryV1 | undefined;
                 const volumes = Array.isArray(inv?.volumes) ? inv.volumes : [];
@@ -717,7 +732,15 @@ export const listResources: Handler = async (req, res) => {
             }
         }
 
-        return respondEnvelope(res, req, "Resources", { success: true, data: out });
+        const paged = out.slice(offset, offset + limit);
+        return respondEnvelope(res, req, "Resources", {
+            success: true,
+            count: paged.length,
+            total: out.length,
+            limit,
+            offset,
+            data: paged,
+        });
     } catch (error) {
         log.error("listResources error", { error });
         return send(res, ERR.internal(), req);
@@ -737,26 +760,56 @@ export const claimResources: Handler = async (req, res) => {
         }
 
         const { kind, agentId, refIds, ha } = vb.value;
+        const uniqueRefIds = Array.from(
+            new Set(refIds.map((refId) => refId.trim()).filter(Boolean))
+        );
+        if (!uniqueRefIds.length || uniqueRefIds.length > 500) {
+            return send(
+                res,
+                ERR.validationPre([
+                    { path: "body.refIds", message: "must contain between 1 and 500 non-empty unique ids" },
+                ]),
+                req
+            );
+        }
         const ensuredTenantId = normTenantStr(tenantId as string);
-        const ops = refIds.map((refId) => {
-            const update: Record<string, unknown> = {
-                $setOnInsert: { tenantId: ensuredTenantId, assignedAt: new Date() },
-            };
-            if (typeof ha === "boolean") {
-                update.$set = { ha };
-            }
-            return {
-                updateOne: {
-                    filter: { kind, agentId, refId },
-                    update,
-                    upsert: true,
-                },
-            };
-        });
+        const outcomes: Array<{
+            refId: string;
+            status: "claimed" | "already_claimed" | "conflict" | "not_found";
+            tenantId?: string;
+        }> = [];
 
-        await TenantResource.bulkWrite(ops);
-        return respondEnvelope(res, req, "Resources", { success: true });
+        // Keep the documented per-resource partial contract (HTTP 207).
+        // Refuse links to resources absent from a recent inventory.
+        const since = new Date(Date.now() - Number(process.env.INVENTORY_MAX_AGE_MS || 300000));
+        const present = new Set<string>();
+        if (kind === "storage") {
+            const snapshot = await InventoryStorage.findOne({ storageId: agentId, ts: { $gte: since } }).lean();
+            const inventory = snapshot?.inventory as StorageInventoryV1 | undefined;
+            for (const volume of inventory?.volumes || []) {
+                if (volume.refId) present.add(String(volume.refId));
+                if (volume.iqn) present.add(String(volume.iqn));
+            }
+        } else {
+            const snapshot = await InventoryFull.findOne({ agentId, ts: { $gte: since } }).lean();
+            for (const resource of pickFromInv(snapshot as InventoryDoc | null, { kind, agentId })) present.add(resource.refId);
+        }
+        for (const refId of uniqueRefIds) {
+            if (!present.has(refId)) { outcomes.push({ refId, status: "not_found" }); continue; }
+            outcomes.push(await claimResourceOwnership(ensuredTenantId, kind, agentId, refId, ha));
+        }
+
+        const conflicts = outcomes.filter((outcome) => ["conflict", "not_found"].includes(outcome.status));
+        const partial = conflicts.length > 0;
+        return respondEnvelope(res.status(partial ? 207 : 200), req, "Resources", {
+            success: !partial,
+            partial,
+            claimed: outcomes.filter((outcome) => ["claimed", "already_claimed"].includes(outcome.status)).length,
+            conflicts: conflicts.length,
+            data: outcomes,
+        });
     } catch (error) {
+        if (isHttpErrorPayload(error)) return send(res, error, req);
         log.error("claimResources error", { error });
         return send(res, ERR.internal(), req);
     }
@@ -777,14 +830,10 @@ export const unclaimResource: Handler = async (req, res) => {
         const { resourceId } = vp.value!;
         const { kind, agentId } = vq.value!;
 
-        await TenantResource.deleteOne({
-            tenantId: ensuredTenantId,
-            kind,
-            agentId,
-            refId: resourceId,
-        });
+        await releaseResourceOwnership(ensuredTenantId, kind, agentId, resourceId);
         return respondEnvelope(res, req, "Resources", { success: true });
     } catch (error) {
+        if (isHttpErrorPayload(error)) return send(res, error, req);
         log.error("unclaimResource error", { error });
         return send(res, ERR.internal(), req);
     }

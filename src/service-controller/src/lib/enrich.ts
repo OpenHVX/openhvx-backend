@@ -146,6 +146,7 @@ const lookupStorageDiskMeta = async ({
 const vmCreateAuto: EnrichHandler = async ({ object, ctx }) => {
     const out = (await ensureImageMeta(object)) as MutablePayload;
     out.generation = out.generation ?? 2;
+    out.cpu = out.cpu ?? 1;
     out.storageMB = out.storageMB ?? 10_240;
     if (!out.switch) out.switch = "fabric0";
     if (typeof out.diskId === "string" && out.diskId) {

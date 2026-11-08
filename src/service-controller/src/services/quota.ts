@@ -1,3 +1,5 @@
+import { transaction } from "./operations/transaction";
+import Task from "../models/Task";
 // src/service-controller/src/services/quota.ts
 
 // Quota service:
@@ -27,6 +29,7 @@ const DEFAULTS: Record<QuotaKey, number> = Object.freeze({
     vmCount: 0,
     networkCount: 0,
 });
+const QUOTA_KEYS = new Set<QuotaKey>(Object.keys(DEFAULTS) as QuotaKey[]);
 
 export const DEFAULT_HOLD_TTL_MS = 15 * 60 * 1000;
 
@@ -92,6 +95,9 @@ const sanitizeDeltas = (input: Record<string, unknown> | undefined) => {
     }
     const out: QuotaDeltas = {};
     for (const [key, value] of Object.entries(input)) {
+        if (!QUOTA_KEYS.has(key as QuotaKey)) {
+            throw ERR.validationPre([{ path: `deltas.${key}`, message: "unknown quota key" }]);
+        }
         if (value == null) continue;
         let val: number;
         if (typeof value === "string") {
@@ -130,6 +136,26 @@ export async function getTenantQuotas(tenantId: TenantIdentifier) {
     if (!tenant) throw ERR.notFound("Tenant not found");
     return hydrateWithDefaults(tenant.quotas);
 }
+
+export const buildQuotaReleaseSet = (increments: QuotaDeltas) => {
+    const $set: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(increments)) {
+        if (value !== 0) {
+            $set[`quotas.${key}.used`] = {
+                $max: [
+                    0,
+                    {
+                        $subtract: [
+                            { $ifNull: [`$quotas.${key}.used`, 0] },
+                            value,
+                        ],
+                    },
+                ],
+            };
+        }
+    }
+    return $set;
+};
 
 export async function setTenantQuotaLimits(tenantId: TenantIdentifier, partialLimits: QuotaLimits) {
     const limits = sanitizeLimits(partialLimits);
@@ -208,32 +234,20 @@ export async function checkAndReserve(tenantId: TenantIdentifier, deltas: QuotaD
 
 export async function release(tenantId: TenantIdentifier, deltas: QuotaDeltas) {
     const increments = sanitizeDeltas(deltas);
-    const $inc: Record<string, number> = {};
-    for (const [key, value] of Object.entries(increments)) {
-        if (value !== 0) $inc[`quotas.${key}.used`] = -Math.abs(value as number);
-    }
+    // A release is the exact inverse of a reservation. This matters for
+    // delete operations, whose reservation delta is negative.
+    const $set = buildQuotaReleaseSet(increments);
 
-    const tenant = await Tenant.findByIdAndUpdate(
-        tenantId,
-        Object.keys($inc).length ? { $inc } : {},
-        { new: true, projection: { quotas: 1 }, runValidators: true }
-    ).lean();
+    const tenant = Object.keys($set).length
+        ? await Tenant.findByIdAndUpdate(
+              tenantId,
+              [{ $set }],
+              { new: true, projection: { quotas: 1 } }
+          ).lean()
+        : await Tenant.findById(tenantId, { quotas: 1 }).lean();
     if (!tenant) throw ERR.notFound("Tenant not found");
 
     const quotas = hydrateWithDefaults(tenant.quotas);
-    let needClamp = false;
-    for (const [key, quota] of Object.entries(quotas)) {
-        if (quota.used < 0) {
-            quota.used = 0;
-            quotas[key as QuotaKey] = quota;
-            needClamp = true;
-        }
-    }
-    if (needClamp) {
-        const $set: Record<string, number> = {};
-        for (const [key, quota] of Object.entries(quotas)) $set[`quotas.${key}.used`] = quota.used;
-        await Tenant.updateOne({ _id: tenantId }, { $set });
-    }
 
     log.info("released", { tenantId: tid(tenantId), deltas: compactDeltas(increments) });
     return quotas;
@@ -245,55 +259,21 @@ export async function holdQuota(
     taskId: string,
     { ttlMs = DEFAULT_HOLD_TTL_MS }: { ttlMs?: number } = {}
 ) {
-    if (!taskId) throw ERR.validationPre([{ path: "taskId", message: "required" }]);
-    const increments = sanitizeDeltas(deltas);
-
-    const existing = await QuotaHold.findOne({ taskId }).lean();
-    if (existing) {
-        logHold.debug("hold exists (idempotent)", {
-            taskId,
-            tenantId: tid(existing.tenantId || tenantId),
-            status: existing.status,
-        });
-        return existing;
-    }
-
-    await checkAndReserve(tenantId, increments);
-
-    try {
-        const hold = await QuotaHold.create({
-            tenantId,
-            taskId,
-            deltas: increments,
-            status: "held",
-            expiresAt: new Date(Date.now() + ttlMs),
-        });
-        logHold.info("hold created", {
-            taskId,
-            tenantId: tid(tenantId),
-            ttlMs,
-            deltas: compactDeltas(increments),
-        });
+    return transaction(async () => {
+        if (!taskId) throw ERR.validationPre([{ path: "taskId", message: "required" }]);
+        const existing = await QuotaHold.findOne({ taskId }).lean();
+        if (existing) {
+            const requested = sanitizeDeltas(deltas);
+            if (String(existing.tenantId) !== String(tenantId) || [...QUOTA_KEYS].some(key => (existing.deltas[key] || 0) !== (requested[key] || 0))) throw ERR.quotaExceeded("taskId already belongs to a different quota reservation");
+            return existing;
+        }
+        const increments = sanitizeDeltas(deltas);
+        const positive = Object.fromEntries(Object.entries(increments).filter(([, value]) => (value as number) > 0));
+        await checkAndReserve(tenantId, positive);
+        const hold = await QuotaHold.create({ tenantId, taskId, deltas: increments,
+            status: "held", reservationVersion: 2, expiresAt: new Date(Date.now() + ttlMs) });
         return hold.toObject();
-    } catch (error: unknown) {
-        if ((error as { code?: number })?.code === 11000) {
-            await release(tenantId, increments);
-            const again = await QuotaHold.findOne({ taskId }).lean();
-            logHold.warn("hold duplicate on create (rolled back reserve)", { taskId, tenantId: tid(tenantId) });
-            if (again) return again;
-        }
-        try {
-            await release(tenantId, increments);
-        } catch {
-            // ignore
-        }
-        logHold.error("hold create failed (rolled back reserve)", {
-            taskId,
-            tenantId: tid(tenantId),
-            error: (error as Error)?.message || String(error),
-        });
-        throw error;
-    }
+    });
 }
 
 export async function extendHold(taskId: string, { ttlMs = DEFAULT_HOLD_TTL_MS } = {}) {
@@ -311,42 +291,32 @@ export async function extendHold(taskId: string, { ttlMs = DEFAULT_HOLD_TTL_MS }
 }
 
 export async function consumeHold(taskId: string) {
-    const hold = await QuotaHold.findOneAndUpdate(
-        { taskId, status: "held" },
-        { $set: { status: "consumed" } },
-        { new: true }
-    ).lean();
-    if (hold) {
-        logHold.info("hold consumed", { taskId, tenantId: tid(hold.tenantId) });
+    return transaction(async () => {
+        const hold = await QuotaHold.findOneAndUpdate(
+            { taskId, status: "held" }, { $set: { status: "consumed" } }, { new: true }
+        ).lean();
+        if (!hold) return QuotaHold.findOne({ taskId }).lean();
+        if (hold.reservationVersion === 2) {
+            // Deletions free capacity only once the external result succeeded.
+            const negativeInverse = Object.fromEntries(Object.entries(hold.deltas).filter(([, value]) => (value as number) < 0).map(([key, value]) => [key, -(value as number)]));
+            if (Object.keys(negativeInverse).length) await release(hold.tenantId, negativeInverse);
+        }
         return hold;
-    }
-    const existing = await QuotaHold.findOne({ taskId }).lean();
-    if (existing) {
-        logHold.debug("consume idempotent (already terminal)", { taskId, status: existing.status });
-    } else {
-        logHold.warn("consume ignored (hold not found)", { taskId });
-    }
-    return existing || null;
+    });
 }
 
 export async function releaseHold(taskId: string) {
-    const hold = await QuotaHold.findOne({ taskId }).lean();
-    if (!hold) {
-        logHold.warn("release ignored (hold not found)", { taskId });
-        return null;
-    }
-    if (hold.status === "held") {
-        await release(hold.tenantId, hold.deltas);
-        await QuotaHold.updateOne({ _id: hold._id }, { $set: { status: "released" } });
-        logHold.info("hold released", {
-            taskId,
-            tenantId: tid(hold.tenantId),
-            deltas: compactDeltas(hold.deltas),
-        });
-        return { ...hold, status: "released" };
-    }
-    logHold.debug("release idempotent (already terminal)", { taskId, status: hold.status });
-    return hold;
+    return transaction(async () => {
+        const hold = await QuotaHold.findOneAndUpdate(
+            { taskId, status: "held" }, { $set: { status: "released" } }, { new: true }
+        ).lean();
+        if (!hold) return QuotaHold.findOne({ taskId }).lean();
+        const reserved = hold.reservationVersion === 2
+            ? Object.fromEntries(Object.entries(hold.deltas).filter(([, value]) => (value as number) > 0))
+            : hold.deltas;
+        await release(hold.tenantId, reserved);
+        return hold;
+    });
 }
 
 export async function reapExpiredHolds({ limit = 200 }: { limit?: number } = {}) {
@@ -359,8 +329,12 @@ export async function reapExpiredHolds({ limit = 200 }: { limit?: number } = {})
     let fail = 0;
     for (const hold of expired) {
         try {
-            await release(hold.tenantId, hold.deltas);
-            await QuotaHold.updateOne({ _id: hold._id }, { $set: { status: "released" } });
+            // Expiration is not evidence that an external effect failed. Only a
+            // durably failed operation permits automatic release.
+            const task = await Task.findOne({ taskId: hold.taskId }, { status: 1 }).lean();
+            if (!task || task.status !== "error") continue;
+            const result = await releaseHold(hold.taskId);
+            if (result?.status !== "released") continue;
             ok++;
             logReaper.info("reaped hold", {
                 taskId: hold.taskId,
@@ -377,7 +351,7 @@ export async function reapExpiredHolds({ limit = 200 }: { limit?: number } = {})
         }
     }
     if (ok || fail) logReaper.info("reap summary", { released: ok, failed: fail });
-    return expired.length;
+    return ok;
 }
 
 // Local, tolerant view of inventory VMs; we only care about fields needed for quota math
@@ -408,6 +382,7 @@ interface InventoryVm {
     dynamic_memory?: boolean;
     ram?: string;
     min_ram?: string;
+    max_ram?: string;
 }
 
 // Local, tolerant view of networks to check ownership/links.
@@ -445,6 +420,7 @@ export async function recalcUsedFromInventory({
 }: {
     tenantId: TenantIdentifier;
 }) {
+    return transaction(async () => {
     if (!tenantId) throw ERR.validationPre([{ path: "tenantId", message: "required" }]);
 
     let tenantKey: string | null = typeof tenantId === "string" ? tenantId : null;
@@ -453,9 +429,11 @@ export async function recalcUsedFromInventory({
         tenantKey = tenantDoc?.tenantId || null;
     }
     if (!tenantKey) throw ERR.notFound("Tenant not found");
+    if (await QuotaHold.exists({ tenantId, status: { $in: ["held", "releasing"] } })) throw ERR.quotaExceeded("Reconciliation blocked by unresolved operations");
+    if (await Task.exists({ tenantId: tenantKey, status: { $in: ["queued", "sent", "reconciling"] } })) throw ERR.quotaExceeded("Reconciliation requires completed operations");
     const links = await TenantResource.find(
         { tenantId: tenantKey, kind: { $in: ["vm", "switch", "storage"] } },
-        { kind: 1, agentId: 1, refId: 1, name: 1 }
+        { kind: 1, agentId: 1, refId: 1, name: 1, assignedAt: 1, quotaAllocation: 1 }
     ).lean<Array<TenantResourceLink & { _id: Types.ObjectId; name?: string }>>();
 
     const vmLinks = links.filter((l) => l.kind === "vm");
@@ -466,21 +444,31 @@ export async function recalcUsedFromInventory({
     const inventories = agentIds.length
         ? await InventoryFull.find(
               { agentId: { $in: agentIds } },
-              { agentId: 1, inventory: 1 }
-          ).lean<Array<{ agentId: string; inventory?: { vms?: InventoryVm[]; networks?: InventoryNetwork[] } }>>()
+              { agentId: 1, inventory: 1, ts: 1 }
+          ).lean<Array<{ agentId: string; ts?: Date; inventory?: { vms?: InventoryVm[]; networks?: InventoryNetwork[] } }>>()
         : [];
 
     const storageDocs = storageLinks.length
         ? await InventoryStorage.find(
               { storageId: { $in: storageLinks.map((l) => String(l.agentId)) } },
-              { storageId: 1, inventory: 1 }
+              { storageId: 1, inventory: 1, ts: 1 }
           ).lean<
               Array<{
                   storageId: string;
+                  ts?: Date;
                   inventory?: { images?: Array<Record<string, unknown>>; volumes?: Array<Record<string, unknown>> };
               }>
           >()
         : [];
+
+    const newestTask = await Task.findOne({ tenantId: tenantKey, status: { $in: ["done", "error"] } }, { finishedAt: 1 }).sort({ finishedAt: -1 }).lean();
+    const frontier = Math.max(newestTask?.finishedAt?.getTime() || 0, ...links.map(link => link.assignedAt?.getTime() || 0));
+    for (const link of links) {
+        const snapshot = link.kind === "storage"
+            ? storageDocs.find(item => item.storageId === link.agentId)
+            : inventories.find(item => item.agentId === link.agentId);
+        if (!snapshot?.ts || new Date(snapshot.ts).getTime() < frontier) throw ERR.quotaExceeded("A fresh inventory after the latest operation is required before reconciliation");
+    }
 
     const invByAgent = new Map<string, { vms?: InventoryVm[]; networks?: InventoryNetwork[] }>();
     for (const id of agentIds) invByAgent.set(id, {});
@@ -592,8 +580,8 @@ export async function recalcUsedFromInventory({
             vmStorageMB = vm.storageMB as number;
         }
 
-        cpu += Math.max(0, vcpu | 0);
-        memoryMB += Math.max(0, mem | 0);
+        cpu += Math.max(0, (link.quotaAllocation?.cpu ?? vcpu) | 0);
+        memoryMB += Math.max(0, (link.quotaAllocation?.memoryMB ?? mem) | 0);
         vmCount += 1;
     }
 
@@ -670,6 +658,7 @@ export async function recalcUsedFromInventory({
         missingStorage,
     });
     return hydrateWithDefaults(tenant.quotas);
+    });
 }
 
 export function deltasFromVmSpec(vmSpec: InventoryVm = {}) {
@@ -691,7 +680,7 @@ export function deltasFromVmSpec(vmSpec: InventoryVm = {}) {
     if (vmSpec.dynamic_memory) {
         const startup = vmSpec.ram ? parseSizeToMB(vmSpec.ram) : memory;
         const minRam = vmSpec.min_ram ? parseSizeToMB(vmSpec.min_ram) : 0;
-        memory = Math.max(minRam, startup, 0);
+        memory = Math.max(minRam, startup, vmSpec.max_ram ? parseSizeToMB(vmSpec.max_ram) : 0, 0);
     }
 
     let storage = 0;
@@ -755,7 +744,12 @@ export function computeDeltas(action: string, payload: unknown) {
             networkCount: 0,
         };
     }
-    if (action === "vm.create") return deltasFromVmSpec(payload as InventoryVm);
+    if (action === "vm.create") {
+        const deltas = deltasFromVmSpec(payload as InventoryVm);
+        // An attached tenant-owned disk is charged by its storage allocation.
+        if ((payload as Record<string, unknown>)?.diskId) deltas.storageMB = 0;
+        return deltas;
+    }
     return null;
 }
 

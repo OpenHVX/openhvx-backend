@@ -1,3 +1,7 @@
+import { ensureOperationIndexes } from "./services/operations/indexes";
+import ResourceLock from "./models/ResourceLock";
+import { controllerIdentity, internalSecret } from "./middlewares/controllerIdentity";
+import { startOutbox } from "./services/operations/outbox";
 import dotenv from "dotenv";
 import express from "express";
 import cors from "cors";
@@ -6,7 +10,7 @@ import mongoose from "mongoose";
 import globalRoutes from "./routes/global.routes";
 import adminRoutes from "./routes/admin.routes";
 import tenantRoutes from "./routes/tenant.routes";
-import { startTelemetryConsumers, startResultsToMongo } from "./services/amqp";
+import { closeAmqp, amqpHealth, startTelemetryConsumers, startResultsToMongo } from "./services/amqp";
 import { reapExpiredHolds } from "./services/quota";
 import Heartbeat from "./models/Heartbeat";
 import Task from "./models/Task";
@@ -43,16 +47,26 @@ const runQuotaReaper = async () => {
     }
 };
 
-const main = async () => {
-    await mongoose.connect(MONGO_URL);
-    log.info("Mongo connected", { url: MONGO_URL });
-
+const startAmqpConsumers = async () => {
     await startTelemetryConsumers({ Heartbeat });
     await startResultsToMongo(Task);
     log.info("AMQP consumers started");
+};
 
-    setTimeout(runQuotaReaper, 10_000);
-    setInterval(runQuotaReaper, REAPER_INTERVAL_MS);
+const main = async () => {
+    internalSecret();
+    await mongoose.connect(MONGO_URL, { serverSelectionTimeoutMS: 10000, retryWrites: true, writeConcern: { w: "majority" } });
+    const hello = await mongoose.connection.db!.admin().command({ hello: 1 });
+    if (!hello.setName && hello.msg !== "isdbgrid") throw new Error("MongoDB replica set required for transactional operations");
+    await ensureOperationIndexes();
+    const lockIndexes = await ResourceLock.collection.indexes();
+    if (lockIndexes.some(index => index.expireAfterSeconds !== undefined)) throw new Error("Run migrate:distributed -- --apply to remove legacy lock TTL before startup");
+    log.info("Mongo connected");
+    if (await Task.exists({ status: { $in: ["queued", "sent", "reconciling"] }, contractVersion: { $ne: 2 } })) throw new Error("Drain or reconcile legacy tasks before starting protocol v2 workers");
+    const stopOutbox = startOutbox();
+
+    const firstReap = setTimeout(runQuotaReaper, 10_000);
+    const reapTimer = setInterval(runQuotaReaper, REAPER_INTERVAL_MS);
     logReaper.info("reaper scheduled", {
         intervalMs: REAPER_INTERVAL_MS,
         batch: REAPER_BATCH_LIMIT,
@@ -70,13 +84,36 @@ const main = async () => {
         })
     );
 
+    let draining = false;
     app.get("/healthz", (_req, res) => res.json({ ok: true }));
+    app.get("/readyz", (_req, res) => {
+        const mongoReady = mongoose.connection.readyState === 1;
+        const amqp = amqpHealth();
+        const ready = !draining && mongoReady && amqp.ready;
+        return res.status(ready ? 200 : 503).json({
+            ok: ready,
+            dependencies: {
+                mongo: { ready: mongoReady },
+                amqp,
+            },
+        });
+    });
 
     app.use("/api/v1", globalRoutes);
-    app.use("/api/v1/admin", adminRoutes);
-    app.use("/api/v1/tenant", tenantRoutes);
+    app.use("/api/v1/admin", controllerIdentity("admin"), adminRoutes);
+    app.use("/api/v1/tenant", controllerIdentity("tenant"), tenantRoutes);
 
-    app.listen(PORT, () => log.info("listening", { port: PORT }));
+    const server = app.listen(PORT, () => log.info("listening", { port: PORT }));
+    process.once("SIGTERM", () => {
+        draining = true;
+        clearTimeout(firstReap); clearInterval(reapTimer);
+        server.close();
+        void stopOutbox().then(() => closeAmqp()).then(() => mongoose.disconnect()).finally(() => process.exit(0));
+        setTimeout(() => process.exit(1), 25000).unref();
+    });
+    void startAmqpConsumers().catch((error) => {
+        log.error("AMQP consumers bootstrap failed", { error });
+    });
 };
 
 main().catch((error) => {

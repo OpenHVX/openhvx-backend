@@ -18,7 +18,7 @@ export type HeartbeatModel = Model<Heartbeat>;
 
 const heartbeatSchema = new Schema<Heartbeat>(
     {
-        agentId: { type: String, required: true, index: true },
+        agentId: { type: String, required: true },
         version: { type: String },
         capabilities: { type: [String], default: [] },
         lastSeen: { type: Date, required: true },

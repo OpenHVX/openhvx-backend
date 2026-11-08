@@ -1,3 +1,4 @@
+import { internalSecret } from "./lib/controllerIdentity";
 import "dotenv/config";
 import http from "node:http";
 import express, { type NextFunction, type Request, type Response } from "express";
@@ -45,18 +46,22 @@ const corsOptions: CorsOptions = {
         "X-Requested-With",
         "X-Tenant-Id",
         "X-Api-Key",
+        "Idempotency-Key",
     ],
     exposedHeaders: ["X-Request-Id"],
     optionsSuccessStatus: 204,
 };
 
+internalSecret();
+let draining = false;
 const app = express();
 
 app.set("trust proxy", 1);
 
 app.options(/.*/, (_req, res) => res.sendStatus(204));
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(morgan("dev"));
+morgan.token("safe-url", (req) => String((req as Request).originalUrl || req.url || "").split("?")[0]);
+app.use(morgan(":method :safe-url :status :response-time ms"));
 app.use(
     rateLimit({
         windowMs: 60_000,
@@ -80,6 +85,17 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 app.get("/healthz", (_req: Request, res: Response) => res.json({ ok: true, service: "api-gateway" }));
+
+app.get("/readyz", async (_req, res) => {
+    try {
+        if (draining) throw new Error("draining");
+        await Promise.all([
+            axios.get(`${AUTH_URL}/readyz`, { timeout: 2000 }),
+            axios.get(`${CONTROLLER_URL}/readyz`, { timeout: 2000 }),
+        ]);
+        res.json({ ok: true });
+    } catch { res.status(503).json({ ok: false }); }
+});
 
 app.use("/api/v1/tenant/auth", tenantAuthRoutes({ AUTH_URL }));
 app.use("/api/v1/admin/auth", adminAuthRoutes({ AUTH_URL }));
@@ -106,4 +122,10 @@ server.listen(PORT, () => {
     console.log(
         `[gateway] listening on :${PORT} → controller=${CONTROLLER_URL} auth=${AUTH_URL}`,
     );
+});
+
+process.once("SIGTERM", () => {
+    draining = true;
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 25000).unref();
 });

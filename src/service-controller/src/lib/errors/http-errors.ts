@@ -65,6 +65,9 @@ export const ERR = {
 
     missingAgentId: () => make(400, "MISSING_AGENT_ID", "Missing target.agentId (no election performed or selection failed)"),
 
+    noEligibleAgent: (requiredCapability: string, details?: unknown) =>
+        make(503, "NO_ELIGIBLE_AGENT", `No eligible agent online for capability '${requiredCapability}'`, details),
+
     agentNotFound: (agentId: string) =>
         make(404, "AGENT_NOT_FOUND", "Agent not found (no heartbeat yet)", { agentId }),
 
