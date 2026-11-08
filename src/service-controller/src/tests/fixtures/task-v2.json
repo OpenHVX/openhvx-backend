@@ -1,0 +1,16 @@
+{
+  "operationId": "contract-vector-1",
+  "agentId": "contract-host",
+  "tenantId": "contract-tenant",
+  "action": "echo",
+  "data": {
+    "message": "héllo\nworld",
+    "number": 100000000000000000000,
+    "optional": null
+  },
+  "taskId": "contract-vector-1",
+  "eventId": "contract-event-1",
+  "contractVersion": 2,
+  "commandBody": "{\"action\":\"echo\",\"agentId\":\"contract-host\",\"data\":{\"message\":\"héllo\\nworld\",\"number\":100000000000000000000,\"optional\":null},\"operationId\":\"contract-vector-1\",\"tenantId\":\"contract-tenant\"}",
+  "commandFingerprint": "048b2388712748613012c4dca41f6f65423ac7e3f3bd79bb00eb8083a0637238"
+}

@@ -3,7 +3,6 @@
 
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import type { InventorySnapshot } from "./types";
-import InventoryFull from "./Inventory.full"
 
 export type InventoryLightDocument = HydratedDocument<InventorySnapshot>;
 
@@ -11,13 +10,15 @@ export type InventoryLightModel = Model<InventorySnapshot>;
 
 const inventoryLightSchema = new Schema<InventorySnapshot>(
     {
-        agentId: { type: String, index: true },
+        agentId: { type: String, required: true },
         ts: { type: Date, index: true },
         inventory: { type: Object },
         raw: { type: Object },
     },
     { minimize: false }
 );
+
+inventoryLightSchema.index({ agentId: 1 }, { unique: true });
 
 const InventoryLight = model<InventorySnapshot>("InventoryLight", inventoryLightSchema);
 

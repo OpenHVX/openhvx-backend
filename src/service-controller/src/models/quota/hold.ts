@@ -4,7 +4,7 @@
 import { Schema, model, Types, type HydratedDocument, type Model } from "mongoose";
 import type { QuotaDeltas } from "../../types/domain";
 
-export type QuotaHoldStatus = "held" | "consumed" | "released";
+export type QuotaHoldStatus = "held" | "releasing" | "consumed" | "released";
 
 export interface QuotaHoldRecord {
     tenantId: Types.ObjectId;
@@ -12,6 +12,7 @@ export interface QuotaHoldRecord {
     deltas: QuotaDeltas;
     status: QuotaHoldStatus;
     expiresAt: Date;
+    reservationVersion?: number;
 }
 
 export type QuotaHoldDocument = HydratedDocument<QuotaHoldRecord>;
@@ -29,8 +30,9 @@ const QuotaHoldSchema = new Schema<QuotaHoldRecord>(
             vmCount: Number,
             networkCount: Number,
         },
-        status: { type: String, enum: ["held", "consumed", "released"], default: "held", index: true },
+        status: { type: String, enum: ["held", "releasing", "consumed", "released"], default: "held", index: true },
         expiresAt: { type: Date, required: true, index: true },
+        reservationVersion: { type: Number },
     },
     { timestamps: true }
 );

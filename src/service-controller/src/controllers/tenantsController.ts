@@ -1,3 +1,7 @@
+import { deleteTenant } from "../services/operations/ownership";
+import { isHttpErrorPayload } from "../services/resourceLocks";
+import Task from "../models/Task";
+import { transaction } from "../services/operations/transaction";
 import type { Response } from "express";
 import { ERR, send } from "../lib/errors/http-errors";
 import Tenant from "../models/Tenant";
@@ -124,27 +128,11 @@ export const removeTenant: Handler = async (req, res) => {
         if (!pre.ok) return send(res, ERR.validationPre(pre.errors), req);
 
         const tenantId = normTenantId(pre.value!.tenantId);
-        const count = await TenantResource.countDocuments({ tenantId });
-        if (count > 0) {
-            return send(
-                res,
-                {
-                    status: 409,
-                    code: "TENANT_HAS_RESOURCES",
-                    message: "Tenant has resources; unassign first",
-                    details: { count },
-                },
-                req
-            );
-        }
-
-        const result = await Tenant.deleteOne({ tenantId });
-        if (result.deletedCount === 0) {
-            return send(res, { status: 404, code: "TENANT_NOT_FOUND", message: "Tenant not found" }, req);
-        }
+        await deleteTenant(tenantId);
 
         return respondEnvelope(res, req, "Tenants", { success: true });
     } catch (error) {
+        if (isHttpErrorPayload(error)) return send(res, error, req);
         log.error("tenant.remove error", { error });
         return send(res, ERR.internal(), req);
     }
@@ -197,11 +185,14 @@ export const reserveQuotas: Handler = async (req, res) => {
         const _id = await getTenantObjectIdOr404(params.value!.tenantId, req, res);
         if (!_id) return;
 
-        const result = await holdQuota(_id, body.value!.deltas, req.body.taskId, {
-            ttlMs: req.body.ttlMs,
+        const result = await transaction(async () => {
+            const task = await Task.findOne({ taskId: req.body.taskId, tenantId: normTenantId(params.value!.tenantId), hasQuotaHold: true, status: { $in: ["queued", "sent", "reconciling"] } }).lean();
+            if (!task) throw ERR.notFound("Quota reservations must be created through task submission");
+            return holdQuota(_id, body.value!.deltas, req.body.taskId, { ttlMs: req.body.ttlMs });
         });
         return respondEnvelope(res, req, "Tenants", { success: true, data: result });
     } catch (error) {
+        if (isHttpErrorPayload(error)) return send(res, error, req);
         log.error("tenant.reserveQuotas error", { error });
         return send(res, ERR.internal(), req);
     }
@@ -209,9 +200,17 @@ export const reserveQuotas: Handler = async (req, res) => {
 
 export const releaseQuotas: Handler = async (req, res) => {
     try {
-        await releaseHold(req.body.taskId);
+        const params = validateParams(req.params);
+        if (!params.ok) return send(res, ERR.validationPre(params.errors), req);
+        if (typeof req.body?.taskId !== "string" || !req.body.taskId) return res.status(400).json({ error: "taskId required" });
+        await transaction(async () => {
+            const task = await Task.findOne({ taskId: req.body.taskId, tenantId: normTenantId(params.value!.tenantId), status: "error" }).lean();
+            if (!task) throw ERR.notFound("Only a failed operation belonging to this tenant permits quota release");
+            await releaseHold(task.taskId);
+        });
         return respondEnvelope(res, req, "Tenants", { success: true });
     } catch (error) {
+        if (isHttpErrorPayload(error)) return send(res, error, req);
         log.error("tenant.releaseQuotas error", { error });
         return send(res, ERR.internal(), req);
     }
@@ -240,6 +239,7 @@ export const recalculateQuotas: Handler = async (req, res) => {
         });
         return respondEnvelope(res, req, "Tenants", { success: true, data });
     } catch (error) {
+        if (isHttpErrorPayload(error)) return send(res, error, req);
         log.error("tenant.recalculateQuotas error", { error });
         return send(res, ERR.internal(), req);
     }

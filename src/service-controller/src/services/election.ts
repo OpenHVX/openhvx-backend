@@ -18,12 +18,20 @@ interface ScoredAgent extends HeartbeatDoc {
     globalScore: number;
 }
 
+const DEFAULT_CPU_WEIGHT = 0.6;
+const DEFAULT_MEM_WEIGHT = 0.4;
+
+const readWeight = (raw: string | undefined, fallback: number) => {
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+
+const hasCapability = (declared: string[], needed: string) =>
+    declared.some((cap) => needed === cap || needed.startsWith(`${cap}.`));
+
 export async function listAgents(): Promise<HeartbeatDoc[]> {
     const docs = await Heartbeat.find({}, "agentId version lastSeen host capabilities raw").lean<HeartbeatDoc[]>();
-    if (!Array.isArray(docs) || docs.length === 0) {
-        throw new Error("No agent exists yet in database");
-    }
-    return docs;
+    return Array.isArray(docs) ? docs : [];
 }
 
 export async function election(requirements: ElectionRequirements): Promise<string | null> {
@@ -33,12 +41,16 @@ export async function election(requirements: ElectionRequirements): Promise<stri
         throw new Error(`Invalid requirements payload: ${errors}`);
     }
 
-    const { freshness } = validation.value.requirements;
+    const { freshness, capabilities } = validation.value.requirements;
+    const cpuWeight = readWeight(process.env.ELECTION_WEIGHT_CPU, DEFAULT_CPU_WEIGHT);
+    const memWeight = readWeight(process.env.ELECTION_WEIGHT_MEM, DEFAULT_MEM_WEIGHT);
     const agents = await listAgents();
     const cutoff = Date.now() - freshness * 1000;
     const eligible = agents.filter((agent) => {
         const ts = agent.lastSeen ? new Date(agent.lastSeen).getTime() : 0;
-        return ts >= cutoff;
+        if (ts < cutoff) return false;
+        const declaredCaps = Array.isArray(agent.capabilities) ? agent.capabilities.map(String) : [];
+        return capabilities.every((cap) => hasCapability(declaredCaps, cap));
     });
 
     if (!eligible.length) return null;
@@ -53,7 +65,7 @@ export async function election(requirements: ElectionRequirements): Promise<stri
             return {
                 ...agent,
                 scores,
-                globalScore: Score({ scores }, { cpu: 0.6, mem: 0.4 }),
+                globalScore: Score({ scores }, { cpu: cpuWeight, mem: memWeight }),
             };
         })
     );

@@ -2,7 +2,7 @@
 // Mongoose model for tenant resource links (mostly VMs and their components)
 
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
-import type { ResourceKind } from "../types/domain";
+import type { ResourceKind, QuotaDeltas } from "../types/domain";
 
 export interface TenantResourceLink {
     tenantId: string;
@@ -10,6 +10,7 @@ export interface TenantResourceLink {
     agentId: string;
     refId: string;
     assignedAt: Date;
+    quotaAllocation?: QuotaDeltas;
     name?: string;
     ha?: boolean;
     attachedVmRefId?: string;
@@ -29,6 +30,7 @@ const schema = new Schema<TenantResourceLink>(
         agentId: { type: String, required: true, index: true },
         refId: { type: String, required: true, index: true },
         assignedAt: { type: Date, default: () => new Date() },
+        quotaAllocation: { type: Object },
         name: { type: String },
         ha: { type: Boolean, default: false },
         attachedVmRefId: { type: String },

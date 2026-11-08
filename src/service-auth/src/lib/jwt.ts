@@ -1,17 +1,25 @@
 // @ts-nocheck
 const jwt = require('jsonwebtoken');
 
+function requiredSecret(name) {
+    const value = process.env[name];
+    if (!value || value.length < 32 || value === 'dev_tenant_secret' || value === 'dev_admin_secret') {
+        throw new Error(`${name} is required and must not use a known development default`);
+    }
+    return value;
+}
+
 const cfg = {
     tenant: {
         iss: process.env.JWT_TENANT_ISS || 'auth-service/tenant',
         aud: process.env.JWT_TENANT_AUD || 'api://tenant',
-        secret: process.env.JWT_TENANT_SECRET || 'dev_tenant_secret',
+        secret: requiredSecret('JWT_TENANT_SECRET'),
         expiresIn: process.env.JWT_TENANT_EXPIRES || '8h',
     },
     admin: {
         iss: process.env.JWT_ADMIN_ISS || 'auth-service/admin',
         aud: process.env.JWT_ADMIN_AUD || 'api://admin',
-        secret: process.env.JWT_ADMIN_SECRET || 'dev_admin_secret',
+        secret: requiredSecret('JWT_ADMIN_SECRET'),
         expiresIn: process.env.JWT_ADMIN_EXPIRES || '30m',
     }
 };
@@ -38,10 +46,10 @@ function signAdmin(u) {
 }
 
 function verifyTenant(token) {
-    return jwt.verify(token, cfg.tenant.secret, { issuer: cfg.tenant.iss, audience: cfg.tenant.aud });
+    return jwt.verify(token, cfg.tenant.secret, { algorithms: ['HS256'], issuer: cfg.tenant.iss, audience: cfg.tenant.aud });
 }
 function verifyAdmin(token) {
-    return jwt.verify(token, cfg.admin.secret, { issuer: cfg.admin.iss, audience: cfg.admin.aud });
+    return jwt.verify(token, cfg.admin.secret, { algorithms: ['HS256'], issuer: cfg.admin.iss, audience: cfg.admin.aud });
 }
 
 module.exports = { cfg, signTenant, signAdmin, verifyTenant, verifyAdmin };

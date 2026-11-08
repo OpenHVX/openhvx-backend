@@ -1,0 +1,10 @@
+# Socket-only override; always combine with compose.yaml.
+# podman compose -f compose.yaml -f compose.podman.yaml up --build -d
+services:
+  traefik:
+    user: "0:0"
+    volumes:
+      # Same container target replaces the base Docker socket mount on merge.
+      - ${PODMAN_SOCKET_PATH:-/run/podman/podman.sock}:/var/run/docker.sock:ro
+    security_opt:
+      - label=disable

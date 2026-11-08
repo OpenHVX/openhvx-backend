@@ -1,3 +1,4 @@
+import { signControllerRequest } from "../lib/controllerIdentity";
 
 import { Router, type NextFunction, type Request, type Response } from "express";
 import type { ServerResponse } from "http";
@@ -41,6 +42,7 @@ export default ({ CONTROLLER_URL }: RouterOptions) => {
             proxyReq: (proxyReq, req) => {
                 const tenantId = normLower(req.params?.tenantId);
 
+                signControllerRequest(proxyReq, req, "admin", tenantId);
                 proxyReq.setHeader("x-request-id", req.id ?? "");
                 proxyReq.setHeader("x-user-id", req.user?.sub ?? "");
                 proxyReq.setHeader("x-roles", (req.user?.roles ?? []).join(","));
@@ -117,8 +119,8 @@ export default ({ CONTROLLER_URL }: RouterOptions) => {
      *               tenantId:
      *                 type: string
      *     responses:
-     *       200:
-     *         description: Task enqueued
+     *       202:
+     *         description: Task accepted durably; Idempotency-Key required
      */
     router.post("/tasks", baseProxy);
     router.get("/tasks/:taskId", baseProxy);
@@ -179,6 +181,7 @@ export default ({ CONTROLLER_URL }: RouterOptions) => {
      *                 type: boolean
      *     responses:
      *       200: { description: OK }
+     *       207: { description: Partial success; inspect the per-resource outcomes }
      */
     router.post("/tenants/:tenantId/resources/claim", baseProxy);
 

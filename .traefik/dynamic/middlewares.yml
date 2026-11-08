@@ -1,10 +1,10 @@
-# traefik/middlewares.yml
+# Local Traefik middleware configuration.
 http:
   middlewares:
 
     sec-headers:
       headers:
-        # HSTS – ok en dev si tu es en full HTTPS; sinon désactive
+        # HSTS requires HTTPS for all local endpoints.
         stsSeconds: 31536000
         stsIncludeSubdomains: true
         stsPreload: true
@@ -15,7 +15,7 @@ http:
         # Referrer Policy
         referrerPolicy: no-referrer-when-downgrade
 
-        # CSP minimaliste (ajuste si tu sers depuis CDNs, etc.)
+        # Minimal CSP; adapt when serving assets from other origins.
         contentSecurityPolicy: >
           default-src 'self';
           script-src 'self';
@@ -53,6 +53,7 @@ http:
           - x-api-key
           - X-Tenant-Id
           - X-Request-Id
+          - Idempotency-Key
         accessControlExposeHeaders:
           - X-Request-Id
         accessControlMaxAge: 600

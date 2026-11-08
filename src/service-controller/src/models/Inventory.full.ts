@@ -10,13 +10,15 @@ export type InventoryModel = Model<InventorySnapshot>;
 
 const inventorySchema = new Schema<InventorySnapshot>(
     {
-        agentId: { type: String, index: true },
+        agentId: { type: String, required: true },
         ts: { type: Date, index: true },
         inventory: { type: Object },
         raw: { type: Object },
     },
     { minimize: false }
 );
+
+inventorySchema.index({ agentId: 1 }, { unique: true });
 
 const InventoryFull = model<InventorySnapshot>("InventoryFull", inventorySchema);
 

@@ -19,6 +19,8 @@ export interface ListResourcesQueryShape extends Record<string, unknown> {
     kind?: ClaimKind;
     agentId?: string;
     includeOrphans?: string;
+    limit?: string;
+    offset?: string;
 }
 
 export interface ClaimResourceBody extends Record<string, unknown> {
@@ -49,6 +51,8 @@ const ListResourcesQuery = objectStrict<ListResourcesQueryShape>({
     kind: optional(isEnum(RESOURCE_KIND_VALUES)),
     agentId: optional(isString),
     includeOrphans: optional(isString),
+    limit: optional(isString),
+    offset: optional(isString),
 });
 
 const ClaimBody = objectStrict<ClaimResourceBody>({

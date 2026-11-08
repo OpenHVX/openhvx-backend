@@ -39,7 +39,7 @@ export interface VmCreatePayload extends Record<string, unknown> {
     imageId?: string;
     cpu?: number;
     generation?: number;
-    ram?: string;
+    ram: string;
     dynamic_memory?: boolean;
     min_ram?: string;
     max_ram?: string;
@@ -75,7 +75,7 @@ const VmCreateSchema = objectStrict<VmCreatePayload>({
     storageId: optional(isString),
     cpu: optional(isInteger),
     generation: optional(isInteger),
-    ram: optional(isString),
+    ram: isString,
     dynamic_memory: optional(isBoolean),
     min_ram: optional(isString),
     max_ram: optional(isString),

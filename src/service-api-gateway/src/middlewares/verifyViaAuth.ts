@@ -16,11 +16,6 @@ export interface AuthenticatedUser {
     [key: string]: unknown;
 }
 
-type CacheEntry = {
-    data: AuthenticatedUser;
-    expTs: number;
-};
-
 interface VerifyOptions {
     AUTH_URL: string;
 }
@@ -54,8 +49,6 @@ const normLower = (value?: string | null) => {
 };
 
 export default function verifyViaAuth({ AUTH_URL }: VerifyOptions) {
-    const cache = new Map<string, CacheEntry>();
-    const SKEW_SECONDS = 10;
 
     const http: AxiosInstance = axios.create({
         baseURL: AUTH_URL,
@@ -82,18 +75,6 @@ export default function verifyViaAuth({ AUTH_URL }: VerifyOptions) {
             const token = authHeader.slice(7);
 
             const nowSeconds = Math.floor(Date.now() / 1000);
-            const cacheKey = `${kind}|${token}`;
-            const cached = cache.get(cacheKey);
-            if (cached && cached.expTs > nowSeconds) {
-                req.user = cached.data;
-                req.isAdmin = cached.data.kind === "admin";
-                if (kind === "tenant" && cached.data.tenantId) {
-                    req.tenantId = String(cached.data.tenantId);
-                }
-                next();
-                return;
-            }
-
             const path = kind === "tenant" ? "/auth/tenant/introspect" : "/auth/admin/introspect";
             const { data } = await http.post<IntrospectionResponse>(path, { token });
 
@@ -120,7 +101,7 @@ export default function verifyViaAuth({ AUTH_URL }: VerifyOptions) {
                 return;
             }
 
-            const expiry = Number.isFinite(data.exp) ? Number(data.exp) : nowSeconds + 60;
+            if (Number.isFinite(data.exp) && Number(data.exp) <= nowSeconds) { res.status(401).json({ error: "Token expired" }); return; }
             const normalized: AuthenticatedUser = {
                 ...data,
                 roles,
@@ -128,8 +109,6 @@ export default function verifyViaAuth({ AUTH_URL }: VerifyOptions) {
                 kind,
                 tenantId: tenantIdLc ?? (data as { tenantId?: string }).tenantId,
             };
-
-            cache.set(cacheKey, { data: normalized, expTs: expiry - SKEW_SECONDS });
 
             req.user = normalized;
             req.isAdmin = kind === "admin";

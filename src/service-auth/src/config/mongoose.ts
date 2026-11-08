@@ -12,6 +12,8 @@ module.exports = async function connectMongo() {
 
     await mongoose.connect(uri, {
         autoIndex: true,
+        serverSelectionTimeoutMS: 10000,
+        retryWrites: true,
         dbName: process.env.MONGO_DB || undefined,
     });
     return mongoose.connection;

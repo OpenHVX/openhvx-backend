@@ -7,6 +7,7 @@ const sanitizeHeaders = (req: Request): void => {
     delete headers["x-tenant"];
     delete headers["x-roles"];
     delete headers["x-user-id"];
+    delete headers["x-controller-identity"];
 };
 
 const antiSpoof = (): RequestHandler => {

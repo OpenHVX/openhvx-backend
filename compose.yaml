@@ -1,45 +1,51 @@
+# Optional local development stack. K3s deployment belongs to the deployment repository.
+# Docker: docker compose -f compose.yaml up --build -d
+# Podman: podman compose -f compose.yaml -f compose.podman.yaml up --build -d
 services:
 
   traefik:
-    image: traefik:v3.1
-    user: "0:0"
+    image: traefik:v3.6.11
     container_name: traefik
     command:
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
       - --providers.docker=true
-      - --providers.docker.endpoint=unix:///run/podman/podman.sock
       - --providers.docker.exposedbydefault=false
       - --providers.docker.network=internal
       - --providers.file.directory=/etc/traefik/dynamic
       - --providers.file.watch=true
       - --api.dashboard=false
       # logs
-      - --log.level=DEBUG
+      - --log.level=INFO
       - --log.filePath=/var/log/traefik/traefik.log
       - --accesslog=true
       - --accesslog.filePath=/var/log/traefik/access.log
       - --accesslog.bufferingsize=0
       - --accesslog.fields.defaultmode=keep
-      - --accesslog.fields.headers.defaultmode=keep
+      - --accesslog.fields.headers.defaultmode=drop
+      - --accesslog.fields.names.RequestPath=drop
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - /run/podman/podman.sock:/run/podman/podman.sock:ro,z
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./.traefik/dynamic:/etc/traefik/dynamic:ro
       - ./.traefik/certs:/etc/traefik/certs:ro
-      - ./.traefik/logs:/var/log/traefik 
+      - ./.traefik/logs:/var/log/traefik
     networks:
       - public
       - internal
     restart: unless-stopped
-    security_opt:
-      - label=disable
 
 
   mongo:
     image: mongo:6
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "try { if (!db.hello().isWritablePrimary) { try { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}) } catch(e) {} quit(1) } } catch(e) { quit(1) }"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
     container_name: mongo
     volumes:
       - mongo_data:/data/db
@@ -51,15 +57,18 @@ services:
     image: rabbitmq:3-management
     container_name: rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: "guest"
-      RABBITMQ_DEFAULT_PASS: "guest"
+      RABBITMQ_DEFAULT_USER: '${RABBITMQ_DEFAULT_USER:-openhvx}'
+      RABBITMQ_DEFAULT_PASS: '${RABBITMQ_DEFAULT_PASS:-change-me-rabbitmq}'
     networks:
       - internal
-      - public
     ports:
-      - "5672:5672" 
-      - "15672:15672"
+      - "127.0.0.1:15672:15672"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
 
   auth:
     build:
@@ -78,6 +87,8 @@ services:
       context: ./src/service-api-gateway
     container_name: api-gateway
     env_file: ./.env.gateway
+    environment:
+      INTERNAL_API_SECRET: '${INTERNAL_API_SECRET:?Set INTERNAL_API_SECRET (32+ characters) in root .env}'
     depends_on:
       - auth
     networks:
@@ -86,16 +97,16 @@ services:
     labels:
       - traefik.enable=true
 
-      # Docs Swagger (admin-api)
+      # Optional Swagger UI (admin host)
       - traefik.http.routers.apidocs.rule=Host(`admin-api.openhvx.local`) && PathPrefix(`/docs`)
       - traefik.http.routers.apidocs.entrypoints=websecure
       - traefik.http.routers.apidocs.tls=true
       - traefik.http.routers.apidocs.middlewares=sec-headers@file,compress@file
-      - traefik.http.routers.apidocs.service=admin-svc 
+      - traefik.http.routers.apidocs.service=admin-svc
       - traefik.http.services.admin-svc.loadbalancer.server.port=8080
-      - traefik.docker.network=internal 
+      - traefik.docker.network=internal
 
-      # TENANT
+      # Tenant API
       - traefik.http.routers.api.rule=Host(`api.openhvx.local`) && PathPrefix(`/api/v1/tenant`)
       - traefik.http.routers.api.entrypoints=websecure
       - traefik.http.routers.api.tls=true
@@ -104,7 +115,7 @@ services:
       - traefik.http.services.tenant-svc.loadbalancer.server.port=8080
       - traefik.docker.network=internal
 
-      # ADMIN
+      # Admin API
       - traefik.http.routers.admin.rule=Host(`admin-api.openhvx.local`) && PathPrefix(`/api/v1/admin`)
       - traefik.http.routers.admin.entrypoints=websecure
       - traefik.http.routers.admin.tls=true
@@ -112,7 +123,7 @@ services:
       - traefik.http.routers.admin.service=admin-svc
       - traefik.http.services.admin-svc.loadbalancer.server.port=8080
 
-      # CONSOLE (Browser)
+      # Browser consoles
       - traefik.http.routers.console.rule=Host(`console.openhvx.local`) && PathPrefix(`/api/v1/console`)
       - traefik.http.routers.console.entrypoints=websecure
       - traefik.http.routers.console.tls=true
@@ -127,6 +138,13 @@ services:
       context: ./src/service-ws-broker
     container_name: ws-broker
     env_file: ./.env.ws
+    environment:
+      MONGO_URL: 'mongodb://mongo:27017/hvwm?replicaSet=rs0'
+      BROKER_ID: local
+      BROKER_PEERS: '{"local":"http://ws-broker:8081"}'
+    depends_on:
+      mongo:
+        condition: service_healthy
     networks:
       - internal
     restart: unless-stopped
@@ -134,7 +152,7 @@ services:
       - traefik.enable=true
       - traefik.docker.network=internal
 
-      # AGENTS → ws-broker (direct)
+      # Agent WebSocket entry point
       - traefik.http.routers.wsb.rule=Host(`ws.openhvx.local`) && PathPrefix(`/ws/`)
       - traefik.http.routers.wsb.entrypoints=websecure
       - traefik.http.routers.wsb.tls=true
@@ -147,14 +165,26 @@ services:
       context: ./src/service-controller
     container_name: controller
     env_file: ./.env.controller
+    environment:
+      INTERNAL_API_SECRET: '${INTERNAL_API_SECRET:?Set INTERNAL_API_SECRET (32+ characters) in root .env}'
+      MONGO_URL: 'mongodb://mongo:27017/hvwm?replicaSet=rs0'
+      NODE_ENV: ${NODE_ENV:-development}
+      # Keep the broker account and the controller URL derived from the same
+      # Compose inputs. Production deployments must override both values.
+      RMQ_URL: 'amqp://${RABBITMQ_DEFAULT_USER:-openhvx}:${RABBITMQ_DEFAULT_PASS:-change-me-rabbitmq}@rabbitmq:5672/'
     depends_on:
-      - mongo
-      - rabbitmq
-    volumes:
-      - /mnt/openhvx:/share:ro
+      mongo:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     networks:
       - internal
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
 
 volumes:
   mongo_data:
@@ -165,5 +195,5 @@ networks:
     name: public
   internal:
     driver: bridge
-    internal: true 
+    internal: true
     name: internal

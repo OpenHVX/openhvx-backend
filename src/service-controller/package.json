@@ -7,7 +7,12 @@
         "start": "node dist/app.js",
         "dev": "ts-node-dev --respawn --transpile-only src/app.ts",
         "build": "tsc",
-        "lint": "tsc --noEmit"
+        "lint": "tsc --noEmit",
+        "test": "node --test -r ts-node/register src/tests/unit/*.test.ts",
+        "migrate:inventory-uniqueness": "ts-node src/scripts/dedupeInventories.ts",
+        "test:integration": "npm run build --prefix ../service-ws-broker && npm run build --prefix ../service-api-gateway && node --test -r ts-node/register src/tests/integration/*.test.ts",
+        "migrate:distributed": "ts-node src/scripts/migrateDistributed.ts",
+        "outbox:replay": "ts-node src/scripts/replayOutbox.ts"
     },
     "dependencies": {
         "amqplib": "^0.10.3",
@@ -28,6 +33,7 @@
         "@types/morgan": "^1.9.10",
         "@types/node": "^24.9.2",
         "@types/ws": "^8.5.12",
+        "mongodb-memory-server": "^11.3.0",
         "nodemon": "^3.1.0",
         "ts-node": "^10.9.2",
         "ts-node-dev": "^2.0.0",

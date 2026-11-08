@@ -47,6 +47,8 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+compose.override.yaml
+compose.override.yml
 
 # Misc
 *.tgz

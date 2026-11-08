@@ -13,7 +13,7 @@ export interface QuotaItem {
 
 export type Quotas = Record<QuotaKey, QuotaItem>;
 
-export type TaskStatus = "queued" | "sent" | "done" | "error";
+export type TaskStatus = "queued" | "sent" | "reconciling" | "done" | "error";
 
 export interface ElectionRequirements {
     freshness: number;

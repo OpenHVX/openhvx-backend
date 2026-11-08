@@ -42,6 +42,7 @@ async function resolveTenantAuth(token) {
     if (!token) return null;
     try {
         const decoded = jwt.verify(token, cfg.tenant.secret, {
+            algorithms: ["HS256"],
             issuer: cfg.tenant.iss,
             audience: cfg.tenant.aud,
         });
