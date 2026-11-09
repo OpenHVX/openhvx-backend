@@ -12,7 +12,9 @@ export interface ValidationResult<T> {
 }
 
 function isPlainObject(input: unknown): input is Record<string, unknown> {
-    return typeof input === "object" && input !== null && Object.getPrototypeOf(input) === Object.prototype;
+    if (typeof input !== "object" || input === null) return false;
+    const prototype = Object.getPrototypeOf(input);
+    return prototype === Object.prototype || prototype === null;
 }
 
 const joinPath = (base: string, key: string) => (base ? `${base}.${key}` : String(key));
